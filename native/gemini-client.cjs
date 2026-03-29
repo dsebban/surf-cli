@@ -297,8 +297,9 @@ function parseGeminiStreamGenerateResponse(rawText) {
   const errorCode = extractErrorCode(responseJson);
 
   const parts = Array.isArray(responseJson) ? responseJson : [];
-  let bodyIndex = 0;
-  let body = null;
+  
+  // Collect all candidate snapshots from the stream
+  const snapshots = [];
   
   for (let i = 0; i < parts.length; i++) {
     const partBody = getNestedValue(parts[i], [2], null);
@@ -307,24 +308,46 @@ function parseGeminiStreamGenerateResponse(rawText) {
       const parsed = JSON.parse(partBody);
       const candidateList = getNestedValue(parsed, [4], []);
       if (Array.isArray(candidateList) && candidateList.length > 0) {
-        bodyIndex = i;
-        body = parsed;
-        break;
+        const firstCandidate = candidateList[0];
+        const textRaw = getNestedValue(firstCandidate, [1, 0], "");
+        const cardContent = /^http:\/\/googleusercontent\.com\/card_content\/\d+/.test(textRaw);
+        const text = cardContent
+          ? (getNestedValue(firstCandidate, [22, 0], null) ?? textRaw)
+          : textRaw;
+        const thoughts = getNestedValue(firstCandidate, [37, 0, 0], null);
+        const metadata = getNestedValue(parsed, [1], []);
+        
+        snapshots.push({
+          index: i,
+          body: parsed,
+          candidate: firstCandidate,
+          text,
+          thoughts,
+          metadata,
+        });
       }
     } catch {
       // ignore
     }
   }
 
-  const candidateList = getNestedValue(body, [4], []);
-  const firstCandidate = candidateList[0];
-  const textRaw = getNestedValue(firstCandidate, [1, 0], "");
-  const cardContent = /^http:\/\/googleusercontent\.com\/card_content\/\d+/.test(textRaw);
-  const text = cardContent
-    ? (getNestedValue(firstCandidate, [22, 0], null) ?? textRaw)
-    : textRaw;
-  const thoughts = getNestedValue(firstCandidate, [37, 0, 0], null);
-  const metadata = getNestedValue(body, [1], []);
+  // Select the last non-empty snapshot (file uploads emit progressive snapshots)
+  let selectedSnapshot = snapshots[snapshots.length - 1] || null;
+  
+  // If last snapshot has empty text but earlier ones don't, use the last non-empty
+  for (let i = snapshots.length - 1; i >= 0; i--) {
+    if (snapshots[i].text && snapshots[i].text.trim().length > 0) {
+      selectedSnapshot = snapshots[i];
+      break;
+    }
+  }
+
+  const bodyIndex = selectedSnapshot?.index ?? 0;
+  const body = selectedSnapshot?.body ?? null;
+  const firstCandidate = selectedSnapshot?.candidate ?? getNestedValue(body, [4, 0], null);
+  const text = selectedSnapshot?.text ?? "";
+  const thoughts = selectedSnapshot?.thoughts ?? null;
+  const metadata = selectedSnapshot?.metadata ?? [];
 
   const images = [];
 
