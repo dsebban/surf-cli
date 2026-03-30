@@ -706,12 +706,16 @@ async function runGeminiWebViaPage(input) {
     const typeResult = await jsEval(tabId, `
       const editor = document.querySelector('.ql-editor[contenteditable=true]');
       if (!editor) return JSON.stringify({ error: "No editor found on page" });
+      const quill = editor.__quill || editor.closest('.ql-container')?.__quill || editor.parentElement?.__quill;
       editor.focus();
+      if (quill) {
+        quill.setText('${fullPrompt}');
+        quill.setSelection(quill.getLength(), 0, 'silent');
+        return JSON.stringify({ ok: true, method: 'quill', len: quill.getText().trim().length });
+      }
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, '${fullPrompt}');
-      editor.dispatchEvent(new Event('input', { bubbles: true }));
-      editor.dispatchEvent(new Event('change', { bubbles: true }));
-      return JSON.stringify({ ok: true, len: editor.textContent.length });
+      return JSON.stringify({ ok: true, method: 'execCommand', len: (editor.textContent||'').trim().length });
     `);
     const typed = JSON.parse(JSON.parse(checkJsResult(typeResult, "Type prompt")));
     if (typed.error) throw new Error(typed.error);
@@ -766,14 +770,14 @@ async function runGeminiWebViaPage(input) {
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 800));
       const pollResult = await jsEval(tabId, `
+        const visible = (el) => !!el && (el.offsetParent !== null || el.getClientRects().length > 0);
         const ggImgs = Array.from(document.querySelectorAll('img[src*="gg-dl"]'))
-          .filter(i => i.naturalWidth >= 512)
-          .map(i => i.src);
+          .filter(i => i.naturalWidth >= 512).map(i => i.src);
         const loading = !!document.querySelector('mat-progress-bar, .loading-indicator, message-loading');
-        const turns = document.querySelectorAll('message-content');
-        const lastTurn = turns.length ? turns[turns.length - 1] : null;
-        const text = lastTurn ? lastTurn.textContent?.trim() : "";
-        return JSON.stringify({ ggImgs, loading, text, turns: turns.length });
+        const responseNodes = Array.from(document.querySelectorAll('model-response, message-content'))
+          .filter(el => visible(el) && !el.closest('rich-textarea, form, .input-area'));
+        const text = [...responseNodes].reverse().map(el => (el.textContent||'').trim()).find(Boolean) || "";
+        return JSON.stringify({ ggImgs, loading, text, turns: responseNodes.length });
       `);
       const poll = JSON.parse(JSON.parse(checkJsResult(pollResult, "Poll response")));
       const newImgs = poll.ggImgs.slice(imgCountBefore);
