@@ -9,6 +9,7 @@ const networkFormatters = require("./formatters/network.cjs");
 const networkStore = require("./network-store.cjs");
 const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
+const { shouldUseBunGemini, isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
 const { version: VERSION } = require("../package.json");
 
 const IS_WIN = process.platform === "win32";
@@ -370,7 +371,8 @@ const TOOLS = {
           output: "Output file path for image operations",
           youtube: "YouTube video URL to analyze",
           "aspect-ratio": "Aspect ratio for image generation (e.g., 1:1, 16:9)",
-          timeout: "Timeout in seconds (default: 300)"
+          timeout: "Timeout in seconds (default: 300)",
+          profile: "Chrome profile email for Bun headless auth (macOS, requires SURF_USE_BUN_GEMINI=1)"
         },
         examples: [
           { cmd: 'gemini "explain quantum computing"', desc: "Basic query" },
@@ -379,6 +381,7 @@ const TOOLS = {
           { cmd: 'gemini "a robot surfing" --generate-image /tmp/robot.png', desc: "Generate image" },
           { cmd: 'gemini "add sunglasses" --edit-image photo.jpg --output out.jpg', desc: "Edit image" },
           { cmd: 'gemini "summarize this video" --youtube "https://youtube.com/..."', desc: "YouTube analysis" },
+          { cmd: 'gemini "summarize" --profile dsebban883@gmail.com', desc: "Use specific Chrome profile (Bun)" },
         ]
       },
       "perplexity": {
@@ -2896,6 +2899,105 @@ const performAutoCapture = async () => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Bun-native Gemini path (opt-in via SURF_USE_BUN_GEMINI=1)
+// ---------------------------------------------------------------------------
+
+// Extract --profile before routing (Bun-only, macOS-only)
+const requestedProfile = (() => {
+  const raw = toolArgs.profile;
+  delete toolArgs.profile;   // never leak to legacy socket request
+  if (raw && typeof raw === "string") return raw.trim().toLowerCase();
+  return undefined;
+})();
+
+if (tool === "gemini" && requestedProfile) {
+  // --profile was explicitly requested — fail fast if conditions aren't met
+  if (process.platform !== "darwin") {
+    console.error("Error: --profile is only supported on macOS");
+    process.exit(1);
+  }
+  if (!shouldUseBunGemini(process.env)) {
+    console.error("Error: --profile requires Bun Gemini (set SURF_USE_BUN_GEMINI=1)");
+    process.exit(1);
+  }
+  if (toolArgs["with-page"] || toolArgs.withPage) {
+    console.error("Error: --profile cannot be used with --with-page");
+    process.exit(1);
+  }
+}
+
+if (tool === "gemini" && shouldUseBunGemini(process.env)) {
+  const eligibility = isBunGeminiEligible(toolArgs);
+  if (eligibility.eligible) {
+    // Pass profile into the toolArgs for the bridge
+    if (requestedProfile) toolArgs.profile = requestedProfile;
+    (async () => {
+      try {
+        const bunResult = await runGeminiViaBun(toolArgs);
+        if (bunResult.ok) {
+          const data = bunResult.result;
+          if (wantJson) {
+            console.log(JSON.stringify(data, null, 2));
+          } else {
+            console.log(data.response);
+            if (data.imagePath) {
+              console.log(`\nImage saved: ${data.imagePath}`);
+            }
+            console.error(`\n[${data.model || 'unknown'} | ${((data.tookMs || 0) / 1000).toFixed(1)}s | bun]`);
+          }
+          process.exit(0);
+        } else if (bunResult.fallbackRecommended) {
+          // When --profile was explicit, never fall back (wrong account risk)
+          if (requestedProfile) {
+            console.error(`Error: Bun Gemini failed with --profile: ${bunResult.error}`);
+            process.exit(1);
+          }
+          process.stderr.write(`[bun-gemini] Falling back to legacy path: ${bunResult.error}\n`);
+          startLegacySocketPath();
+        } else {
+          // Runtime error — honor --soft-fail / --auto-capture like legacy path
+          const errMsg = bunResult.error || "Bun Gemini worker error";
+          if (softFail) {
+            console.warn(`Warning: ${errMsg}`);
+            process.exit(0);
+          }
+          console.error(`Error: ${errMsg}`);
+          if (autoCapture) {
+            await performAutoCapture();
+          }
+          process.exit(1);
+        }
+      } catch (err) {
+        const errMsg = `Bun Gemini bridge failed: ${err.message}`;
+        if (softFail) {
+          console.warn(`Warning: ${errMsg}`);
+          process.exit(0);
+        }
+        console.error(`Error: ${errMsg}`);
+        if (autoCapture) {
+          await performAutoCapture();
+        }
+        process.exit(1);
+      }
+    })();
+  } else {
+    // Not eligible for Bun (e.g. --with-page) → legacy path
+    if (requestedProfile) {
+      console.error(`Error: --profile cannot be used with --with-page`);
+      process.exit(1);
+    }
+    if (eligibility.reason !== "with_page") {
+      process.stderr.write(`[bun-gemini] Not eligible: ${eligibility.reason}, using legacy path\n`);
+    }
+    startLegacySocketPath();
+  }
+} else {
+  startLegacySocketPath();
+}
+
+function startLegacySocketPath() {
+
 const socket = net.createConnection(SOCKET_PATH, () => {
   socket.write(JSON.stringify(request) + "\n");
 });
@@ -3238,3 +3340,5 @@ async function handleResponse(response) {
   socket.end();
   process.exit(0);
 }
+
+} // end startLegacySocketPath

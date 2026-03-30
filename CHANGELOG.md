@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.8.0] - 2026-03-30
+
+### Added
+- **Gemini headless mode** (`SURF_USE_BUN_GEMINI=1`) - Opt-in headless Gemini queries via Bun WebView, bypassing the Chrome extension and native host entirely. Uses Chrome's existing session cookies for authentication. Supports text queries, file uploads, image generation, image editing, model selection, and YouTube analysis. Requires Bun canary. Automatically falls back to the legacy extension-based path when Bun is unavailable or `--with-page` is used.
+- **Chrome profile auth** (`--profile <email>`) - Select which Chrome profile to use for Gemini headless auth. Reads cookies from the profile's SQLite DB, decrypts via Keychain, and injects via CDP. Defaults to Chrome's Default profile when omitted. macOS only.
+
+### Changed
+- **Gemini shared helpers extracted** - Prompt building, model resolution, and image URL helpers are now in `native/gemini-common.cjs`, shared between the legacy HTTP path and the new Bun WebView worker. No behavior changes.
+
 ## [2.7.1] - 2026-02-28
 
 ### Fixed

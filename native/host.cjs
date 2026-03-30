@@ -728,6 +728,16 @@ function handleToolRequest(msg, socket) {
           log(`[gemini] Sending EXECUTE_JAVASCRIPT id=${jsId} tabId=${tabId} code=${code.length} chars`);
           writeMessage({ type: "EXECUTE_JAVASCRIPT", tabId, code, id: jsId });
         }),
+        cdpCommand: (tabId, method, params) => new Promise((resolve) => {
+          const cdpId = ++requestCounter;
+          pendingToolRequests.set(cdpId, {
+            socket: null,
+            originalId: null,
+            tool: "cdp_command",
+            onComplete: (r) => resolve(r)
+          });
+          writeMessage({ type: "GEMINI_CDP_COMMAND", tabId, method, params: params || {}, id: cdpId });
+        }),
         uploadFile: (tabId, filePaths) => new Promise((resolve) => {
           const uploadId = ++requestCounter;
           pendingToolRequests.set(uploadId, {

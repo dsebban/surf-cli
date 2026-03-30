@@ -342,6 +342,8 @@ surf aistudio.build "game" --keep-open --timeout 600          # Keep tab open, 1
 
 Each AI tool uses your existing browser login - no API keys needed. Just be logged into the respective service in Chrome (chatgpt.com, gemini.google.com, perplexity.ai, x.com, or aistudio.google.com).
 
+**Gemini headless mode (opt-in):** Set `SURF_USE_BUN_GEMINI=1` to run Gemini queries via a headless Bun WebView — no Chrome extension or native host required. Requires [Bun canary](https://bun.sh) (`bun upgrade --canary`). Automatically falls back to the legacy extension-based path when Bun is unavailable or `--with-page` is used. On macOS, cookies are automatically injected from your Chrome Default profile. Use `--profile <email>` to select a specific Chrome profile (e.g. `surf gemini "hello" --profile user@gmail.com`).
+
 **Grok troubleshooting:** If queries fail, run `surf grok --validate` to check if the UI structure changed. Use `--save-models` to update the model cache in `surf.json`. Default model is "thinking" (Grok 4.1 Thinking).
 
 ### Waiting

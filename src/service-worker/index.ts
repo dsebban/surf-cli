@@ -2809,6 +2809,11 @@ export async function handleMessage(
       return result;
     }
 
+    case "GEMINI_CDP_COMMAND": {
+      const { method, params } = message;
+      return await cdp.sendCommand(message.tabId, method, params || {});
+    }
+
     case "GEMINI_NEW_TAB": {
       const tab = await chrome.tabs.create({
         url: "https://gemini.google.com/app",
@@ -3133,7 +3138,7 @@ const COMMANDS_WITHOUT_TAB = new Set([
   "GET_CHATGPT_COOKIES", "GET_GOOGLE_COOKIES", "GET_TWITTER_COOKIES",
   "PERPLEXITY_NEW_TAB", "PERPLEXITY_CLOSE_TAB", "PERPLEXITY_EVALUATE", "PERPLEXITY_CDP_COMMAND",
   "GROK_NEW_TAB", "GROK_CLOSE_TAB", "GROK_EVALUATE", "GROK_CDP_COMMAND",
-  "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "UPLOAD_FILE_TO_TAB",
+  "GEMINI_NEW_TAB", "GEMINI_CLOSE_TAB", "GEMINI_FETCH_URL", "UPLOAD_FILE_TO_TAB", "GEMINI_CDP_COMMAND",
   "AISTUDIO_NEW_TAB", "AISTUDIO_CLOSE_TAB", "AISTUDIO_EVALUATE", "AISTUDIO_CDP_COMMAND",
   "DOWNLOADS_SEARCH",
   "WINDOW_NEW", "WINDOW_LIST", "WINDOW_FOCUS", "WINDOW_CLOSE", "WINDOW_RESIZE",

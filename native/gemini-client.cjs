@@ -8,47 +8,38 @@
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const {
+  GEMINI_APP_URL,
+  DEFAULT_GEMINI_MODEL,
+  MODEL_HEADER_NAME,
+  MODEL_HEADERS,
+  MODEL_HEADER_OVERRIDES,
+  REQUIRED_COOKIES,
+  ALL_COOKIE_NAMES,
+  resolveGeminiModel,
+  getModelHeaderCandidates,
+  buildGeminiPrompt,
+  ensureFullSizeImageUrl: ensureFullSizeImageUrlShared,
+  extractGgdlUrls: extractGgdlUrlsShared,
+  resolveImageOutputPath,
+} = require("./gemini-common.cjs");
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const GEMINI_APP_URL = "https://gemini.google.com/app";
 const GEMINI_STREAM_GENERATE_URL = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const GEMINI_UPLOAD_URL = "https://content-push.googleapis.com/upload";
 const GEMINI_UPLOAD_PUSH_ID = "feeds/mcudyrk2a4khkz";
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-const MODEL_HEADER_NAME = "x-goog-ext-525001261-jspb";
-const MODEL_HEADERS = {
-  "gemini-3-pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]',
-  "gemini-2.5-pro": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]',
-  "gemini-2.5-flash": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4]]',
-};
+const GEMINI_ACCESS_TOKEN_CACHE_PATH = path.join(os.tmpdir(), "surf-gemini-at.json");
 
-const REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
 
-const ALL_COOKIE_NAMES = [
-  "__Secure-1PSID",
-  "__Secure-1PSIDTS", 
-  "__Secure-1PSIDCC",
-  "__Secure-1PAPISID",
-  "NID",
-  "AEC",
-  "SOCS",
-  "__Secure-BUCKET",
-  "__Secure-ENID",
-  "SID",
-  "HSID",
-  "SSID",
-  "APISID",
-  "SAPISID",
-  "__Secure-3PSID",
-  "__Secure-3PSIDTS",
-  "__Secure-3PAPISID",
-  "SIDCC",
-];
+// REQUIRED_COOKIES and ALL_COOKIE_NAMES imported from gemini-common.cjs
 
 // ============================================================================
 // Utility Functions
@@ -214,8 +205,40 @@ async function fetchWithRedirects(url, headers, maxRedirects = 10, binary = fals
 // Gemini API Functions
 // ============================================================================
 
+function _atCacheKey(cookieHeader) {
+  return crypto.createHash("sha256").update(cookieHeader).digest("hex");
+}
+function _readAtCache() {
+  try { return JSON.parse(fs.readFileSync(GEMINI_ACCESS_TOKEN_CACHE_PATH, "utf8")); } catch { return {}; }
+}
+function _writeAtCache(cache) {
+  try { fs.writeFileSync(GEMINI_ACCESS_TOKEN_CACHE_PATH, JSON.stringify(cache), "utf8"); } catch {}
+}
+function _readCachedAt(cookieHeader) {
+  const cache = _readAtCache(); const entry = cache[_atCacheKey(cookieHeader)];
+  if (!entry?.at || !entry?.ts) return null;
+  if (Date.now() - entry.ts > GEMINI_ACCESS_TOKEN_TTL_MS) { delete cache[_atCacheKey(cookieHeader)]; _writeAtCache(cache); return null; }
+  return entry.at;
+}
+function _writeCachedAt(cookieHeader, at) {
+  const cache = _readAtCache(); cache[_atCacheKey(cookieHeader)] = { at, ts: Date.now() }; _writeAtCache(cache);
+}
+function _clearCachedAt(cookieHeader) {
+  const cache = _readAtCache(); delete cache[_atCacheKey(cookieHeader)]; _writeAtCache(cache);
+}
+
+// Delegate to shared helper; keep local alias for __internal export compat
+function _getModelHeaderCandidates(model) {
+  return getModelHeaderCandidates(model);
+}
+
+function _hasMeaningfulOutput(r) {
+  return Boolean((typeof r?.text === "string" && r.text.trim()) || (Array.isArray(r?.images) && r.images.length > 0));
+}
+
 async function fetchGeminiAccessToken(cookieMap, opts = {}) {
   const cookieHeader = buildCookieHeader(cookieMap);
+  // AT (CSRF) token is single-use — always fetch fresh
   const res = await fetchWithRedirects(GEMINI_APP_URL, { cookie: cookieHeader }, 10, false, {
     ...opts,
     label: opts.label || "geminiAccessToken",
@@ -276,20 +299,11 @@ function isModelUnavailable(errorCode) {
 }
 
 function extractGgdlUrls(rawText) {
-  const matches = rawText.match(/https:\/\/lh3\.googleusercontent\.com\/gg-dl\/[^\s"']+/g) ?? [];
-  const seen = new Set();
-  const urls = [];
-  for (const match of matches) {
-    if (seen.has(match)) continue;
-    seen.add(match);
-    urls.push(match);
-  }
-  return urls;
+  return extractGgdlUrlsShared(rawText);
 }
 
 function ensureFullSizeImageUrl(url) {
-  if (url.includes("=s")) return url; // Already has size parameter
-  return `${url}=s2048`;
+  return ensureFullSizeImageUrlShared(url);
 }
 
 function parseGeminiStreamGenerateResponse(rawText) {
@@ -297,8 +311,9 @@ function parseGeminiStreamGenerateResponse(rawText) {
   const errorCode = extractErrorCode(responseJson);
 
   const parts = Array.isArray(responseJson) ? responseJson : [];
-  let bodyIndex = 0;
-  let body = null;
+  
+  // Collect all candidate snapshots from the stream
+  const snapshots = [];
   
   for (let i = 0; i < parts.length; i++) {
     const partBody = getNestedValue(parts[i], [2], null);
@@ -307,24 +322,46 @@ function parseGeminiStreamGenerateResponse(rawText) {
       const parsed = JSON.parse(partBody);
       const candidateList = getNestedValue(parsed, [4], []);
       if (Array.isArray(candidateList) && candidateList.length > 0) {
-        bodyIndex = i;
-        body = parsed;
-        break;
+        const firstCandidate = candidateList[0];
+        const textRaw = getNestedValue(firstCandidate, [1, 0], "");
+        const cardContent = /^http:\/\/googleusercontent\.com\/card_content\/\d+/.test(textRaw);
+        const text = cardContent
+          ? (getNestedValue(firstCandidate, [22, 0], null) ?? textRaw)
+          : textRaw;
+        const thoughts = getNestedValue(firstCandidate, [37, 0, 0], null);
+        const metadata = getNestedValue(parsed, [1], []);
+        
+        snapshots.push({
+          index: i,
+          body: parsed,
+          candidate: firstCandidate,
+          text,
+          thoughts,
+          metadata,
+        });
       }
     } catch {
       // ignore
     }
   }
 
-  const candidateList = getNestedValue(body, [4], []);
-  const firstCandidate = candidateList[0];
-  const textRaw = getNestedValue(firstCandidate, [1, 0], "");
-  const cardContent = /^http:\/\/googleusercontent\.com\/card_content\/\d+/.test(textRaw);
-  const text = cardContent
-    ? (getNestedValue(firstCandidate, [22, 0], null) ?? textRaw)
-    : textRaw;
-  const thoughts = getNestedValue(firstCandidate, [37, 0, 0], null);
-  const metadata = getNestedValue(body, [1], []);
+  // Select the last non-empty snapshot (file uploads emit progressive snapshots)
+  let selectedSnapshot = snapshots[snapshots.length - 1] || null;
+  
+  // If last snapshot has empty text but earlier ones don't, use the last non-empty
+  for (let i = snapshots.length - 1; i >= 0; i--) {
+    if (snapshots[i].text && snapshots[i].text.trim().length > 0) {
+      selectedSnapshot = snapshots[i];
+      break;
+    }
+  }
+
+  const bodyIndex = selectedSnapshot?.index ?? 0;
+  const body = selectedSnapshot?.body ?? null;
+  const firstCandidate = selectedSnapshot?.candidate ?? getNestedValue(body, [4, 0], null);
+  const text = selectedSnapshot?.text ?? "";
+  const thoughts = selectedSnapshot?.thoughts ?? null;
+  const metadata = selectedSnapshot?.metadata ?? [];
 
   const images = [];
 
@@ -516,78 +553,64 @@ function buildGeminiFReqPayload(prompt, uploaded, chatMetadata) {
   return JSON.stringify([null, JSON.stringify(innerList)]);
 }
 
+function _normalizeHttpResponse(rawResponseText, status, chatMetadata) {
+  if (status < 200 || status >= 300) {
+    return { rawResponseText, text: "", thoughts: null, metadata: chatMetadata ?? null, images: [], errorMessage: `Gemini request failed: ${status}` };
+  }
+  try {
+    const parsed = parseGeminiStreamGenerateResponse(rawResponseText);
+    return { rawResponseText, text: parsed.text ?? "", thoughts: parsed.thoughts, metadata: parsed.metadata, images: parsed.images, errorCode: parsed.errorCode };
+  } catch (error) {
+    let responseJson = null;
+    try { responseJson = JSON.parse(trimGeminiJsonEnvelope(rawResponseText)); } catch { responseJson = null; }
+    const errorCode = extractErrorCode(responseJson);
+    return { rawResponseText, text: "", thoughts: null, metadata: chatMetadata ?? null, images: [],
+      errorCode: typeof errorCode === "number" ? errorCode : undefined,
+      errorMessage: error instanceof Error ? error.message : String(error ?? "") };
+  }
+}
+
 async function runGeminiWebOnce(input) {
   const { prompt, files, model, cookieMap, chatMetadata, timeoutMs = 30000, log = null } = input;
   const cookieHeader = buildCookieHeader(cookieMap);
-  
-  // 1. Get access token
-  const at = await fetchGeminiAccessToken(cookieMap, { timeoutMs, log, label: "geminiAccessToken" });
 
-  // 2. Upload files
+  // Upload files
   const uploaded = [];
   for (const file of files ?? []) {
     uploaded.push(await uploadGeminiFile(file, cookieMap, { timeoutMs, log, label: "geminiUpload" }));
   }
 
-  // 3. Build request
   const fReq = buildGeminiFReqPayload(prompt, uploaded, chatMetadata);
   const params = new URLSearchParams();
-  params.set("at", at);
   params.set("f.req", fReq);
 
-  // 4. Send request
-  const res = await httpsPost(GEMINI_STREAM_GENERATE_URL, {
-    "content-type": "application/x-www-form-urlencoded;charset=utf-8",
-    "host": "gemini.google.com",
-    "origin": "https://gemini.google.com",
-    "referer": "https://gemini.google.com/",
-    "x-same-domain": "1",
-    "cookie": cookieHeader,
-    [MODEL_HEADER_NAME]: MODEL_HEADERS[model] || MODEL_HEADERS["gemini-3-pro"],
-  }, params.toString(), { timeoutMs, log, label: "geminiStreamGenerate" });
+  const modelHeaderCandidates = _getModelHeaderCandidates(model);
+  let lastResult = null;
 
-  const rawResponseText = res.text;
-  
-  if (res.status < 200 || res.status >= 300) {
-    return {
-      rawResponseText,
-      text: "",
-      thoughts: null,
-      metadata: chatMetadata ?? null,
-      images: [],
-      errorMessage: `Gemini request failed: ${res.status}`,
-    };
-  }
+  for (let tokenAttempt = 0; tokenAttempt < 2; tokenAttempt++) {
+    const at = await fetchGeminiAccessToken(cookieMap, { timeoutMs, log, label: "geminiAccessToken" });
+    params.set("at", at);
 
-  try {
-    const parsed = parseGeminiStreamGenerateResponse(rawResponseText);
-    return {
-      rawResponseText,
-      text: parsed.text ?? "",
-      thoughts: parsed.thoughts,
-      metadata: parsed.metadata,
-      images: parsed.images,
-      errorCode: parsed.errorCode,
-    };
-  } catch (error) {
-    let responseJson = null;
-    try {
-      responseJson = JSON.parse(trimGeminiJsonEnvelope(rawResponseText));
-    } catch {
-      responseJson = null;
+    let retryWithFreshToken = false;
+    for (const modelHeader of modelHeaderCandidates) {
+      if (log) log(`StreamGenerate: ${modelHeader ? "model-header" : "no-header"}`);
+      const headers = { "content-type": "application/x-www-form-urlencoded;charset=utf-8",
+        "host": "gemini.google.com", "origin": "https://gemini.google.com",
+        "referer": "https://gemini.google.com/", "x-same-domain": "1", "cookie": cookieHeader };
+      if (modelHeader) headers[MODEL_HEADER_NAME] = modelHeader;
+
+      const res = await httpsPost(GEMINI_STREAM_GENERATE_URL, headers, params.toString(), { timeoutMs, log, label: "geminiStreamGenerate" });
+      lastResult = _normalizeHttpResponse(res.text, res.status, chatMetadata);
+
+      if ([400, 401, 403].includes(res.status) && tokenAttempt === 0) { retryWithFreshToken = true; break; }
+      if (_hasMeaningfulOutput(lastResult) || typeof lastResult.errorCode === "number") return lastResult;
     }
-    const errorCode = extractErrorCode(responseJson);
 
-    return {
-      rawResponseText,
-      text: "",
-      thoughts: null,
-      metadata: chatMetadata ?? null,
-      images: [],
-      errorCode: typeof errorCode === "number" ? errorCode : undefined,
-      errorMessage: error instanceof Error ? error.message : String(error ?? ""),
-    };
+    if (!retryWithFreshToken) break;
+    _clearCachedAt(cookieHeader);
   }
+
+  return lastResult ?? { rawResponseText: "", text: "", thoughts: null, metadata: chatMetadata ?? null, images: [], errorMessage: "Gemini request returned no response" };
 }
 
 async function runGeminiWebWithFallback(input) {
@@ -607,7 +630,7 @@ async function runGeminiWebWithFallback(input) {
 // ============================================================================
 
 async function runGeminiWebViaPage(input) {
-  const { prompt, files, model, timeoutMs = 120000, log = null, createTab, closeTab, jsEval, fetchUrl, uploadFile } = input;
+  const { prompt, files, model, timeoutMs = 120000, log = null, createTab, closeTab, jsEval, cdpCommand, fetchUrl, uploadFile } = input;
 
   if (!createTab || !closeTab || !jsEval) {
     throw new Error("In-page execution requires createTab, closeTab, and jsEval callbacks");
@@ -620,7 +643,15 @@ async function runGeminiWebViaPage(input) {
     tabId = tabResult?.tabId;
     if (!tabId) throw new Error("Failed to create Gemini tab");
     if (log) log(`Gemini tab created: ${tabId}`);
-    await new Promise(r => setTimeout(r, 12000));
+    // Poll for editor ready instead of fixed 12s wait
+    {
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 300));
+        const check = await jsEval(tabId, `String(!!document.querySelector('.ql-editor[contenteditable=true]'))`);
+        if (check?.output === '"true"') break;
+      }
+    }
 
     if (files?.length && uploadFile) {
       const absFiles = files.map(f => path.resolve(process.cwd(), f));
@@ -640,13 +671,29 @@ async function runGeminiWebViaPage(input) {
     // Type prompt
     const fullPrompt = prompt.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
     if (log) log("Typing prompt...");
-    const typeResult = await jsEval(tabId, `
+    // Focus editor, then use CDP Input.insertText for reliable Angular state update
+    const focusResult = await jsEval(tabId, `
       const editor = document.querySelector('.ql-editor[contenteditable=true]');
       if (!editor) return JSON.stringify({ error: "No editor found on page" });
       editor.focus();
       document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, '${fullPrompt}');
-      return JSON.stringify({ ok: true, len: editor.textContent.length });
+      document.execCommand('delete', false, null);
+      return JSON.stringify({ ok: true });
+    `);
+    const focused = JSON.parse(JSON.parse(checkJsResult(focusResult, "Focus editor")));
+    if (focused.error) throw new Error(focused.error);
+
+    // CDP Input.insertText bypasses execCommand limitations and properly triggers framework events
+    if (cdpCommand) {
+      await cdpCommand(tabId, "Input.insertText", { text: prompt });
+      if (log) log("Typed via CDP Input.insertText");
+    } else {
+      await jsEval(tabId, `document.execCommand('insertText', false, '${fullPrompt}'); 'ok'`);
+    }
+
+    const typeResult = await jsEval(tabId, `
+      const editor = document.querySelector('.ql-editor[contenteditable=true]');
+      return JSON.stringify({ ok: true, len: editor ? editor.textContent.trim().length : 0 });
     `);
     const typed = JSON.parse(JSON.parse(checkJsResult(typeResult, "Type prompt")));
     if (typed.error) throw new Error(typed.error);
@@ -656,12 +703,38 @@ async function runGeminiWebViaPage(input) {
     `);
     const imgCountBefore = parseInt(JSON.parse(checkJsResult(beforeResult, "Count images")) || "0", 10);
 
+    // Poll for send button to be enabled instead of fixed delay
+    {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 150));
+        const check = await jsEval(tabId, `
+          const btn = document.querySelector('button[aria-label="Send message"]') || document.querySelector('button[aria-label*="Send"]');
+          String(btn && !btn.disabled);
+        `);
+        if (check?.output === '"true"') break;
+      }
+    }
+
     if (log) log("Submitting...");
     const sendResult = await jsEval(tabId, `
-      const btn = document.querySelector('button[aria-label="Send message"]');
-      if (!btn) return 'no-btn';
-      btn.click();
-      return 'sent';
+      // Try aria-label first, then broader search, then Enter key
+      const btn = document.querySelector('button[aria-label="Send message"]')
+        || document.querySelector('button[aria-label*="Send"]')
+        || document.querySelector('button[aria-label*="send"]')
+        || [...document.querySelectorAll('button')].find(b => {
+            const icon = b.querySelector('mat-icon, svg');
+            return icon && b.closest('rich-textarea, .input-area, form');
+          });
+      if (btn) { btn.click(); return 'sent-btn'; }
+      // Fallback: Enter key on the editor
+      const editor = document.querySelector('.ql-editor[contenteditable=true]');
+      if (editor) {
+        editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+        editor.dispatchEvent(new KeyboardEvent('keyup',  {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+        return 'sent-enter';
+      }
+      return 'no-btn';
     `);
     const sendVal = JSON.parse(checkJsResult(sendResult, "Click send"));
     if (sendVal === "no-btn") throw new Error("Send button not found on Gemini page");
@@ -673,16 +746,16 @@ async function runGeminiWebViaPage(input) {
     let responseText = "";
 
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 800));
       const pollResult = await jsEval(tabId, `
+        const visible = (el) => !!el && (el.offsetParent !== null || el.getClientRects().length > 0);
         const ggImgs = Array.from(document.querySelectorAll('img[src*="gg-dl"]'))
-          .filter(i => i.naturalWidth >= 512)
-          .map(i => i.src);
+          .filter(i => i.naturalWidth >= 512).map(i => i.src);
         const loading = !!document.querySelector('mat-progress-bar, .loading-indicator, message-loading');
-        const turns = document.querySelectorAll('message-content');
-        const lastTurn = turns.length ? turns[turns.length - 1] : null;
-        const text = lastTurn ? lastTurn.textContent?.trim() : "";
-        return JSON.stringify({ ggImgs, loading, text, turns: turns.length });
+        const responseNodes = Array.from(document.querySelectorAll('model-response, message-content'))
+          .filter(el => visible(el) && !el.closest('rich-textarea, form, .input-area'));
+        const text = [...responseNodes].reverse().map(el => (el.textContent||'').trim()).find(Boolean) || "";
+        return JSON.stringify({ ggImgs, loading, text, turns: responseNodes.length });
       `);
       const poll = JSON.parse(JSON.parse(checkJsResult(pollResult, "Poll response")));
       const newImgs = poll.ggImgs.slice(imgCountBefore);
@@ -751,6 +824,7 @@ async function query(options) {
     createTab,
     closeTab,
     jsEval,
+    cdpCommand,
     fetchUrl,
     uploadFile,
     timeout = 300000,
@@ -776,19 +850,10 @@ async function query(options) {
   log(`Got ${Object.keys(cookieMap).length} Gemini cookies`);
 
   // 2. Resolve model
-  const resolvedModel = MODEL_HEADERS[model] ? model : "gemini-3-pro";
+  const resolvedModel = resolveGeminiModel(model);
 
   // 3. Build prompt
-  let fullPrompt = prompt || "";
-  if (aspectRatio && (generateImage || editImage)) {
-    fullPrompt = `${fullPrompt} (aspect ratio: ${aspectRatio})`;
-  }
-  if (youtube) {
-    fullPrompt = `${fullPrompt}\n\nYouTube video: ${youtube}`;
-  }
-  if (generateImage && !editImage) {
-    fullPrompt = `Generate an image: ${fullPrompt}`;
-  }
+  const fullPrompt = buildGeminiPrompt({ prompt, youtube, aspectRatio, generateImage, editImage });
 
   // 4. Collect files
   const files = file ? [file] : [];
@@ -814,6 +879,7 @@ async function query(options) {
         createTab,
         closeTab,
         jsEval,
+        cdpCommand,
         fetchUrl,
         uploadFile,
       });
@@ -877,19 +943,25 @@ async function query(options) {
       imagePath = generateImage;
       
     } else {
-      // Text query
-      log("Sending text query...");
-      const out = await runGeminiWebWithFallback({
-        prompt: fullPrompt,
-        files,
-        model: resolvedModel,
-        cookieMap,
-        chatMetadata: null,
-        timeoutMs: timeout,
-        log,
-      });
+      // Text query — direct HTTP first (fast, no browser), browser UI only as rescue
+      log("Sending text query via direct transport...");
+      const directInput = {
+        prompt: fullPrompt, files, model: resolvedModel, cookieMap, chatMetadata: null, timeoutMs: timeout, log,
+      };
+      response = await runGeminiWebWithFallback(directInput);
 
-      response = out;
+      if (!_hasMeaningfulOutput(response)) {
+        if (!hasPageCallbacks) {
+          throw new Error(response.errorMessage || "Gemini direct transport returned no text");
+        }
+        log(`Direct transport empty (${response.errorMessage || "no text"}) — falling back to browser UI`);
+        const out = await runGeminiWebViaPage({
+          prompt: fullPrompt, files, model: resolvedModel, timeoutMs: timeout, log,
+          createTab, closeTab, jsEval, cdpCommand, fetchUrl, uploadFile,
+        });
+        if (!out.text || !out.text.trim()) throw new Error("Gemini browser UI returned empty text");
+        response = out;
+      }
     }
   } catch (error) {
     throw new Error(`Gemini request failed: ${error.message}`);
@@ -920,4 +992,5 @@ module.exports = {
   REQUIRED_COOKIES,
   ALL_COOKIE_NAMES,
   GEMINI_APP_URL,
+  __internal: { _getModelHeaderCandidates, _hasMeaningfulOutput },
 };
