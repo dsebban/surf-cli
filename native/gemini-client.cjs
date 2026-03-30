@@ -706,9 +706,18 @@ async function runGeminiWebViaPage(input) {
       const editor = document.querySelector('.ql-editor[contenteditable=true]');
       if (!editor) return JSON.stringify({ error: "No editor found on page" });
       editor.focus();
+      // Clear existing content
       document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, '${fullPrompt}');
-      return JSON.stringify({ ok: true, len: editor.textContent.length });
+      document.execCommand('delete', false, null);
+      // Paste triggers Quill's paste handler which properly updates Angular model state
+      const dt = new DataTransfer();
+      dt.setData('text/plain', '${fullPrompt}');
+      editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      // Fallback: execCommand if paste didn't populate
+      if (!editor.textContent.trim()) {
+        document.execCommand('insertText', false, '${fullPrompt}');
+      }
+      return JSON.stringify({ ok: true, len: editor.textContent.trim().length });
     `);
     const typed = JSON.parse(JSON.parse(checkJsResult(typeResult, "Type prompt")));
     if (typed.error) throw new Error(typed.error);
