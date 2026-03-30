@@ -669,6 +669,8 @@ async function runGeminiWebViaPage(input) {
       editor.focus();
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, '${fullPrompt}');
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      editor.dispatchEvent(new Event('change', { bubbles: true }));
       return JSON.stringify({ ok: true, len: editor.textContent.length });
     `);
     const typed = JSON.parse(JSON.parse(checkJsResult(typeResult, "Type prompt")));
@@ -679,12 +681,28 @@ async function runGeminiWebViaPage(input) {
     `);
     const imgCountBefore = parseInt(JSON.parse(checkJsResult(beforeResult, "Count images")) || "0", 10);
 
+    // Small delay for React to process the input event and enable the send button
+    await new Promise(r => setTimeout(r, 800));
+
     if (log) log("Submitting...");
     const sendResult = await jsEval(tabId, `
-      const btn = document.querySelector('button[aria-label="Send message"]');
-      if (!btn) return 'no-btn';
-      btn.click();
-      return 'sent';
+      // Try aria-label first, then broader search, then Enter key
+      const btn = document.querySelector('button[aria-label="Send message"]')
+        || document.querySelector('button[aria-label*="Send"]')
+        || document.querySelector('button[aria-label*="send"]')
+        || [...document.querySelectorAll('button')].find(b => {
+            const icon = b.querySelector('mat-icon, svg');
+            return icon && b.closest('rich-textarea, .input-area, form');
+          });
+      if (btn) { btn.click(); return 'sent-btn'; }
+      // Fallback: Enter key on the editor
+      const editor = document.querySelector('.ql-editor[contenteditable=true]');
+      if (editor) {
+        editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+        editor.dispatchEvent(new KeyboardEvent('keyup',  {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+        return 'sent-enter';
+      }
+      return 'no-btn';
     `);
     const sendVal = JSON.parse(checkJsResult(sendResult, "Click send"));
     if (sendVal === "no-btn") throw new Error("Send button not found on Gemini page");
@@ -900,9 +918,9 @@ async function query(options) {
       imagePath = generateImage;
       
     } else {
-      // Text query
+      // Text query — prefer browser UI path (direct StreamGenerate can return empty wrb.fr payloads)
       log("Sending text query...");
-      const out = await runGeminiWebWithFallback({
+      const directInput = {
         prompt: fullPrompt,
         files,
         model: resolvedModel,
@@ -910,9 +928,33 @@ async function query(options) {
         chatMetadata: null,
         timeoutMs: timeout,
         log,
-      });
-
-      response = out;
+      };
+      if (hasPageCallbacks) {
+        try {
+          log("Using browser UI path for text query...");
+          const out = await runGeminiWebViaPage({
+            prompt: fullPrompt,
+            files,
+            model: resolvedModel,
+            timeoutMs: timeout,
+            log,
+            createTab,
+            closeTab,
+            jsEval,
+            fetchUrl,
+            uploadFile,
+          });
+          if (!out.text || !out.text.trim()) {
+            throw new Error("Gemini browser UI returned empty text");
+          }
+          response = out;
+        } catch (pageError) {
+          log(`Browser UI path failed: ${pageError.message} — falling back to direct transport`);
+          response = await runGeminiWebWithFallback(directInput);
+        }
+      } else {
+        response = await runGeminiWebWithFallback(directInput);
+      }
     }
   } catch (error) {
     throw new Error(`Gemini request failed: ${error.message}`);
