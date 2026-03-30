@@ -11,6 +11,7 @@ const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { shouldUseBunGemini, isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
 const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require("./chatgpt-bun-bridge.cjs");
+const { isCloakBrowserAvailable, queryWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
 const { version: VERSION } = require("../package.json");
 
 const IS_WIN = process.platform === "win32";
@@ -350,18 +351,18 @@ const TOOLS = {
         opts: { 
           "with-page": "Include current page context",
           model: "Model: gpt-4o, o3, o4-mini, etc.",
-          file: "Attach file (requires SURF_USE_BUN_CHATGPT=1)",
-          "generate-image": "Generate image and save to path (requires SURF_USE_BUN_CHATGPT=1)",
+          file: "Attach file (requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)",
+          "generate-image": "Generate image and save to path (requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)",
           timeout: "Timeout in seconds (default: 2700 = 45min)",
-          profile: "Chrome profile email for Bun headless auth (macOS, requires SURF_USE_BUN_CHATGPT=1)"
+          profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)"
         },
         examples: [
           { cmd: 'chatgpt "explain this code"', desc: "Basic query" },
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
-          { cmd: 'chatgpt "review" --file code.ts', desc: "With file (Bun)" },
+          { cmd: 'chatgpt "review" --file code.ts', desc: "With file (headless)" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
-          { cmd: 'chatgpt "robot surfing" --generate-image /tmp/robot.png', desc: "Generate image (Bun)" },
-          { cmd: 'chatgpt "hello" --profile me@gmail.com', desc: "Use specific Chrome profile (Bun)" },
+          { cmd: 'chatgpt "robot surfing" --generate-image /tmp/robot.png', desc: "Generate image (headless)" },
+          { cmd: 'chatgpt "hello" --profile me@gmail.com', desc: "Use Chrome profile (headless)" },
         ]
       },
       "gemini": { 
@@ -2930,14 +2931,17 @@ const hasBunOnlyChatGPTFeature = !!(
   toolArgs.file || toolArgs["generate-image"] || requestedProfile
 );
 
-if (tool === "chatgpt" && hasBunOnlyChatGPTFeature && !shouldUseBunChatGPT(process.env)) {
+// CloakBrowser check (defined here to avoid TDZ issues)
+const shouldUseCloakChatGPT = () => process.env.SURF_USE_CLOAK_CHATGPT === "1";
+
+if (tool === "chatgpt" && hasBunOnlyChatGPTFeature && !shouldUseBunChatGPT(process.env) && !shouldUseCloakChatGPT()) {
   // Bun-only feature requested but env flag not set — fail fast
   const features = [
     toolArgs.file && "--file",
     toolArgs["generate-image"] && "--generate-image",
     requestedProfile && "--profile",
   ].filter(Boolean).join(", ");
-  console.error(`Error: ${features} requires Bun ChatGPT (set SURF_USE_BUN_CHATGPT=1)`);
+  console.error(`Error: ${features} requires headless mode (set SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)`);
   process.exit(1);
 }
 
@@ -2951,6 +2955,74 @@ if (tool === "chatgpt" && requestedProfile) {
     process.exit(1);
   }
 }
+
+// ---------------------------------------------------------------------------
+// CloakBrowser ChatGPT path (opt-in via SURF_USE_CLOAK_CHATGPT=1)
+// Premium stealth: C++ patches, human-like behavior, defeats detection
+// ---------------------------------------------------------------------------
+
+if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
+  (async () => {
+    try {
+      if (!isCloakBrowserAvailable()) {
+        console.error("Error: CloakBrowser not installed. Run: npm install -g cloakbrowser");
+        process.exit(1);
+      }
+      
+      if (requestedProfile) toolArgs.profile = requestedProfile;
+      if (toolArgs["generate-image"]) toolArgs.generateImage = toolArgs["generate-image"];
+      
+      const startMs = Date.now();
+      let lastProgress = "";
+      
+      const result = await queryWithCloakBrowser(toolArgs, (progress) => {
+        const msg = `[cloak-chatgpt] [${progress.step}/${progress.total}] ${progress.message}`;
+        if (msg !== lastProgress) {
+          process.stderr.write(msg + "\n");
+          lastProgress = msg;
+        }
+      });
+      
+      const durationMs = result.tookMs || (Date.now() - startMs);
+      
+      if (result.imagePath) {
+        process.stderr.write(`Image saved: ${result.imagePath}\n`);
+      }
+      
+      if (wantJson) {
+        console.log(JSON.stringify({
+          response: result.response,
+          model: result.model,
+          tookMs: durationMs,
+          imagePath: result.imagePath || undefined,
+          partial: result.partial || undefined,
+          backend: "cloak"
+        }, null, 2));
+      } else {
+        console.log(result.response);
+        const suffix = result.partial ? ' | partial' : '';
+        console.error(`\n[${result.model || 'unknown'} | ${(durationMs / 1000).toFixed(1)}s | cloak${suffix}]`);
+      }
+      process.exit(0);
+    } catch (err) {
+      const errMsg = `CloakBrowser failed: ${err.message}`;
+      if (softFail) {
+        console.warn(`Warning: ${errMsg}`);
+        process.exit(0);
+      }
+      console.error(`Error: ${errMsg}`);
+      if (autoCapture) {
+        await performAutoCapture();
+      }
+      process.exit(1);
+    }
+  })();
+  return; // Prevent falling through to Bun or legacy
+}
+
+// ---------------------------------------------------------------------------
+// Bun-native ChatGPT path (opt-in via SURF_USE_BUN_CHATGPT=1)
+// ---------------------------------------------------------------------------
 
 if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
   const eligibility = isBunChatGPTEligible(toolArgs);
