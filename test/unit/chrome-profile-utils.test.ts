@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 
 const utils = require("../../native/chrome-profile-utils.cjs");
 
@@ -6,23 +6,14 @@ describe("chrome-profile-utils", () => {
   describe("extractProfileEmails", () => {
     it("extracts emails from account_info", () => {
       const prefs = {
-        account_info: [
-          { email: "Alice@Example.com" },
-          { email: "bob@test.org" },
-        ],
+        account_info: [{ email: "Alice@Example.com" }, { email: "bob@test.org" }],
       };
-      expect(utils.extractProfileEmails(prefs)).toEqual([
-        "alice@example.com",
-        "bob@test.org",
-      ]);
+      expect(utils.extractProfileEmails(prefs)).toEqual(["alice@example.com", "bob@test.org"]);
     });
 
     it("dedupes emails", () => {
       const prefs = {
-        account_info: [
-          { email: "same@example.com" },
-          { email: "Same@Example.com" },
-        ],
+        account_info: [{ email: "same@example.com" }, { email: "Same@Example.com" }],
       };
       expect(utils.extractProfileEmails(prefs)).toEqual(["same@example.com"]);
     });
@@ -31,9 +22,7 @@ describe("chrome-profile-utils", () => {
       const prefs = {
         google: { services: { last_username: "fallback@gmail.com" } },
       };
-      expect(utils.extractProfileEmails(prefs)).toEqual([
-        "fallback@gmail.com",
-      ]);
+      expect(utils.extractProfileEmails(prefs)).toEqual(["fallback@gmail.com"]);
     });
 
     it("ignores last_username without @", () => {
@@ -111,10 +100,7 @@ describe("chrome-profile-utils", () => {
     });
 
     it("returns error for unknown email", () => {
-      const result = utils.resolveChromeProfile(
-        candidates,
-        "nobody@nowhere.com"
-      );
+      const result = utils.resolveChromeProfile(candidates, "nobody@nowhere.com");
       expect(result.error).toBeDefined();
       expect(result.code).toBe("profile_not_found");
     });
@@ -172,15 +158,11 @@ describe("chrome-profile-utils", () => {
 
   describe("decryptCookieValue", () => {
     it("returns null for non-v10 prefix", () => {
-      expect(
-        utils.decryptCookieValue(Buffer.from("v20abcd"), Buffer.alloc(16))
-      ).toBeNull();
+      expect(utils.decryptCookieValue(Buffer.from("v20abcd"), Buffer.alloc(16))).toBeNull();
     });
 
     it("returns null for too-short buffer", () => {
-      expect(
-        utils.decryptCookieValue(Buffer.from("v1"), Buffer.alloc(16))
-      ).toBeNull();
+      expect(utils.decryptCookieValue(Buffer.from("v1"), Buffer.alloc(16))).toBeNull();
     });
 
     it("returns null for null/undefined", () => {
@@ -190,7 +172,7 @@ describe("chrome-profile-utils", () => {
 
     it("round-trips with known key + ciphertext", () => {
       // Encrypt a known value with v10 prefix + AES-128-CBC + space IV
-      const crypto = require("crypto");
+      const crypto = require("node:crypto");
       const key = utils.deriveChromeCookieKey("test-key-for-round-trip");
       const iv = Buffer.alloc(16, 0x20);
 
@@ -249,7 +231,9 @@ describe("chrome-profile-utils", () => {
     it("discovers at least one profile on this machine", () => {
       // Only runs when Chrome is installed and SURF_TEST_LIVE=1 is set.
       // Skip in CI or machines without a populated Chrome profile.
-      if (process.platform !== "darwin" || !process.env.SURF_TEST_LIVE) return;
+      if (process.platform !== "darwin" || !process.env.SURF_TEST_LIVE) {
+        return;
+      }
       const profiles = utils.discoverChromeProfiles();
       expect(profiles.length).toBeGreaterThan(0);
       expect(profiles[0]).toHaveProperty("dirName");

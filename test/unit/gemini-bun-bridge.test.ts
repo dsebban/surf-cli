@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, expect, it } from "vitest";
 
 const bridge = require("../../native/gemini-bun-bridge.cjs");
 
@@ -129,7 +129,7 @@ describe("gemini-bun-bridge", () => {
     it("returns error with fallback for empty stdout", async () => {
       // We can't easily mock spawn, but we can test with a deliberately bad worker
       // by pointing to a non-existent script — spawn_failed
-      const { execFileSync } = require("child_process");
+      const { execFileSync } = require("node:child_process");
       try {
         execFileSync("which", ["bun"], { encoding: "utf-8", timeout: 3000 });
       } catch {
@@ -138,23 +138,25 @@ describe("gemini-bun-bridge", () => {
       }
 
       // Create a temp worker that outputs nothing
-      const fs = require("fs");
-      const path = require("path");
-      const tmpWorker = path.join(require("os").tmpdir(), "surf-test-empty-worker.ts");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const tmpWorker = path.join(require("node:os").tmpdir(), "surf-test-empty-worker.ts");
       fs.writeFileSync(tmpWorker, "// empty — no output\n");
 
       // Monkey-patch __dirname temporarily — not feasible in CJS module,
       // so just validate the protocol error shape from a real spawn
       // We'll test the bridge's internal parsing via a controlled child
-      const { spawn } = require("child_process");
+      const { spawn } = require("node:child_process");
       const result = await new Promise((resolve) => {
         const bunPath = execFileSync("which", ["bun"], { encoding: "utf-8" }).trim();
         const child = spawn(bunPath, [tmpWorker], { stdio: ["pipe", "pipe", "pipe"] });
         child.stdin.write(JSON.stringify({ prompt: "test" }));
         child.stdin.end();
         let stdout = "";
-        child.stdout.on("data", (d: any) => { stdout += d.toString(); });
-        child.on("close", (code: number) => {
+        child.stdout.on("data", (d: any) => {
+          stdout += d.toString();
+        });
+        child.on("close", (_code: number) => {
           // Simulate bridge parsing
           const lines = stdout.trim().split("\n").filter(Boolean);
           const lastLine = lines[lines.length - 1] || "";
@@ -175,26 +177,28 @@ describe("gemini-bun-bridge", () => {
     });
 
     it("handles invalid JSON from worker stdout", async () => {
-      const { execFileSync } = require("child_process");
+      const { execFileSync } = require("node:child_process");
       try {
         execFileSync("which", ["bun"], { encoding: "utf-8", timeout: 3000 });
       } catch {
         return; // Bun not installed — skip
       }
 
-      const fs = require("fs");
-      const path = require("path");
-      const tmpWorker = path.join(require("os").tmpdir(), "surf-test-bad-json-worker.ts");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const tmpWorker = path.join(require("node:os").tmpdir(), "surf-test-bad-json-worker.ts");
       fs.writeFileSync(tmpWorker, 'process.stdout.write("NOT_JSON\\n");\n');
 
-      const { spawn } = require("child_process");
+      const { spawn } = require("node:child_process");
       const result = await new Promise((resolve) => {
         const bunPath = execFileSync("which", ["bun"], { encoding: "utf-8" }).trim();
         const child = spawn(bunPath, [tmpWorker], { stdio: ["pipe", "pipe", "pipe"] });
         child.stdin.write(JSON.stringify({ prompt: "test" }));
         child.stdin.end();
         let stdout = "";
-        child.stdout.on("data", (d: any) => { stdout += d.toString(); });
+        child.stdout.on("data", (d: any) => {
+          stdout += d.toString();
+        });
         child.on("close", () => {
           const lines = stdout.trim().split("\n").filter(Boolean);
           const lastLine = lines[lines.length - 1] || "";

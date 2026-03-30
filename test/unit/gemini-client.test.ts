@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 
 // Simple test to verify the gemini client module loads
 const geminiClient = require("../../native/gemini-client.cjs");
