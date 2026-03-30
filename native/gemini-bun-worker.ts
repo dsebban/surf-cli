@@ -232,11 +232,21 @@ async function waitForSendButton(wv: WebView, timeoutMs = 3000) {
 // Response extraction
 // ============================================================================
 
+interface ImageCandidate {
+  source: string;        // fetchable URL (img src, blob:, data:, etc.)
+  kind: "img" | "source" | "link";
+  width: number;
+  height: number;
+  fingerprint: string;   // stable dedup key
+  isDisplayImage: boolean;
+}
+
 interface PollState {
   text: string;
-  imageUrls: string[];
+  imageCandidates: ImageCandidate[];
   loading: boolean;
   turnCount: number;
+  latestTurnKey: string; // stable ID for last turn (outerHTML hash or index)
 }
 
 async function pollResponseState(wv: WebView): Promise<PollState> {
@@ -245,16 +255,60 @@ async function pollResponseState(wv: WebView): Promise<PollState> {
       var turns = document.querySelectorAll('model-response');
       var last = turns.length > 0 ? turns[turns.length - 1] : null;
 
+      // Text from latest response
       var text = '';
       if (last) {
         var mc = last.querySelector('message-content');
         text = mc ? (mc.textContent || '').trim() : (last.textContent || '').trim();
       }
 
-      var imgs = [];
-      var imgEls = document.querySelectorAll('img[src*="gg-dl"]');
-      for (var i = 0; i < imgEls.length; i++) {
-        if (imgEls[i].naturalWidth >= 512) imgs.push(imgEls[i].src);
+      // Stable key for the last turn (use index + first 40 chars of text)
+      var latestTurnKey = turns.length + ':' + text.slice(0, 40);
+
+      // Collect image candidates from the latest model-response subtree
+      var candidates = [];
+      var seen = {};
+      var root = last || document;
+
+      // 1. <img> elements
+      var imgs = root.querySelectorAll('img');
+      for (var i = 0; i < imgs.length; i++) {
+        var el = imgs[i];
+        var src = el.currentSrc || el.src || '';
+        if (!src || src.startsWith('data:image/svg') || src.endsWith('.svg')) continue;
+        var w = el.naturalWidth || el.clientWidth || 0;
+        var h = el.naturalHeight || el.clientHeight || 0;
+        if (Math.max(w, h) < 256) continue;
+        var fp = src.split('?')[0].slice(-80);
+        if (seen[fp]) continue;
+        seen[fp] = true;
+        candidates.push({ source: src, kind: 'img', width: w, height: h, fingerprint: fp, isDisplayImage: true });
+      }
+
+      // 2. <picture><source srcset> if no img candidates yet
+      if (candidates.length === 0) {
+        var sources = root.querySelectorAll('picture source[srcset]');
+        for (var i = 0; i < sources.length; i++) {
+          var srcset = sources[i].getAttribute('srcset') || '';
+          var parts = srcset.trim().split(',').map(function(p) { return p.trim().split(/\s+/)[0]; }).filter(Boolean);
+          var src = parts[parts.length - 1] || '';
+          if (!src) continue;
+          var fp = src.split('?')[0].slice(-80);
+          if (seen[fp]) continue;
+          seen[fp] = true;
+          candidates.push({ source: src, kind: 'source', width: 0, height: 0, fingerprint: fp, isDisplayImage: true });
+        }
+      }
+
+      // 3. <a href> download links (secondary)
+      var links = root.querySelectorAll('a[href]');
+      for (var i = 0; i < links.length; i++) {
+        var href = links[i].href || '';
+        if (!href || !(href.startsWith('blob:') || href.startsWith('data:image') || href.includes('googleusercontent') || href.includes('gg-dl'))) continue;
+        var fp = href.split('?')[0].slice(-80);
+        if (seen[fp]) continue;
+        seen[fp] = true;
+        candidates.push({ source: href, kind: 'link', width: 0, height: 0, fingerprint: fp, isDisplayImage: false });
       }
 
       var loading = !!(
@@ -263,64 +317,106 @@ async function pollResponseState(wv: WebView): Promise<PollState> {
         document.querySelector('message-loading')
       );
 
-      return { text: text, imageUrls: imgs, loading: loading, turnCount: turns.length };
+      return {
+        text: text,
+        imageCandidates: candidates,
+        loading: loading,
+        turnCount: turns.length,
+        latestTurnKey: latestTurnKey,
+      };
     })()
   `);
 }
 
+const IMAGE_GENERATING_PATTERNS = [
+  /creating your image/i,
+  /generating image/i,
+  /^generating\b/i,
+];
+
+function isImagePlaceholderText(text: string): boolean {
+  return IMAGE_GENERATING_PATTERNS.some((re) => re.test(text.trim()));
+}
+
+function newDisplayCandidates(state: PollState, baseline: PollState): ImageCandidate[] {
+  const bfp = new Set(baseline.imageCandidates.map((c) => c.fingerprint));
+  return state.imageCandidates.filter((c) => !bfp.has(c.fingerprint) && c.isDisplayImage);
+}
+
 async function waitForResponse(
   wv: WebView,
-  baselineTurnCount: number,
-  baselineImageUrls: string[],
+  baseline: PollState,
   timeoutMs: number,
-): Promise<{ text: string; imageUrls: string[] }> {
+  expectsImage: boolean,
+): Promise<{ text: string; imageCandidates: ImageCandidate[] }> {
   const deadline = Date.now() + timeoutMs;
   let stableCount = 0;
-  // Only track content AFTER a new turn has been observed, to prevent
-  // returning stale text from a previous conversation on timeout.
-  let sawNewTurn = false;
-  let lastNewTurnText = "";
-  let lastNewTurnImgCount = 0;
-  const baselineImgSet = new Set(baselineImageUrls);
+  let sawNewActivity = false;
+  let lastText = "";
+  let lastImgFingerprints = "";
+  let lastGoodCandidates: ImageCandidate[] = [];
 
   while (Date.now() < deadline) {
-    await delay(600);
-
+    await delay(700);
     const state = await pollResponseState(wv);
-    const newImgs = state.imageUrls.filter((u) => !baselineImgSet.has(u));
-    const hasNewTurn = state.turnCount > baselineTurnCount;
 
-    if (hasNewTurn) {
-      sawNewTurn = true;
-      const hasContent = !!(state.text && state.text.length > 0) || newImgs.length > 0;
+    const hasNewTurn =
+      state.turnCount > baseline.turnCount ||
+      state.latestTurnKey !== baseline.latestTurnKey;
 
-      if (hasContent && !state.loading) {
-        // Stability: same content on 2 consecutive polls → done
-        if (state.text === lastNewTurnText && newImgs.length === lastNewTurnImgCount) {
+    const newImgs = newDisplayCandidates(state, baseline);
+    const imgFp = newImgs.map((c) => c.fingerprint).sort().join("|");
+
+    if (hasNewTurn || newImgs.length > 0) {
+      sawNewActivity = true;
+    }
+
+    if (!sawNewActivity) continue;
+
+    if (expectsImage) {
+      // For image mode: require at least one new display image before completing
+      if (newImgs.length === 0) { stableCount = 0; continue; }
+      if (!state.loading) {
+        if (imgFp === lastImgFingerprints) {
           stableCount++;
-          if (stableCount >= 2) {
-            return { text: state.text, imageUrls: newImgs };
-          }
+          if (stableCount >= 2) return { text: state.text, imageCandidates: newImgs };
+        } else {
+          stableCount = 0;
+          lastGoodCandidates = newImgs;
+        }
+        lastImgFingerprints = imgFp;
+      } else {
+        stableCount = 0;
+      }
+    } else {
+      // Text mode
+      const hasContent = state.text.length > 0;
+      if (hasContent && !state.loading) {
+        if (state.text === lastText) {
+          stableCount++;
+          if (stableCount >= 2) return { text: state.text, imageCandidates: newImgs };
         } else {
           stableCount = 0;
         }
-        lastNewTurnText = state.text;
-        lastNewTurnImgCount = newImgs.length;
+        lastText = state.text;
       } else {
         stableCount = 0;
       }
     }
   }
 
-  // Timeout — only return cached content if a new turn was actually observed
-  if (sawNewTurn && lastNewTurnText) {
-    const state = await pollResponseState(wv);
-    const newImgs = state.imageUrls.filter((u) => !baselineImgSet.has(u));
-    return { text: lastNewTurnText, imageUrls: newImgs };
+  // Timeout — return best observed if activity was seen
+  if (sawNewActivity) {
+    if (expectsImage && lastGoodCandidates.length > 0) {
+      return { text: lastText, imageCandidates: lastGoodCandidates };
+    }
+    if (!expectsImage && lastText) {
+      return { text: lastText, imageCandidates: [] };
+    }
   }
 
   throw Object.assign(
-    new Error(`Response timed out after ${timeoutMs}ms — ${sawNewTurn ? "new turn seen but no stable content" : "Gemini never produced a new turn (send may have failed)"}`),
+    new Error(`Response timed out after ${timeoutMs}ms — ${sawNewActivity ? "activity seen but no stable content" : "Gemini never produced a new turn (send may have failed)"}`),
     { code: "timeout" },
   );
 }
@@ -438,35 +534,102 @@ async function uploadFileViaCDP(
 
 async function saveGeneratedImage(
   wv: WebView,
-  imageUrls: string[],
+  candidates: ImageCandidate[],
   outputPath: string,
 ) {
-  if (imageUrls.length === 0) {
+  if (candidates.length === 0) {
     throw new Error("No generated images found to save");
   }
 
-  const url = ensureFullSizeImageUrl(imageUrls[0]);
-  log(`Saving image: ${url.slice(0, 80)}...`);
+  // Sort: display images first, larger area first, then links
+  const sorted = [...candidates].sort((a, b) => {
+    if (a.isDisplayImage !== b.isDisplayImage) return a.isDisplayImage ? -1 : 1;
+    return (b.width * b.height) - (a.width * a.height);
+  });
 
-  // Download image bytes via page context (authenticated)
-  const b64 = await pageEval(wv, `
-    (function() {
-      return new Promise(function(resolve, reject) {
-        fetch("${url}", { credentials: "include" })
-          .then(function(r) { return r.blob(); })
-          .then(function(blob) { return blob.arrayBuffer(); })
-          .then(function(buf) {
-            var bytes = new Uint8Array(buf);
-            var binary = '';
-            for (var i = 0; i < bytes.length; i++) {
-              binary += String.fromCharCode(bytes[i]);
-            }
-            resolve(btoa(binary));
-          })
-          .catch(function(e) { reject(e); });
-      });
-    })()
-  `);
+  let b64 = "";
+  let savedSource = "";
+
+  for (const candidate of sorted) {
+    const rawUrl = candidate.source;
+    const url = rawUrl.includes("gg-dl") ? ensureFullSizeImageUrl(rawUrl) : rawUrl;
+    log(`Saving image (${candidate.kind}): ${url.slice(0, 80)}...`);
+
+    try {
+      if (url.startsWith("blob:")) {
+        // Blob URLs expire — draw the img element to a canvas immediately
+        b64 = await pageEval(wv, `
+          (function() {
+            return new Promise(function(resolve, reject) {
+              // Find the img element with this blob src
+              var imgs = document.querySelectorAll('img');
+              var target = null;
+              for (var i = 0; i < imgs.length; i++) {
+                if ((imgs[i].currentSrc || imgs[i].src) === ${JSON.stringify(url)}) {
+                  target = imgs[i]; break;
+                }
+              }
+              if (!target) {
+                // Fallback: try fetch while blob is still alive
+                return fetch(${JSON.stringify(url)}, { credentials: "include" })
+                  .then(function(r) { return r.blob(); })
+                  .then(function(blob) { return blob.arrayBuffer(); })
+                  .then(function(buf) {
+                    var bytes = new Uint8Array(buf);
+                    var binary = '';
+                    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                    resolve(btoa(binary));
+                  })
+                  .catch(function(e) { reject('fetch: ' + (e.message || String(e))); });
+              }
+              // Draw img to canvas → toDataURL
+              var canvas = document.createElement('canvas');
+              canvas.width = target.naturalWidth || target.width || 1024;
+              canvas.height = target.naturalHeight || target.height || 1024;
+              var ctx = canvas.getContext('2d');
+              try {
+                ctx.drawImage(target, 0, 0, canvas.width, canvas.height);
+                var dataUrl = canvas.toDataURL('image/png');
+                resolve(dataUrl.split(',')[1]); // strip "data:image/png;base64,"
+              } catch(e) {
+                reject('canvas: ' + (e.message || String(e)));
+              }
+            });
+          })()
+        `);
+      } else {
+        // HTTP URL: fetch with credentials
+        b64 = await pageEval(wv, `
+          (function() {
+            return new Promise(function(resolve, reject) {
+              fetch(${JSON.stringify(url)}, { credentials: "include" })
+                .then(function(r) {
+                  if (!r.ok) throw new Error('HTTP ' + r.status);
+                  return r.blob();
+                })
+                .then(function(blob) { return blob.arrayBuffer(); })
+                .then(function(buf) {
+                  var bytes = new Uint8Array(buf);
+                  var binary = '';
+                  for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                  resolve(btoa(binary));
+                })
+                .catch(function(e) { reject(e.message || String(e)); });
+            });
+          })()
+        `);
+      }
+      savedSource = url;
+      break;
+    } catch (err) {
+      log(`Fetch failed for ${url.slice(0, 60)}: ${err}`);
+    }
+  }
+
+  if (!b64) {
+    throw new Error("All image candidate sources failed to fetch");
+  }
+  log(`Image fetched from: ${savedSource.slice(0, 80)}`);
 
   if (!b64 || typeof b64 !== "string") {
     throw new Error("Failed to download image bytes from page context");
@@ -481,6 +644,140 @@ async function saveGeneratedImage(
   // Write binary
   require("fs").writeFileSync(outputPath, Buffer.from(b64, "base64"));
   log(`Image saved to ${outputPath}`);
+}
+
+// ============================================================================
+// Create image tool activation
+// ============================================================================
+
+/**
+ * Activate the "Create image" tool in the Gemini input toolbar.
+ * Verified activation: throws ui_changed if tool cannot be confirmed active.
+ */
+async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<void> {
+  // Step 1: check if already active — look for the dismiss chip (has × close button)
+  // NOT the static tool suggestion buttons that are always present
+  const alreadyActive = await pageEval(wv, `
+    (function() {
+      var chips = document.querySelectorAll('mat-chip, [class*="chip"]');
+      for (var i = 0; i < chips.length; i++) {
+        var c = chips[i];
+        var t = (c.textContent || '').toLowerCase().replace(/\s+/g,' ').trim();
+        // Active chip has a close/dismiss button inside it
+        var hasClose = !!c.querySelector('button[aria-label*="close" i], button[aria-label*="remove" i], mat-icon[aria-label*="cancel" i], [class*="close"], [class*="remove"]');
+        if (t.includes('create image') && hasClose) return true;
+      }
+      return false;
+    })()
+  `);
+  if (alreadyActive) { log("Create image tool: already active"); return; }
+
+  // Step 2: find and click the + / tools button near the editor
+  const openResult = await pageEval(wv, `
+    (function() {
+      // Direct aria selectors (case-insensitive where possible)
+      var directSelectors = [
+        'button[aria-label="Tools"]',
+        'button[aria-label="Open tools"]',
+        'button[aria-label="More options"]',
+        'button[aria-label*="tool" i]',
+        'button[aria-label*="more" i]',
+        'button[data-test-id*="tool" i]',
+      ];
+      for (var s = 0; s < directSelectors.length; s++) {
+        var btn = document.querySelector(directSelectors[s]);
+        if (btn && btn.offsetParent !== null) { btn.click(); return 'direct:' + directSelectors[s]; }
+      }
+
+      // Scoped scan: find composer root near the editor
+      var editor = document.querySelector('.ql-editor[contenteditable="true"]');
+      var root = editor;
+      var rootSelectors = ['form','[role="group"]','rich-textarea','message-input','[class*="input-area"]','[class*="composer"]'];
+      for (var r = 0; r < rootSelectors.length && root; r++) {
+        root = editor.closest(rootSelectors[r]) || root;
+      }
+      if (!root) root = document.body;
+
+      // Scan visible buttons in root for + / tools button
+      var btns = root.querySelectorAll('button');
+      var labels = [];
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.offsetParent === null) continue;
+        var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        var text = (b.textContent || '').trim();
+        var iconText = '';
+        var icon = b.querySelector('mat-icon, [class*="material"]');
+        if (icon) iconText = (icon.textContent || '').toLowerCase().trim();
+        labels.push(aria || text.slice(0, 20));
+        if (aria.includes('tool') || aria.includes('more') || aria.includes('add') ||
+            text === '+' || iconText === 'add' || iconText === 'add_circle') {
+          b.click();
+          return 'scoped:' + (aria || text || iconText);
+        }
+      }
+      return 'no-button|visible:' + labels.slice(0,8).join(',');
+    })()
+  `);
+
+  log(`Create image tool open: ${openResult}`);
+  if (openResult.startsWith("no-button")) {
+    log("Warning: could not find tools button — relying on prompt prefix");
+    return;
+  }
+
+  await delay(500);
+
+  // Step 3: find and click "Create image" in the overlay menu
+  const clickResult = await pageEval(wv, `
+    (function() {
+      var roleSelectors = '[role="menuitemcheckbox"],[role="menuitemradio"],[role="menuitem"],[role="option"],mat-option,[data-test-id*="tool" i]';
+      var items = document.querySelectorAll(roleSelectors);
+      var found = [];
+      for (var i = 0; i < items.length; i++) {
+        var raw = (items[i].textContent || '').replace(/\s+/g,' ').trim().toLowerCase();
+        found.push(raw.slice(0,30));
+        // Match "images", "image", "images new", "create image" — Gemini uses "Images New"
+        var firstWord = raw.split(/\s+/)[0];
+        if ((firstWord === 'image' || firstWord === 'images' || raw.startsWith('create image')) &&
+            !raw.includes('video') && !raw.includes('music') && !raw.includes('canvas')) {
+          items[i].click();
+          return 'clicked:' + items[i].textContent.trim().slice(0,30);
+        }
+      }
+      document.body.click();
+      return 'not-found|items:' + found.join(';');
+    })()
+  `);
+
+  log(`Create image tool click: ${clickResult}`);
+
+  if (!clickResult.startsWith("clicked")) {
+    log("Warning: Create image item not found in menu — relying on prompt prefix");
+    return;
+  }
+
+  await delay(300);
+
+  // Step 4: verify chip appeared (poll up to timeoutMs)
+  const deadline = Date.now() + Math.min(timeoutMs, 3000);
+  while (Date.now() < deadline) {
+    await delay(300);
+    const verified = await pageEval(wv, `
+      (function() {
+        var els = document.querySelectorAll('mat-chip,[class*="chip"],[class*="tool-badge"],button,[role="button"]');
+        for (var i = 0; i < els.length; i++) {
+          var t = (els[i].textContent || '').toLowerCase().replace(/\s+/g,' ').trim();
+          if (t.startsWith('create image')) return true;
+        }
+        return false;
+      })()
+    `);
+    if (verified) { log("Create image tool: verified active (chip)"); return; }
+  }
+
+  // Verification failed — but don't hard-fail: Gemini may still honor the prompt prefix
+  log("Warning: Create image chip not confirmed — proceeding anyway");
 }
 
 // ============================================================================
@@ -734,10 +1031,15 @@ async function main() {
       await uploadFileViaCDP(wv, filePath, Math.min(timeoutMs, 30000));
     }
 
-    // Capture baseline state before submitting
+    // Activate Create image tool BEFORE baseline capture and typing
+    const needsCreateImageTool = !!req.generateImage;
+    const expectsImageOutput = !!(req.generateImage || req.editImage);
+    if (needsCreateImageTool) {
+      await activateCreateImageTool(wv, 5000);
+    }
+
+    // Capture baseline state after tool activation, before submitting
     const baseline = await pollResponseState(wv);
-    const baselineTurnCount = baseline.turnCount;
-    const baselineImageUrls = baseline.imageUrls;
 
     // Step: Send prompt
     const promptPreview = fullPrompt.length > 60
@@ -760,15 +1062,10 @@ async function main() {
 
     // Step: Wait for response
     progress.step();
-    const { text: responseText, imageUrls: newImageUrls } =
-      await waitForResponse(
-        wv,
-        baselineTurnCount,
-        baselineImageUrls,
-        timeoutMs,
-      );
+    const { text: responseText, imageCandidates: newImageCandidates } =
+      await waitForResponse(wv, baseline, timeoutMs, expectsImageOutput);
 
-    if (!responseText && newImageUrls.length === 0) {
+    if (!responseText && newImageCandidates.length === 0) {
       throw Object.assign(new Error("Empty response from Gemini"), {
         code: "timeout",
       });
@@ -776,16 +1073,16 @@ async function main() {
 
     // Handle image save
     let imagePath: string | null = null;
-    let imageCount = newImageUrls.length;
+    const imageCount = newImageCandidates.length;
 
-    if (wantsImage && newImageUrls.length > 0) {
+    if (expectsImageOutput && newImageCandidates.length > 0) {
       const outputPath = resolveImageOutputPath({
         output: req.output,
         generateImage: req.generateImage,
         editImage: req.editImage,
       });
       progress.step(outputPath);
-      await saveGeneratedImage(wv, newImageUrls, outputPath);
+      await saveGeneratedImage(wv, newImageCandidates, outputPath);
       imagePath = outputPath;
     }
 
