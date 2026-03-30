@@ -247,6 +247,13 @@ const UI_NOISE_LINES = new Set([
   "thinking",
   "thinking…",
   "thinking...",
+  "analyzing image",
+  "analyzing",
+  "searching the web",
+  "searching",
+  "browsing the web",
+  "generating image",
+  "creating image",
 ]);
 
 /**

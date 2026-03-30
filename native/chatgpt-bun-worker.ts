@@ -650,6 +650,8 @@ interface PollState {
   text: string;
   imageCandidates: ImageCandidate[];
   isStreaming: boolean;
+  isThinking: boolean; // stop button visible + no .markdown text + "Thinking" label
+  thinkingLabel: string; // e.g. "Thinking", "Analyzing image", "Searching"
   assistantTurnCount: number;
   latestAssistantTurnId: string | null; // stable: data-testid or index
   messageId: string | null;
@@ -726,6 +728,21 @@ async function pollResponseState(wv: WebView): Promise<PollState> {
 
       var isStreaming = !!document.querySelector(STOP_SEL);
 
+      // Detect thinking/processing phase: streaming + no .markdown text + status label
+      var isThinking = false;
+      var thinkingLabel = '';
+      if (isStreaming && !text && lastAssistant) {
+        // Get non-sr-only, non-markdown, non-button text from the turn
+        var labelClone = lastAssistant.cloneNode(true);
+        var labelRemove = labelClone.querySelectorAll('.sr-only, .markdown, button, nav, form, script, style');
+        for (var lr = 0; lr < labelRemove.length; lr++) labelRemove[lr].remove();
+        var labelText = (labelClone.textContent || '').trim();
+        if (labelText) {
+          thinkingLabel = labelText;
+          isThinking = true;
+        }
+      }
+
       // Image candidates from latest assistant turn
       var candidates = [];
       var seen = {};
@@ -759,6 +776,8 @@ async function pollResponseState(wv: WebView): Promise<PollState> {
         text: text,
         imageCandidates: candidates,
         isStreaming: isStreaming,
+        isThinking: isThinking,
+        thinkingLabel: thinkingLabel,
         assistantTurnCount: assistantCount,
         latestAssistantTurnId: latestAssistantTurnId,
         messageId: messageId,
@@ -796,14 +815,22 @@ async function waitForResponse(
   // Text stability tracking
   let stableCycles = 0;
   let lastChangeAtMs = Date.now();
+  let lastProgressPhase = "";
 
   while (Date.now() < deadline) {
-    await delay(600);
+    await delay(400);
 
     // Primary: read from SSE stream capture (bypasses empty DOM issue)
     const stream = await readStreamResponse(wv);
     // Fallback: poll DOM state for completion signals + images
     const state = await pollResponseState(wv);
+
+    // Emit progress feedback for thinking/processing phases
+    const phase = state.isThinking ? state.thinkingLabel : (state.isStreaming && state.text ? "Responding" : "");
+    if (phase && phase !== lastProgressPhase) {
+      log(`⏳ ${phase}`);
+      lastProgressPhase = phase;
+    }
 
     // Sanitize DOM text and choose best source
     const sanitizedDom = sanitizeChatGptAssistantText(state.text);
@@ -859,8 +886,10 @@ async function waitForResponse(
       lastText = currentText;
     } else {
       // Text mode — completion via stream.done OR DOM stability
-      // Stream done = authoritative completion signal
-      if (stream.done && currentText.length > 0) {
+      // Stream done with actual stream text = authoritative completion.
+      // Note: stream_handoff sends [DONE] with empty stream.text — don't
+      // treat that as completion; fall through to DOM stability instead.
+      if (stream.done && stream.text.length > 0) {
         return { text: currentText, imageCandidates: newImgs, messageId: currentMessageId, partial: false };
       }
 
