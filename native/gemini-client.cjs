@@ -34,8 +34,7 @@ const MODEL_HEADER_OVERRIDES = (() => {
 })();
 
 const GEMINI_ACCESS_TOKEN_CACHE_PATH = path.join(os.tmpdir(), "surf-gemini-at.json");
-// AT token appears to be single-use or very short-lived — cache disabled (TTL=0)
-const GEMINI_ACCESS_TOKEN_TTL_MS = 0;
+
 
 const REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
 
@@ -261,8 +260,7 @@ function _hasMeaningfulOutput(r) {
 
 async function fetchGeminiAccessToken(cookieMap, opts = {}) {
   const cookieHeader = buildCookieHeader(cookieMap);
-  const cached = _readCachedAt(cookieHeader);
-  if (cached) { if (opts.log) opts.log("geminiAccessToken: cache hit"); return cached; }
+  // AT (CSRF) token is single-use — always fetch fresh
   const res = await fetchWithRedirects(GEMINI_APP_URL, { cookie: cookieHeader }, 10, false, {
     ...opts,
     label: opts.label || "geminiAccessToken",
@@ -272,7 +270,7 @@ async function fetchGeminiAccessToken(cookieMap, opts = {}) {
   const tokens = ["SNlM0e", "thykhd"];
   for (const key of tokens) {
     const match = html.match(new RegExp(`"${key}":"(.*?)"`));
-    if (match?.[1]) { _writeCachedAt(cookieHeader, match[1]); return match[1]; }
+    if (match?.[1]) return match[1];
   }
   
   throw new Error("Unable to authenticate with Gemini. Make sure you're signed into gemini.google.com in Chrome.");
