@@ -520,112 +520,110 @@ async function activateImageTool(wv: WebView, timeoutMs = 5000): Promise<void> {
 }
 
 // ============================================================================
-// SSE stream interception — capture response text from network, not DOM
+// SSE stream interception — capture response text from fetch, not DOM
 // ============================================================================
 
 /**
- * Inject a fetch monkey-patch via CDP Page.addScriptToEvaluateOnNewDocument
- * that captures the ChatGPT SSE streaming response BEFORE page JS runs.
- * Must be called BEFORE navigating to chatgpt.com.
+ * Inject a fetch monkey-patch AFTER page load (post-auth/sentinel setup).
+ * ChatGPT's conversation API returns SSE with delta_encoding v1 format.
+ * Must be called AFTER navigating to chatgpt.com and verifying login.
+ *
+ * The hook intercepts POST to /backend-api/f/conversation or /backend-api/conversation,
+ * clones the response, reads the SSE stream, and parses:
+ *   - legacy full-message: {message: {content: {parts: [...]}}}
+ *   - nested v.message:    {v: {message: {content: {parts: [...]}}}}
+ *   - delta v1 single op:  {o: "append", p: "/message/content/parts/0", v: "chunk"}
+ *   - delta v1 batch ops:  {v: [{o, p, v}, ...]}
+ *   - sentinels: [DONE], message_stream_complete
  */
-/**
- * Start capturing WebSocket frames via CDP Network domain.
- * ChatGPT streams conversation responses over wss://ws.chatgpt.com.
- * Frames contain JSON with delta-encoded messages.
- */
-async function startWebSocketCapture(wv: WebView): Promise<void> {
-  // Enable Network domain for WebSocket frame events
-  await wv.cdp("Network.enable");
-
-  // Hook WebSocket to capture ChatGPT response stream before page JS runs
-  await wv.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `
+async function injectFetchStreamCapture(wv: WebView): Promise<void> {
+  await pageEval(wv, `
     (function() {
-      if (!window.__surfChatResponse) window.__surfChatResponse = { text: '', done: false, messageId: null, model: null };
-      var OrigWS = window.WebSocket;
-      window.WebSocket = function(url, protocols) {
-        var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
-        if (url && url.indexOf('ws.chatgpt.com') !== -1) {
-          var origOnMessage = null;
-          Object.defineProperty(ws, 'onmessage', {
-            get: function() { return origOnMessage; },
-            set: function(fn) {
-              origOnMessage = function(event) {
-                try {
-                  var data = typeof event.data === 'string' ? event.data : '';
-                  if (data) {
-                    // Parse each line as potential JSON message
-                    var lines = data.split('\\n');
-                    for (var i = 0; i < lines.length; i++) {
-                      var line = lines[i].trim();
-                      if (!line || line[0] !== '{') continue;
-                      try {
-                        var obj = JSON.parse(line);
-                        var msg = (obj.v && obj.v.message) || obj.message;
-                        if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
-                          var text = msg.content.parts.join('');
-                          if (text) window.__surfChatResponse.text = text;
-                          if (msg.id) window.__surfChatResponse.messageId = msg.id;
-                          if (msg.metadata && msg.metadata.model_slug) {
-                            window.__surfChatResponse.model = msg.metadata.model_slug;
-                          }
-                          if (msg.status === 'finished_successfully' && msg.end_turn) {
-                            window.__surfChatResponse.done = true;
-                          }
-                        }
-                      } catch(e) {}
+      window.__surfChatResponse = { text: '', done: false, messageId: null, model: null, parts: [] };
+      var origFetch = window.fetch;
+      window.fetch = function() {
+        var args = arguments;
+        var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+        var opts = args[1] || {};
+        var method = (opts.method || 'GET').toUpperCase();
+        var result = origFetch.apply(this, args);
+        var isConv = method === 'POST' && (url.indexOf('/backend-api/f/conversation') !== -1 || url.indexOf('/backend-api/conversation') !== -1);
+        if (isConv) {
+          result.then(function(resp) {
+            if (!resp.body || !resp.ok) return;
+            // Reset state for new conversation
+            window.__surfChatResponse = { text: '', done: false, messageId: null, model: null, parts: [] };
+            var clone = resp.clone();
+            var reader = clone.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            function pump() {
+              reader.read().then(function(chunk) {
+                if (chunk.done) { window.__surfChatResponse.done = true; return; }
+                buf += decoder.decode(chunk.value, { stream: true });
+                var lines = buf.split('\\n');
+                buf = lines.pop() || '';
+                for (var i = 0; i < lines.length; i++) {
+                  var line = lines[i].trim();
+                  if (!line) continue;
+                  if (line.indexOf('event:') === 0) continue;
+                  if (line.indexOf('data: ') === 0) line = line.slice(6).trim();
+                  if (line === '[DONE]') { window.__surfChatResponse.done = true; continue; }
+                  if (line === 'message_stream_complete') { window.__surfChatResponse.done = true; continue; }
+                  if (line[0] !== '{') continue;
+                  try {
+                    var obj = JSON.parse(line);
+                    if (obj.type === 'message_stream_complete') { window.__surfChatResponse.done = true; continue; }
+                    // Legacy / nested message format
+                    var msg = (obj.v && obj.v.message) || obj.message;
+                    if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
+                      var t = msg.content.parts.join('');
+                      if (t) { window.__surfChatResponse.text = t; window.__surfChatResponse.parts = msg.content.parts.slice(); }
+                      if (msg.id) window.__surfChatResponse.messageId = msg.id;
+                      if (msg.metadata && msg.metadata.model_slug) window.__surfChatResponse.model = msg.metadata.model_slug;
+                      if (msg.status === 'finished_successfully') window.__surfChatResponse.done = true;
+                      continue;
                     }
-                  }
-                } catch(e) {}
-                if (fn) fn.call(ws, event);
-              };
-            }
-          });
-          // Also intercept addEventListener
-          var origAddEL = ws.addEventListener.bind(ws);
-          ws.addEventListener = function(type, listener, opts) {
-            if (type === 'message') {
-              var wrappedListener = function(event) {
-                try {
-                  var data = typeof event.data === 'string' ? event.data : '';
-                  if (data) {
-                    var lines = data.split('\\n');
-                    for (var i = 0; i < lines.length; i++) {
-                      var line = lines[i].trim();
-                      if (!line || line[0] !== '{') continue;
-                      try {
-                        var obj = JSON.parse(line);
-                        var msg = (obj.v && obj.v.message) || obj.message;
-                        if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
-                          var text = msg.content.parts.join('');
-                          if (text) window.__surfChatResponse.text = text;
-                          if (msg.id) window.__surfChatResponse.messageId = msg.id;
-                          if (msg.metadata && msg.metadata.model_slug) {
-                            window.__surfChatResponse.model = msg.metadata.model_slug;
-                          }
-                          if (msg.status === 'finished_successfully' && msg.end_turn) {
-                            window.__surfChatResponse.done = true;
-                          }
-                        }
-                      } catch(e) {}
+                    // Delta v1 single op: {o, p, v}
+                    if (typeof obj.o === 'string' && typeof obj.p === 'string') {
+                      applyOp(obj);
+                      continue;
                     }
-                  }
-                } catch(e) {}
-                listener.call(ws, event);
-              };
-              return origAddEL(type, wrappedListener, opts);
+                    // Delta v1 batch ops: {v: [{o, p, v}, ...]}
+                    if (Array.isArray(obj.v)) {
+                      for (var j = 0; j < obj.v.length; j++) {
+                        var op = obj.v[j];
+                        if (typeof op.o === 'string' && typeof op.p === 'string') applyOp(op);
+                      }
+                      continue;
+                    }
+                  } catch(e) {}
+                }
+                pump();
+              }).catch(function() { window.__surfChatResponse.done = true; });
             }
-            return origAddEL(type, listener, opts);
-          };
+            function applyOp(op) {
+              var r = window.__surfChatResponse;
+              var m = op.p.match(/^\\/message\\/content\\/parts\\/(\\d+)$/);
+              if (m) {
+                var idx = parseInt(m[1], 10);
+                while (r.parts.length <= idx) r.parts.push('');
+                if (op.o === 'append' && typeof op.v === 'string') r.parts[idx] += op.v;
+                else if (op.o === 'replace') r.parts[idx] = typeof op.v === 'string' ? op.v : JSON.stringify(op.v);
+                r.text = r.parts.join('');
+                return;
+              }
+              if (op.p === '/message/status' && op.o === 'replace' && op.v === 'finished_successfully') { r.done = true; return; }
+              if (op.p === '/message/id' && op.o === 'replace' && typeof op.v === 'string') { r.messageId = op.v; return; }
+              if (op.p === '/message/metadata/model_slug' && op.o === 'replace' && typeof op.v === 'string') { r.model = op.v; return; }
+            }
+            pump();
+          }).catch(function() {});
         }
-        return ws;
+        return result;
       };
-      window.WebSocket.prototype = OrigWS.prototype;
-      window.WebSocket.CONNECTING = OrigWS.CONNECTING;
-      window.WebSocket.OPEN = OrigWS.OPEN;
-      window.WebSocket.CLOSING = OrigWS.CLOSING;
-      window.WebSocket.CLOSED = OrigWS.CLOSED;
     })()
-  ` });
+  `);
 }
 
 /**
@@ -785,7 +783,7 @@ async function waitForResponse(
   timeoutMs: number,
   expectsImage: boolean,
 ): Promise<{ text: string; imageCandidates: ImageCandidate[]; messageId: string | null; partial: boolean }> {
-  const { advanceTextStability } = require("./chatgpt-bun-worker-logic.ts");
+  const { advanceTextStability, sanitizeChatGptAssistantText, chooseBestText } = require("./chatgpt-bun-worker-logic.ts");
   const deadline = Date.now() + timeoutMs;
   let sawNewActivity = false;
   let lastText = "";
@@ -807,8 +805,14 @@ async function waitForResponse(
     // Fallback: poll DOM state for completion signals + images
     const state = await pollResponseState(wv);
 
-    // Use stream text as primary source, DOM text as fallback
-    const currentText = stream.text || state.text;
+    // Sanitize DOM text and choose best source
+    const sanitizedDom = sanitizeChatGptAssistantText(state.text);
+    const currentText = chooseBestText({
+      streamText: stream.text,
+      domText: sanitizedDom,
+      streamDone: stream.done,
+      domFinished: state.finished,
+    });
     const currentMessageId = stream.messageId || state.messageId;
 
     // Detect new assistant turn via stable turn ID or stream activity
@@ -1123,10 +1127,6 @@ async function main() {
       log(`CDP stealth skipped: ${stealthErr.message}`);
     }
 
-    // WebSocket capture for response extraction (must be before navigation)
-    await startWebSocketCapture(wv);
-    log("WebSocket capture registered");
-
     // Step: Load ChatGPT
     progress.step();
     await wv.navigate(CHATGPT_URL);
@@ -1166,6 +1166,10 @@ async function main() {
       );
     }
     log("Login verified");
+
+    // Inject fetch stream capture AFTER login (auth/sentinel tokens ready)
+    await injectFetchStreamCapture(wv);
+    log("Stream capture injected");
 
     // Model selection (best-effort)
     if (req.model) {

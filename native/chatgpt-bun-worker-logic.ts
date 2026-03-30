@@ -97,6 +97,205 @@ export function buildChatGptModelSelectionSpec(model: string): ChatGptModelSelec
 }
 
 // ============================================================================
+// Stream state + delta v1 parser
+// ============================================================================
+
+export interface ChatGptStreamState {
+  parts: string[];
+  text: string;
+  done: boolean;
+  messageId: string | null;
+  model: string | null;
+}
+
+export function createEmptyChatGptStreamState(): ChatGptStreamState {
+  return { parts: [], text: "", done: false, messageId: null, model: null };
+}
+
+/**
+ * Apply one raw payloadData chunk (may contain multiple lines) to stream state.
+ * Handles:
+ *   - legacy full-message: {message: {content: {parts: [...]}}}
+ *   - nested v.message:    {v: {message: {content: {parts: [...]}}}}
+ *   - delta v1 single op:  {o: "append", p: "/message/content/parts/0", v: "chunk"}
+ *   - delta v1 batch ops:  {v: [{o, p, v}, ...]}
+ *   - data: prefix lines (SSE format)
+ *   - sentinel: [DONE], message_stream_complete
+ * Returns new state (immutable pattern for testability).
+ */
+export function applyChatGptFramePayload(
+  state: ChatGptStreamState,
+  payloadData: string,
+): ChatGptStreamState {
+  const next: ChatGptStreamState = {
+    parts: [...state.parts],
+    text: state.text,
+    done: state.done,
+    messageId: state.messageId,
+    model: state.model,
+  };
+
+  const lines = payloadData.split("\n");
+  for (let rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line) continue;
+
+    // Strip "event: ..." lines
+    if (line.startsWith("event:")) continue;
+
+    // Strip SSE data: prefix
+    if (line.startsWith("data: ")) line = line.slice(6).trim();
+
+    // Sentinels
+    if (line === "[DONE]") { next.done = true; continue; }
+    if (line === "message_stream_complete") { next.done = true; continue; }
+    if (line[0] !== "{") continue;
+
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+
+    // Check for message_stream_complete type
+    if (obj.type === "message_stream_complete") { next.done = true; continue; }
+
+    // --- Legacy / nested message format ---
+    const msg = (obj.v && obj.v.message) || obj.message;
+    if (msg && msg.author?.role === "assistant" && msg.content?.parts) {
+      const text = msg.content.parts.join("");
+      if (text) {
+        next.parts = [...msg.content.parts];
+        next.text = text;
+      }
+      if (msg.id) next.messageId = msg.id;
+      if (msg.metadata?.model_slug) next.model = msg.metadata.model_slug;
+      if (msg.status === "finished_successfully") next.done = true;
+      continue;
+    }
+
+    // --- Delta v1 single op: {o, p, v} ---
+    if (typeof obj.o === "string" && typeof obj.p === "string") {
+      applyDeltaOp(next, obj);
+      continue;
+    }
+
+    // --- Delta v1 batch ops: {v: [{o, p, v}, ...]} ---
+    if (Array.isArray(obj.v)) {
+      for (const op of obj.v) {
+        if (typeof op.o === "string" && typeof op.p === "string") {
+          applyDeltaOp(next, op);
+        }
+      }
+      continue;
+    }
+  }
+
+  return next;
+}
+
+function applyDeltaOp(
+  state: ChatGptStreamState,
+  op: { o: string; p: string; v: unknown },
+): void {
+  const partMatch = op.p.match(/^\/message\/content\/parts\/(\d+)$/);
+  if (partMatch) {
+    const idx = parseInt(partMatch[1], 10);
+    // Ensure parts array is large enough
+    while (state.parts.length <= idx) state.parts.push("");
+    if (op.o === "append" && typeof op.v === "string") {
+      state.parts[idx] += op.v;
+    } else if (op.o === "replace") {
+      state.parts[idx] = typeof op.v === "string" ? op.v : JSON.stringify(op.v);
+    }
+    state.text = state.parts.join("");
+    return;
+  }
+
+  if (op.p === "/message/status" && op.o === "replace" && op.v === "finished_successfully") {
+    state.done = true;
+    return;
+  }
+  if (op.p === "/message/id" && op.o === "replace" && typeof op.v === "string") {
+    state.messageId = op.v;
+    return;
+  }
+  if (op.p === "/message/metadata/model_slug" && op.o === "replace" && typeof op.v === "string") {
+    state.model = op.v;
+    return;
+  }
+}
+
+// ============================================================================
+// DOM text sanitizer
+// ============================================================================
+
+/** UI-chrome lines to strip from DOM-extracted text (exact line match, case-insensitive). */
+const UI_NOISE_LINES = new Set([
+  "give feedback",
+  "copy",
+  "good response",
+  "bad response",
+  "chatgpt said:",
+  "assistant said:",
+  "you said:",
+  "chatgpt",
+  "chatgpt instruments",
+  "read aloud",
+  "share",
+  "regenerate",
+  "edit",
+  "retry",
+  "is this conversation helpful so far?",
+  "thinking",
+  "thinking…",
+  "thinking...",
+]);
+
+/**
+ * Strip known UI chrome from DOM-extracted assistant text.
+ * Removes exact-line matches only; preserves legitimate prose.
+ */
+export function sanitizeChatGptAssistantText(raw: string): string {
+  if (!raw) return "";
+  return raw
+    .split("\n")
+    .filter(line => {
+      const trimmed = line.trim().toLowerCase();
+      return trimmed.length > 0 && !UI_NOISE_LINES.has(trimmed);
+    })
+    .join("\n")
+    .trim();
+}
+
+// ============================================================================
+// Stream vs DOM text arbitration
+// ============================================================================
+
+/**
+ * Choose the best text source between stream capture and DOM extraction.
+ * Stream wins during streaming; DOM wins after render completes (more reliable).
+ */
+export function chooseBestText(args: {
+  streamText: string;
+  domText: string;
+  streamDone: boolean;
+  domFinished: boolean;
+}): string {
+  const { streamText, domText, streamDone, domFinished } = args;
+
+  // If DOM is finished and has content, prefer it (most reliable after render)
+  if (domFinished && domText.length > 0) {
+    return domText;
+  }
+
+  // If stream has content, prefer it
+  if (streamText.length > 0) {
+    return streamText;
+  }
+
+  // Fallback to whatever is available
+  return domText || streamText;
+}
+
+// ============================================================================
 // Text stability tracker
 // ============================================================================
 
