@@ -1004,13 +1004,14 @@ async function main() {
     progress.step(resolvedModel);
     wv = new Bun.WebView({ headless: true, backend: "chrome" });
 
+    // Pre-navigation staging on about:blank (required for cookie injection + stealth)
+    await wv.navigate("about:blank");
+    await delay(200);
+
     // Step: Authenticate (macOS only — inject cookies from Chrome profile)
-    // CDP requires an active session, so navigate to about:blank first.
     if (process.platform === "darwin") {
       progress.step(req.profileEmail || "default profile");
       try {
-        await wv.navigate("about:blank");
-        await delay(200);
         const { loadAndInjectGeminiCookies } = await import(
           "./gemini-bun-profile-auth.ts"
         );
@@ -1030,6 +1031,15 @@ async function main() {
         new Error("--profile is only supported on macOS"),
         { code: "profile_unsupported_platform" },
       );
+    }
+
+    // CDP stealth patches — reduce headless fingerprint before target navigation
+    try {
+      const { applyCdpStealth } = require("./cdp-stealth.cjs");
+      const stealthResult = await applyCdpStealth(wv);
+      log(`Stealth: UA=${stealthResult.uaOverrideApplied}, script=${stealthResult.initScriptApplied}`);
+    } catch (stealthErr: any) {
+      log(`CDP stealth skipped: ${stealthErr.message}`);
     }
 
     // Step: Load Gemini

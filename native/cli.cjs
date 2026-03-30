@@ -10,6 +10,7 @@ const networkStore = require("./network-store.cjs");
 const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { shouldUseBunGemini, isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
+const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require("./chatgpt-bun-bridge.cjs");
 const { version: VERSION } = require("../package.json");
 
 const IS_WIN = process.platform === "win32";
@@ -348,15 +349,19 @@ const TOOLS = {
         args: ["query"], 
         opts: { 
           "with-page": "Include current page context",
-          model: "Model: gpt-4o, o1, etc.",
-          file: "Attach file",
-          timeout: "Timeout in seconds (default: 2700 = 45min)"
+          model: "Model: gpt-4o, o3, o4-mini, etc.",
+          file: "Attach file (requires SURF_USE_BUN_CHATGPT=1)",
+          "generate-image": "Generate image and save to path (requires SURF_USE_BUN_CHATGPT=1)",
+          timeout: "Timeout in seconds (default: 2700 = 45min)",
+          profile: "Chrome profile email for Bun headless auth (macOS, requires SURF_USE_BUN_CHATGPT=1)"
         },
         examples: [
           { cmd: 'chatgpt "explain this code"', desc: "Basic query" },
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
-          { cmd: 'chatgpt "review" --file code.ts', desc: "With file" },
+          { cmd: 'chatgpt "review" --file code.ts', desc: "With file (Bun)" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
+          { cmd: 'chatgpt "robot surfing" --generate-image /tmp/robot.png', desc: "Generate image (Bun)" },
+          { cmd: 'chatgpt "hello" --profile me@gmail.com', desc: "Use specific Chrome profile (Bun)" },
         ]
       },
       "gemini": { 
@@ -2671,6 +2676,15 @@ if (tool === "gemini") {
   }
 }
 
+if (tool === "chatgpt") {
+  if (toolArgs["generate-image"] && typeof toolArgs["generate-image"] === "string") {
+    toolArgs["generate-image"] = path.resolve(toolArgs["generate-image"]);
+  }
+  if (toolArgs.file && typeof toolArgs.file === "string") {
+    toolArgs.file = path.resolve(toolArgs.file);
+  }
+}
+
 if (tool === "screenshot" && outputPath) {
   if (typeof outputPath !== "string") {
     console.error("Error: --output requires a file path");
@@ -2900,16 +2914,120 @@ const performAutoCapture = async () => {
 };
 
 // ---------------------------------------------------------------------------
-// Bun-native Gemini path (opt-in via SURF_USE_BUN_GEMINI=1)
+// Bun-native ChatGPT path (opt-in via SURF_USE_BUN_CHATGPT=1)
 // ---------------------------------------------------------------------------
 
-// Extract --profile before routing (Bun-only, macOS-only)
+// Extract --profile before routing (Bun-only, macOS-only) — shared by both Gemini and ChatGPT
 const requestedProfile = (() => {
   const raw = toolArgs.profile;
   delete toolArgs.profile;   // never leak to legacy socket request
   if (raw && typeof raw === "string") return raw.trim().toLowerCase();
   return undefined;
 })();
+
+// Bun-only ChatGPT features: --file, --generate-image, --profile
+const hasBunOnlyChatGPTFeature = !!(
+  toolArgs.file || toolArgs["generate-image"] || requestedProfile
+);
+
+if (tool === "chatgpt" && hasBunOnlyChatGPTFeature && !shouldUseBunChatGPT(process.env)) {
+  // Bun-only feature requested but env flag not set — fail fast
+  const features = [
+    toolArgs.file && "--file",
+    toolArgs["generate-image"] && "--generate-image",
+    requestedProfile && "--profile",
+  ].filter(Boolean).join(", ");
+  console.error(`Error: ${features} requires Bun ChatGPT (set SURF_USE_BUN_CHATGPT=1)`);
+  process.exit(1);
+}
+
+if (tool === "chatgpt" && requestedProfile) {
+  if (process.platform !== "darwin") {
+    console.error("Error: --profile is only supported on macOS");
+    process.exit(1);
+  }
+  if (toolArgs["with-page"] || toolArgs.withPage) {
+    console.error("Error: --profile cannot be used with --with-page");
+    process.exit(1);
+  }
+}
+
+if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
+  const eligibility = isBunChatGPTEligible(toolArgs);
+  if (eligibility.eligible) {
+    if (requestedProfile) toolArgs.profile = requestedProfile;
+    (async () => {
+      try {
+        const bunResult = await runChatGPTViaBun(toolArgs);
+        if (bunResult.ok) {
+          const data = bunResult.result;
+          if (wantJson) {
+            console.log(JSON.stringify(data, null, 2));
+          } else {
+            console.log(data.response);
+            if (data.imagePath) {
+              console.log(`\nImage saved: ${data.imagePath}`);
+            }
+            console.error(`\n[${data.model || 'unknown'} | ${((data.tookMs || 0) / 1000).toFixed(1)}s | bun]`);
+          }
+          process.exit(0);
+        } else if (bunResult.fallbackRecommended) {
+          if (requestedProfile) {
+            console.error(`Error: Bun ChatGPT failed with --profile: ${bunResult.error}`);
+            process.exit(1);
+          }
+          if (hasBunOnlyChatGPTFeature) {
+            console.error(`Error: ${bunResult.error}`);
+            process.exit(1);
+          }
+          process.stderr.write(`[bun-chatgpt] Falling back to legacy path: ${bunResult.error}\n`);
+          startLegacySocketPath();
+        } else {
+          const errMsg = bunResult.error || "Bun ChatGPT worker error";
+          if (softFail) {
+            console.warn(`Warning: ${errMsg}`);
+            process.exit(0);
+          }
+          console.error(`Error: ${errMsg}`);
+          if (autoCapture) {
+            await performAutoCapture();
+          }
+          process.exit(1);
+        }
+      } catch (err) {
+        const errMsg = `Bun ChatGPT bridge failed: ${err.message}`;
+        if (softFail) {
+          console.warn(`Warning: ${errMsg}`);
+          process.exit(0);
+        }
+        console.error(`Error: ${errMsg}`);
+        if (autoCapture) {
+          await performAutoCapture();
+        }
+        process.exit(1);
+      }
+    })();
+  } else {
+    if (requestedProfile) {
+      console.error(`Error: --profile cannot be used with --with-page`);
+      process.exit(1);
+    }
+    if (hasBunOnlyChatGPTFeature) {
+      console.error(`Error: Bun ChatGPT not eligible (${eligibility.reason}) but Bun-only features requested`);
+      process.exit(1);
+    }
+    if (eligibility.reason !== "with_page") {
+      process.stderr.write(`[bun-chatgpt] Not eligible: ${eligibility.reason}, using legacy path\n`);
+    }
+    startLegacySocketPath();
+  }
+} else if (tool === "chatgpt") {
+  startLegacySocketPath();
+}
+
+// ---------------------------------------------------------------------------
+// Bun-native Gemini path (opt-in via SURF_USE_BUN_GEMINI=1)
+// ---------------------------------------------------------------------------
 
 if (tool === "gemini" && requestedProfile) {
   // --profile was explicitly requested — fail fast if conditions aren't met
@@ -2992,7 +3110,8 @@ if (tool === "gemini" && shouldUseBunGemini(process.env)) {
     }
     startLegacySocketPath();
   }
-} else {
+} else if (tool !== "chatgpt") {
+  // Non-Gemini, non-ChatGPT tools → legacy socket path
   startLegacySocketPath();
 }
 
