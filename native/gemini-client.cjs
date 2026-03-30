@@ -8,6 +8,8 @@
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
 
 // ============================================================================
 // Constants
@@ -21,11 +23,18 @@ const GEMINI_UPLOAD_PUSH_ID = "feeds/mcudyrk2a4khkz";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const MODEL_HEADER_NAME = "x-goog-ext-525001261-jspb";
+// Best-effort only — these private IDs may drift. Use SURF_GEMINI_MODEL_HEADERS env to override.
 const MODEL_HEADERS = {
   "gemini-3-pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]',
   "gemini-2.5-pro": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]',
   "gemini-2.5-flash": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4]]',
 };
+const MODEL_HEADER_OVERRIDES = (() => {
+  try { const p = JSON.parse(process.env.SURF_GEMINI_MODEL_HEADERS || ""); return (p && typeof p === "object" && !Array.isArray(p)) ? p : {}; } catch { return {}; }
+})();
+
+const GEMINI_ACCESS_TOKEN_CACHE_PATH = path.join(os.tmpdir(), "surf-gemini-at.json");
+const GEMINI_ACCESS_TOKEN_TTL_MS = 10 * 60 * 1000;
 
 const REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
 
@@ -214,8 +223,45 @@ async function fetchWithRedirects(url, headers, maxRedirects = 10, binary = fals
 // Gemini API Functions
 // ============================================================================
 
+function _atCacheKey(cookieHeader) {
+  return crypto.createHash("sha256").update(cookieHeader).digest("hex");
+}
+function _readAtCache() {
+  try { return JSON.parse(fs.readFileSync(GEMINI_ACCESS_TOKEN_CACHE_PATH, "utf8")); } catch { return {}; }
+}
+function _writeAtCache(cache) {
+  try { fs.writeFileSync(GEMINI_ACCESS_TOKEN_CACHE_PATH, JSON.stringify(cache), "utf8"); } catch {}
+}
+function _readCachedAt(cookieHeader) {
+  const cache = _readAtCache(); const entry = cache[_atCacheKey(cookieHeader)];
+  if (!entry?.at || !entry?.ts) return null;
+  if (Date.now() - entry.ts > GEMINI_ACCESS_TOKEN_TTL_MS) { delete cache[_atCacheKey(cookieHeader)]; _writeAtCache(cache); return null; }
+  return entry.at;
+}
+function _writeCachedAt(cookieHeader, at) {
+  const cache = _readAtCache(); cache[_atCacheKey(cookieHeader)] = { at, ts: Date.now() }; _writeAtCache(cache);
+}
+function _clearCachedAt(cookieHeader) {
+  const cache = _readAtCache(); delete cache[_atCacheKey(cookieHeader)]; _writeAtCache(cache);
+}
+
+function _getModelHeaderCandidates(model) {
+  const get = (m) => MODEL_HEADER_OVERRIDES[m] || MODEL_HEADERS[m] || null;
+  const seen = new Set(); const out = [];
+  for (const h of [get(model), model !== "gemini-3-pro" ? get("gemini-3-pro") : null, null]) {
+    const k = h ?? "__none__"; if (!seen.has(k)) { seen.add(k); out.push(h); }
+  }
+  return out;
+}
+
+function _hasMeaningfulOutput(r) {
+  return Boolean((typeof r?.text === "string" && r.text.trim()) || (Array.isArray(r?.images) && r.images.length > 0));
+}
+
 async function fetchGeminiAccessToken(cookieMap, opts = {}) {
   const cookieHeader = buildCookieHeader(cookieMap);
+  const cached = _readCachedAt(cookieHeader);
+  if (cached) { if (opts.log) opts.log("geminiAccessToken: cache hit"); return cached; }
   const res = await fetchWithRedirects(GEMINI_APP_URL, { cookie: cookieHeader }, 10, false, {
     ...opts,
     label: opts.label || "geminiAccessToken",
@@ -225,7 +271,7 @@ async function fetchGeminiAccessToken(cookieMap, opts = {}) {
   const tokens = ["SNlM0e", "thykhd"];
   for (const key of tokens) {
     const match = html.match(new RegExp(`"${key}":"(.*?)"`));
-    if (match?.[1]) return match[1];
+    if (match?.[1]) { _writeCachedAt(cookieHeader, match[1]); return match[1]; }
   }
   
   throw new Error("Unable to authenticate with Gemini. Make sure you're signed into gemini.google.com in Chrome.");
@@ -539,78 +585,64 @@ function buildGeminiFReqPayload(prompt, uploaded, chatMetadata) {
   return JSON.stringify([null, JSON.stringify(innerList)]);
 }
 
+function _normalizeHttpResponse(rawResponseText, status, chatMetadata) {
+  if (status < 200 || status >= 300) {
+    return { rawResponseText, text: "", thoughts: null, metadata: chatMetadata ?? null, images: [], errorMessage: `Gemini request failed: ${status}` };
+  }
+  try {
+    const parsed = parseGeminiStreamGenerateResponse(rawResponseText);
+    return { rawResponseText, text: parsed.text ?? "", thoughts: parsed.thoughts, metadata: parsed.metadata, images: parsed.images, errorCode: parsed.errorCode };
+  } catch (error) {
+    let responseJson = null;
+    try { responseJson = JSON.parse(trimGeminiJsonEnvelope(rawResponseText)); } catch { responseJson = null; }
+    const errorCode = extractErrorCode(responseJson);
+    return { rawResponseText, text: "", thoughts: null, metadata: chatMetadata ?? null, images: [],
+      errorCode: typeof errorCode === "number" ? errorCode : undefined,
+      errorMessage: error instanceof Error ? error.message : String(error ?? "") };
+  }
+}
+
 async function runGeminiWebOnce(input) {
   const { prompt, files, model, cookieMap, chatMetadata, timeoutMs = 30000, log = null } = input;
   const cookieHeader = buildCookieHeader(cookieMap);
-  
-  // 1. Get access token
-  const at = await fetchGeminiAccessToken(cookieMap, { timeoutMs, log, label: "geminiAccessToken" });
 
-  // 2. Upload files
+  // Upload files
   const uploaded = [];
   for (const file of files ?? []) {
     uploaded.push(await uploadGeminiFile(file, cookieMap, { timeoutMs, log, label: "geminiUpload" }));
   }
 
-  // 3. Build request
   const fReq = buildGeminiFReqPayload(prompt, uploaded, chatMetadata);
   const params = new URLSearchParams();
-  params.set("at", at);
   params.set("f.req", fReq);
 
-  // 4. Send request
-  const res = await httpsPost(GEMINI_STREAM_GENERATE_URL, {
-    "content-type": "application/x-www-form-urlencoded;charset=utf-8",
-    "host": "gemini.google.com",
-    "origin": "https://gemini.google.com",
-    "referer": "https://gemini.google.com/",
-    "x-same-domain": "1",
-    "cookie": cookieHeader,
-    [MODEL_HEADER_NAME]: MODEL_HEADERS[model] || MODEL_HEADERS["gemini-3-pro"],
-  }, params.toString(), { timeoutMs, log, label: "geminiStreamGenerate" });
+  const modelHeaderCandidates = _getModelHeaderCandidates(model);
+  let lastResult = null;
 
-  const rawResponseText = res.text;
-  
-  if (res.status < 200 || res.status >= 300) {
-    return {
-      rawResponseText,
-      text: "",
-      thoughts: null,
-      metadata: chatMetadata ?? null,
-      images: [],
-      errorMessage: `Gemini request failed: ${res.status}`,
-    };
-  }
+  for (let tokenAttempt = 0; tokenAttempt < 2; tokenAttempt++) {
+    const at = await fetchGeminiAccessToken(cookieMap, { timeoutMs, log, label: "geminiAccessToken" });
+    params.set("at", at);
 
-  try {
-    const parsed = parseGeminiStreamGenerateResponse(rawResponseText);
-    return {
-      rawResponseText,
-      text: parsed.text ?? "",
-      thoughts: parsed.thoughts,
-      metadata: parsed.metadata,
-      images: parsed.images,
-      errorCode: parsed.errorCode,
-    };
-  } catch (error) {
-    let responseJson = null;
-    try {
-      responseJson = JSON.parse(trimGeminiJsonEnvelope(rawResponseText));
-    } catch {
-      responseJson = null;
+    let retryWithFreshToken = false;
+    for (const modelHeader of modelHeaderCandidates) {
+      if (log) log(`StreamGenerate: ${modelHeader ? "model-header" : "no-header"}`);
+      const headers = { "content-type": "application/x-www-form-urlencoded;charset=utf-8",
+        "host": "gemini.google.com", "origin": "https://gemini.google.com",
+        "referer": "https://gemini.google.com/", "x-same-domain": "1", "cookie": cookieHeader };
+      if (modelHeader) headers[MODEL_HEADER_NAME] = modelHeader;
+
+      const res = await httpsPost(GEMINI_STREAM_GENERATE_URL, headers, params.toString(), { timeoutMs, log, label: "geminiStreamGenerate" });
+      lastResult = _normalizeHttpResponse(res.text, res.status, chatMetadata);
+
+      if ([400, 401, 403].includes(res.status) && tokenAttempt === 0) { retryWithFreshToken = true; break; }
+      if (_hasMeaningfulOutput(lastResult) || typeof lastResult.errorCode === "number") return lastResult;
     }
-    const errorCode = extractErrorCode(responseJson);
 
-    return {
-      rawResponseText,
-      text: "",
-      thoughts: null,
-      metadata: chatMetadata ?? null,
-      images: [],
-      errorCode: typeof errorCode === "number" ? errorCode : undefined,
-      errorMessage: error instanceof Error ? error.message : String(error ?? ""),
-    };
+    if (!retryWithFreshToken) break;
+    _clearCachedAt(cookieHeader);
   }
+
+  return lastResult ?? { rawResponseText: "", text: "", thoughts: null, metadata: chatMetadata ?? null, images: [], errorMessage: "Gemini request returned no response" };
 }
 
 async function runGeminiWebWithFallback(input) {
@@ -643,7 +675,15 @@ async function runGeminiWebViaPage(input) {
     tabId = tabResult?.tabId;
     if (!tabId) throw new Error("Failed to create Gemini tab");
     if (log) log(`Gemini tab created: ${tabId}`);
-    await new Promise(r => setTimeout(r, 12000));
+    // Poll for editor ready instead of fixed 12s wait
+    {
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 300));
+        const check = await jsEval(tabId, `String(!!document.querySelector('.ql-editor[contenteditable=true]'))`);
+        if (check?.output === '"true"') break;
+      }
+    }
 
     if (files?.length && uploadFile) {
       const absFiles = files.map(f => path.resolve(process.cwd(), f));
@@ -681,8 +721,18 @@ async function runGeminiWebViaPage(input) {
     `);
     const imgCountBefore = parseInt(JSON.parse(checkJsResult(beforeResult, "Count images")) || "0", 10);
 
-    // Small delay for React to process the input event and enable the send button
-    await new Promise(r => setTimeout(r, 800));
+    // Poll for send button to be enabled instead of fixed delay
+    {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 150));
+        const check = await jsEval(tabId, `
+          const btn = document.querySelector('button[aria-label="Send message"]') || document.querySelector('button[aria-label*="Send"]');
+          String(btn && !btn.disabled);
+        `);
+        if (check?.output === '"true"') break;
+      }
+    }
 
     if (log) log("Submitting...");
     const sendResult = await jsEval(tabId, `
@@ -714,7 +764,7 @@ async function runGeminiWebViaPage(input) {
     let responseText = "";
 
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 800));
       const pollResult = await jsEval(tabId, `
         const ggImgs = Array.from(document.querySelectorAll('img[src*="gg-dl"]'))
           .filter(i => i.naturalWidth >= 512)
@@ -817,7 +867,7 @@ async function query(options) {
   log(`Got ${Object.keys(cookieMap).length} Gemini cookies`);
 
   // 2. Resolve model
-  const resolvedModel = MODEL_HEADERS[model] ? model : "gemini-3-pro";
+  const resolvedModel = (MODEL_HEADER_OVERRIDES[model] || MODEL_HEADERS[model]) ? model : "gemini-3-pro";
 
   // 3. Build prompt
   let fullPrompt = prompt || "";
@@ -918,42 +968,24 @@ async function query(options) {
       imagePath = generateImage;
       
     } else {
-      // Text query — prefer browser UI path (direct StreamGenerate can return empty wrb.fr payloads)
-      log("Sending text query...");
+      // Text query — direct HTTP first (fast, no browser), browser UI only as rescue
+      log("Sending text query via direct transport...");
       const directInput = {
-        prompt: fullPrompt,
-        files,
-        model: resolvedModel,
-        cookieMap,
-        chatMetadata: null,
-        timeoutMs: timeout,
-        log,
+        prompt: fullPrompt, files, model: resolvedModel, cookieMap, chatMetadata: null, timeoutMs: timeout, log,
       };
-      if (hasPageCallbacks) {
-        try {
-          log("Using browser UI path for text query...");
-          const out = await runGeminiWebViaPage({
-            prompt: fullPrompt,
-            files,
-            model: resolvedModel,
-            timeoutMs: timeout,
-            log,
-            createTab,
-            closeTab,
-            jsEval,
-            fetchUrl,
-            uploadFile,
-          });
-          if (!out.text || !out.text.trim()) {
-            throw new Error("Gemini browser UI returned empty text");
-          }
-          response = out;
-        } catch (pageError) {
-          log(`Browser UI path failed: ${pageError.message} — falling back to direct transport`);
-          response = await runGeminiWebWithFallback(directInput);
+      response = await runGeminiWebWithFallback(directInput);
+
+      if (!_hasMeaningfulOutput(response)) {
+        if (!hasPageCallbacks) {
+          throw new Error(response.errorMessage || "Gemini direct transport returned no text");
         }
-      } else {
-        response = await runGeminiWebWithFallback(directInput);
+        log(`Direct transport empty (${response.errorMessage || "no text"}) — falling back to browser UI`);
+        const out = await runGeminiWebViaPage({
+          prompt: fullPrompt, files, model: resolvedModel, timeoutMs: timeout, log,
+          createTab, closeTab, jsEval, fetchUrl, uploadFile,
+        });
+        if (!out.text || !out.text.trim()) throw new Error("Gemini browser UI returned empty text");
+        response = out;
       }
     }
   } catch (error) {
@@ -985,4 +1017,5 @@ module.exports = {
   REQUIRED_COOKIES,
   ALL_COOKIE_NAMES,
   GEMINI_APP_URL,
+  __internal: { _getModelHeaderCandidates, _hasMeaningfulOutput },
 };
