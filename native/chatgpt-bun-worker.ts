@@ -528,60 +528,102 @@ async function activateImageTool(wv: WebView, timeoutMs = 5000): Promise<void> {
  * that captures the ChatGPT SSE streaming response BEFORE page JS runs.
  * Must be called BEFORE navigating to chatgpt.com.
  */
-async function injectStreamCapture(wv: WebView): Promise<void> {
+/**
+ * Start capturing WebSocket frames via CDP Network domain.
+ * ChatGPT streams conversation responses over wss://ws.chatgpt.com.
+ * Frames contain JSON with delta-encoded messages.
+ */
+async function startWebSocketCapture(wv: WebView): Promise<void> {
+  // Enable Network domain for WebSocket frame events
+  await wv.cdp("Network.enable");
+
+  // Hook WebSocket to capture ChatGPT response stream before page JS runs
   await wv.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `
     (function() {
-      window.__surfChatResponse = { text: '', done: false, messageId: null, model: null };
-      var origFetch = window.fetch.bind(window);
-      window.fetch = function() {
-        var args = arguments;
-        var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-        var opts = args[1] || {};
-        var method = (opts.method || 'GET').toUpperCase();
-        var result = origFetch.apply(this, args);
-        // Match conversation send: POST /backend-api/f/conversation or /backend-api/conversation
-        var isConv = method === 'POST' && (url.indexOf('/backend-api/f/conversation') !== -1 || url.match(/\\/backend-api\\/conversation$/));
-        if (isConv) {
-          result.then(function(resp) {
-            if (!resp.body) return;
-            var clone = resp.clone();
-            var reader = clone.body.getReader();
-            var decoder = new TextDecoder();
-            var buf = '';
-            function pump() {
-              reader.read().then(function(chunk) {
-                if (chunk.done) {
-                  window.__surfChatResponse.done = true;
-                  return;
-                }
-                buf += decoder.decode(chunk.value, { stream: true });
-                var lines = buf.split('\\n');
-                buf = lines.pop() || '';
-                for (var i = 0; i < lines.length; i++) {
-                  var line = lines[i];
-                  if (line.indexOf('data: ') !== 0) continue;
-                  var payload = line.slice(6).trim();
-                  if (payload === '[DONE]') { window.__surfChatResponse.done = true; continue; }
-                  try {
-                    var obj = JSON.parse(payload);
-                    var msg = obj.message;
-                    if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
-                      window.__surfChatResponse.text = msg.content.parts.join('');
-                      window.__surfChatResponse.messageId = msg.id || null;
-                      if (msg.metadata && msg.metadata.model_slug) {
-                        window.__surfChatResponse.model = msg.metadata.model_slug;
-                      }
+      if (!window.__surfChatResponse) window.__surfChatResponse = { text: '', done: false, messageId: null, model: null };
+      var OrigWS = window.WebSocket;
+      window.WebSocket = function(url, protocols) {
+        var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+        if (url && url.indexOf('ws.chatgpt.com') !== -1) {
+          var origOnMessage = null;
+          Object.defineProperty(ws, 'onmessage', {
+            get: function() { return origOnMessage; },
+            set: function(fn) {
+              origOnMessage = function(event) {
+                try {
+                  var data = typeof event.data === 'string' ? event.data : '';
+                  if (data) {
+                    // Parse each line as potential JSON message
+                    var lines = data.split('\\n');
+                    for (var i = 0; i < lines.length; i++) {
+                      var line = lines[i].trim();
+                      if (!line || line[0] !== '{') continue;
+                      try {
+                        var obj = JSON.parse(line);
+                        var msg = (obj.v && obj.v.message) || obj.message;
+                        if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
+                          var text = msg.content.parts.join('');
+                          if (text) window.__surfChatResponse.text = text;
+                          if (msg.id) window.__surfChatResponse.messageId = msg.id;
+                          if (msg.metadata && msg.metadata.model_slug) {
+                            window.__surfChatResponse.model = msg.metadata.model_slug;
+                          }
+                          if (msg.status === 'finished_successfully' && msg.end_turn) {
+                            window.__surfChatResponse.done = true;
+                          }
+                        }
+                      } catch(e) {}
                     }
-                  } catch(e) {}
-                }
-                pump();
-              }).catch(function() { window.__surfChatResponse.done = true; });
+                  }
+                } catch(e) {}
+                if (fn) fn.call(ws, event);
+              };
             }
-            pump();
-          }).catch(function() {});
+          });
+          // Also intercept addEventListener
+          var origAddEL = ws.addEventListener.bind(ws);
+          ws.addEventListener = function(type, listener, opts) {
+            if (type === 'message') {
+              var wrappedListener = function(event) {
+                try {
+                  var data = typeof event.data === 'string' ? event.data : '';
+                  if (data) {
+                    var lines = data.split('\\n');
+                    for (var i = 0; i < lines.length; i++) {
+                      var line = lines[i].trim();
+                      if (!line || line[0] !== '{') continue;
+                      try {
+                        var obj = JSON.parse(line);
+                        var msg = (obj.v && obj.v.message) || obj.message;
+                        if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
+                          var text = msg.content.parts.join('');
+                          if (text) window.__surfChatResponse.text = text;
+                          if (msg.id) window.__surfChatResponse.messageId = msg.id;
+                          if (msg.metadata && msg.metadata.model_slug) {
+                            window.__surfChatResponse.model = msg.metadata.model_slug;
+                          }
+                          if (msg.status === 'finished_successfully' && msg.end_turn) {
+                            window.__surfChatResponse.done = true;
+                          }
+                        }
+                      } catch(e) {}
+                    }
+                  }
+                } catch(e) {}
+                listener.call(ws, event);
+              };
+              return origAddEL(type, wrappedListener, opts);
+            }
+            return origAddEL(type, listener, opts);
+          };
         }
-        return result;
+        return ws;
       };
+      window.WebSocket.prototype = OrigWS.prototype;
+      window.WebSocket.CONNECTING = OrigWS.CONNECTING;
+      window.WebSocket.OPEN = OrigWS.OPEN;
+      window.WebSocket.CLOSING = OrigWS.CLOSING;
+      window.WebSocket.CLOSED = OrigWS.CLOSED;
     })()
   ` });
 }
@@ -1081,14 +1123,14 @@ async function main() {
       log(`CDP stealth skipped: ${stealthErr.message}`);
     }
 
-    // Inject SSE stream capture BEFORE navigating (hooks fetch before page JS runs)
-    await injectStreamCapture(wv);
-    log("Stream capture injected (pre-navigation)");
+    // WebSocket capture for response extraction (must be before navigation)
+    await startWebSocketCapture(wv);
+    log("WebSocket capture registered");
 
     // Step: Load ChatGPT
     progress.step();
     await wv.navigate(CHATGPT_URL);
-    await delay(2000);
+    await delay(3000);
 
     // Check for Cloudflare
     if (await isCloudflareBlocked(wv)) {
