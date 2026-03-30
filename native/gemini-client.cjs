@@ -705,16 +705,10 @@ async function runGeminiWebViaPage(input) {
     const typeResult = await jsEval(tabId, `
       const editor = document.querySelector('.ql-editor[contenteditable=true]');
       if (!editor) return JSON.stringify({ error: "No editor found on page" });
-      const quill = editor.__quill || editor.closest('.ql-container')?.__quill || editor.parentElement?.__quill;
       editor.focus();
-      if (quill) {
-        quill.setText('${fullPrompt}');
-        quill.setSelection(quill.getLength(), 0, 'silent');
-        return JSON.stringify({ ok: true, method: 'quill', len: quill.getText().trim().length });
-      }
       document.execCommand('selectAll', false, null);
       document.execCommand('insertText', false, '${fullPrompt}');
-      return JSON.stringify({ ok: true, method: 'execCommand', len: (editor.textContent||'').trim().length });
+      return JSON.stringify({ ok: true, len: editor.textContent.length });
     `);
     const typed = JSON.parse(JSON.parse(checkJsResult(typeResult, "Type prompt")));
     if (typed.error) throw new Error(typed.error);
