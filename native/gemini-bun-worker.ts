@@ -311,10 +311,13 @@ async function pollResponseState(wv: WebView): Promise<PollState> {
         candidates.push({ source: href, kind: 'link', width: 0, height: 0, fingerprint: fp, isDisplayImage: false });
       }
 
+      // Scope loading detection to the latest model-response only —
+      // unrelated page spinners must not block response completion.
+      var loadingRoot = last || document;
       var loading = !!(
-        document.querySelector('mat-progress-bar') ||
-        document.querySelector('.loading-indicator') ||
-        document.querySelector('message-loading')
+        loadingRoot.querySelector('mat-progress-bar') ||
+        loadingRoot.querySelector('.loading-indicator') ||
+        loadingRoot.querySelector('message-loading')
       );
 
       return {
@@ -582,7 +585,7 @@ async function saveGeneratedImage(
                   })
                   .catch(function(e) { reject('fetch: ' + (e.message || String(e))); });
               }
-              // Draw img to canvas → toDataURL
+              // Draw img to canvas → toDataURL; fall back to fetch if tainted
               var canvas = document.createElement('canvas');
               canvas.width = target.naturalWidth || target.width || 1024;
               canvas.height = target.naturalHeight || target.height || 1024;
@@ -590,9 +593,21 @@ async function saveGeneratedImage(
               try {
                 ctx.drawImage(target, 0, 0, canvas.width, canvas.height);
                 var dataUrl = canvas.toDataURL('image/png');
-                resolve(dataUrl.split(',')[1]); // strip "data:image/png;base64,"
-              } catch(e) {
-                reject('canvas: ' + (e.message || String(e)));
+                resolve(dataUrl.split(',')[1]);
+              } catch(canvasErr) {
+                // Canvas tainted or SecurityError — try fetch as last resort
+                fetch(${JSON.stringify(url)}, { credentials: 'include' })
+                  .then(function(r) { return r.blob(); })
+                  .then(function(blob) { return blob.arrayBuffer(); })
+                  .then(function(buf) {
+                    var bytes = new Uint8Array(buf);
+                    var binary = '';
+                    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                    resolve(btoa(binary));
+                  })
+                  .catch(function(fetchErr) {
+                    reject('canvas: ' + (canvasErr.message || canvasErr) + ' | fetch: ' + (fetchErr.message || fetchErr));
+                  });
               }
             });
           })()
@@ -655,24 +670,40 @@ async function saveGeneratedImage(
  * Verified activation: throws ui_changed if tool cannot be confirmed active.
  */
 async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<void> {
-  // Step 1: check if already active — look for the dismiss chip (has × close button)
-  // NOT the static tool suggestion buttons that are always present
+  // Shared text-matcher: "image" or "images" as first word (matches menu item AND active chip)
+  // Used in alreadyActive check, menu click, and post-click verification.
+  const IMAGE_TOOL_MATCH_JS = `(function isImageItem(text) {
+    var t = text.toLowerCase().replace(/\\s+/g,' ').trim();
+    var fw = t.split(' ')[0];
+    return (fw === 'image' || fw === 'images') && !t.includes('video') && !t.includes('music') && !t.includes('canvas');
+  })`;
+
+  // Step 1: check if already active via aria-checked on menuitemcheckbox
+  // (requires opening/closing the menu, but that's the only reliable signal)
+  // Fallback: look for active dismiss-chip with matching text + close button
   const alreadyActive = await pageEval(wv, `
     (function() {
+      var isImageItem = ${IMAGE_TOOL_MATCH_JS};
+      // Check dismiss chip at bottom of input (has close/remove button inside)
       var chips = document.querySelectorAll('mat-chip, [class*="chip"]');
       for (var i = 0; i < chips.length; i++) {
         var c = chips[i];
-        var t = (c.textContent || '').toLowerCase().replace(/\s+/g,' ').trim();
-        // Active chip has a close/dismiss button inside it
-        var hasClose = !!c.querySelector('button[aria-label*="close" i], button[aria-label*="remove" i], mat-icon[aria-label*="cancel" i], [class*="close"], [class*="remove"]');
-        if (t.includes('create image') && hasClose) return true;
+        var hasClose = !!c.querySelector('button[aria-label*="close" i], button[aria-label*="remove" i], [class*="close"], [class*="remove"], mat-icon');
+        if (hasClose && isImageItem(c.textContent || '')) return true;
       }
       return false;
     })()
   `);
   if (alreadyActive) { log("Create image tool: already active"); return; }
 
-  // Step 2: find and click the + / tools button near the editor
+  // Step 2: wait for Tools button to appear (toolbar loads async), then click
+  const toolsBtnDeadline = Date.now() + 4000;
+  while (Date.now() < toolsBtnDeadline) {
+    const ready = await pageEval(wv, `!!document.querySelector('button[aria-label="Tools"]')`);
+    if (ready) break;
+    await delay(300);
+  }
+
   const openResult = await pageEval(wv, `
     (function() {
       // Direct aria selectors (case-insensitive where possible)
@@ -728,22 +759,25 @@ async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<v
 
   await delay(500);
 
-  // Step 3: find and click "Create image" in the overlay menu
+  // Step 3: find and click "Images" in the overlay menu
   const clickResult = await pageEval(wv, `
     (function() {
-      var roleSelectors = '[role="menuitemcheckbox"],[role="menuitemradio"],[role="menuitem"],[role="option"],mat-option,[data-test-id*="tool" i]';
+      var isImageItem = ${IMAGE_TOOL_MATCH_JS};
+      var roleSelectors = '[role="menuitemcheckbox"],[role="menuitemradio"],[role="menuitem"],[role="option"],mat-option';
       var items = document.querySelectorAll(roleSelectors);
       var found = [];
       for (var i = 0; i < items.length; i++) {
-        var raw = (items[i].textContent || '').replace(/\s+/g,' ').trim().toLowerCase();
+        var el = items[i];
+        var raw = (el.textContent || '').replace(/\\s+/g,' ').trim();
         found.push(raw.slice(0,30));
-        // Match "images", "image", "images new", "create image" — Gemini uses "Images New"
-        var firstWord = raw.split(/\s+/)[0];
-        if ((firstWord === 'image' || firstWord === 'images' || raw.startsWith('create image')) &&
-            !raw.includes('video') && !raw.includes('music') && !raw.includes('canvas')) {
-          items[i].click();
-          return 'clicked:' + items[i].textContent.trim().slice(0,30);
+        if (!isImageItem(raw)) continue;
+        // Skip if already checked (aria-checked="true") — clicking would toggle OFF
+        var checked = el.getAttribute('aria-checked');
+        if (checked === 'true') {
+          return 'already-checked:' + raw.slice(0,30);
         }
+        el.click();
+        return 'clicked:' + raw.slice(0,30);
       }
       document.body.click();
       return 'not-found|items:' + found.join(';');
@@ -752,6 +786,12 @@ async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<v
 
   log(`Create image tool click: ${clickResult}`);
 
+  if (clickResult.startsWith("already-checked")) {
+    log("Create image tool: already checked in menu — closing");
+    await pageEval(wv, "document.body.click()");
+    return;
+  }
+
   if (!clickResult.startsWith("clicked")) {
     log("Warning: Create image item not found in menu — relying on prompt prefix");
     return;
@@ -759,16 +799,18 @@ async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<v
 
   await delay(300);
 
-  // Step 4: verify chip appeared (poll up to timeoutMs)
+  // Step 4: verify chip appeared (poll up to timeoutMs) using same text-matcher
   const deadline = Date.now() + Math.min(timeoutMs, 3000);
   while (Date.now() < deadline) {
     await delay(300);
     const verified = await pageEval(wv, `
       (function() {
-        var els = document.querySelectorAll('mat-chip,[class*="chip"],[class*="tool-badge"],button,[role="button"]');
-        for (var i = 0; i < els.length; i++) {
-          var t = (els[i].textContent || '').toLowerCase().replace(/\s+/g,' ').trim();
-          if (t.startsWith('create image')) return true;
+        var isImageItem = ${IMAGE_TOOL_MATCH_JS};
+        var chips = document.querySelectorAll('mat-chip, [class*="chip"]');
+        for (var i = 0; i < chips.length; i++) {
+          var c = chips[i];
+          var hasClose = !!c.querySelector('button[aria-label*="close" i], button[aria-label*="remove" i], [class*="close"], [class*="remove"], mat-icon');
+          if (hasClose && isImageItem(c.textContent || '')) return true;
         }
         return false;
       })()
@@ -776,7 +818,6 @@ async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<v
     if (verified) { log("Create image tool: verified active (chip)"); return; }
   }
 
-  // Verification failed — but don't hard-fail: Gemini may still honor the prompt prefix
   log("Warning: Create image chip not confirmed — proceeding anyway");
 }
 
