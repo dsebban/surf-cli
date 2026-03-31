@@ -495,26 +495,33 @@ async function uploadFileViaCDP(
     }
   };
 
-  // Wait for the Page.fileChooserOpened event then set files on the correct input
-  const waitForFileChooser = (attemptTimeoutMs: number): Promise<void> => {
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | null = null;
+  // Create a cancellable file-chooser waiter.
+  // Returns { promise, cancel } so the caller can clean up stale listeners
+  // if clickUploadSequence() throws before the event fires.
+  const createFileChooserWaiter = (attemptTimeoutMs: number) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let handler: ((event: any) => void) | null = null;
 
-      const cleanup = () => {
-        if (timer) { clearTimeout(timer); timer = null; }
-        wv.removeEventListener("Page.fileChooserOpened", handler);
-      };
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (handler) { wv.removeEventListener("Page.fileChooserOpened", handler); handler = null; }
+    };
 
-      const handler = async (event: any) => {
+    const promise = new Promise<void>((resolve, reject) => {
+      handler = async (event: any) => {
         if (settled) return;
         settled = true;
         cleanup();
         try {
           // event.data contains { frameId, mode, backendNodeId }
-          const backendNodeId = event.data?.backendNodeId;
-          if (!backendNodeId) {
-            throw new Error("fileChooserOpened event missing backendNodeId");
+          // Harden extraction: backendNodeId must be a number (CDP spec)
+          const data = event?.data ?? event;
+          const backendNodeId = data?.backendNodeId;
+          if (typeof backendNodeId !== "number") {
+            throw new Error(
+              `fileChooserOpened event: expected numeric backendNodeId, got ${typeof backendNodeId} (${backendNodeId})`,
+            );
           }
           log(`File chooser opened (backendNodeId=${backendNodeId}), setting files...`);
           await wv.cdp("DOM.setFileInputFiles", {
@@ -536,36 +543,46 @@ async function uploadFileViaCDP(
 
       wv.addEventListener("Page.fileChooserOpened", handler);
     });
+
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+    };
+
+    return { promise, cancel };
   };
 
-  // Retry loop — mirrors the extension's 3-attempt strategy
+  // Retry loop — only retries chooser open + file set.
+  // waitForUploadChip runs ONCE after successful file set (not retried).
   const maxAttempts = 3;
   const attemptTimeouts = [10000, 15000, 20000];
   let lastError: Error | null = null;
 
   try {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const waiter = createFileChooserWaiter(
+        Math.min(attemptTimeouts[attempt - 1], timeoutMs),
+      );
       try {
-        const chooserPromise = waitForFileChooser(
-          Math.min(attemptTimeouts[attempt - 1], timeoutMs),
-        );
         await clickUploadSequence();
-        await chooserPromise;
+        await waiter.promise;
         log("File set via file chooser interception");
-
-        // Wait for upload chip to appear and finish processing
-        await waitForUploadChip(wv, timeoutMs);
-        log("File upload complete");
-        return;
+        break; // success — exit retry loop
       } catch (err: any) {
+        waiter.cancel(); // always clean up stale listener/timer
         lastError = err;
         log(`Upload attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
-        if (attempt < maxAttempts) {
-          await delay(1000);
+        if (attempt === maxAttempts) {
+          throw new Error(`File upload failed after ${maxAttempts} attempts: ${lastError.message}`);
         }
+        await delay(1000);
       }
     }
-    throw new Error(`File upload failed after ${maxAttempts} attempts: ${lastError?.message}`);
+
+    // Chip readiness: runs once after successful file set (outside retry scope)
+    await waitForUploadChip(wv, timeoutMs);
+    log("File upload complete");
   } finally {
     // Always disable interception on exit
     try {

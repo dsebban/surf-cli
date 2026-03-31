@@ -73,8 +73,18 @@ declare namespace Bun {
     /** Close this WebView instance. */
     close(): void;
 
-    addEventListener(event: string, handler: (...args: unknown[]) => void): void;
-    removeEventListener(event: string, handler: (...args: unknown[]) => void): void;
+    /**
+     * Listen for CDP domain events (requires the domain to be enabled first).
+     * Events are dispatched as MessageEvent with:
+     *   - event.type  = CDP method name (e.g. "Page.fileChooserOpened")
+     *   - event.data  = parsed CDP params object
+     *
+     * Example CDP events:
+     *   "Page.fileChooserOpened"  → { frameId: string, mode: string, backendNodeId: number }
+     *   "Network.requestWillBeSent" → { requestId, request, ... }
+     */
+    addEventListener(event: string, handler: (event: { data?: any; [key: string]: any }) => void): void;
+    removeEventListener(event: string, handler: (event: { data?: any; [key: string]: any }) => void): void;
 
     /** Close all WebView instances. */
     static closeAll(): void;
