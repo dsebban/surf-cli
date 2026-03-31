@@ -12,6 +12,7 @@ const { executeDoSteps } = require("./do-executor.cjs");
 const { shouldUseBunGemini, isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
 const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require("./chatgpt-bun-bridge.cjs");
 const { isCloakBrowserAvailable, queryWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
+const sessionStore = require("./session-store.cjs");
 const { version: VERSION } = require("../package.json");
 
 const IS_WIN = process.platform === "win32";
@@ -1563,6 +1564,9 @@ More Help:
   surf --find <query>        Search for commands
   surf --about <topic>       Learn about a topic
   surf skills                Print the full agent skill reference (SKILL.md)
+  surf session               List recent AI sessions (~/.surf/sessions/)
+  surf session <id>          View session log (full stderr + result)
+  surf session --clear       Delete all sessions
 `);
 };
 
@@ -1824,6 +1828,97 @@ if (args[0] === "skills" || args[0] === "skill") {
     process.exit(1);
   }
   process.stdout.write(fs.readFileSync(skillPath, "utf-8"));
+  process.exit(0);
+}
+
+// ============================================================================
+// surf session — list / view / clear sessions (Oracle-style)
+// ============================================================================
+
+if (args[0] === "session" || args[0] === "sessions") {
+  const sessionArgs = args.slice(1);
+
+  // surf session --clear [--hours N | --all]
+  if (sessionArgs.includes("--clear")) {
+    const allFlag   = sessionArgs.includes("--all");
+    const hoursIdx  = sessionArgs.indexOf("--hours");
+    const hours     = hoursIdx !== -1 ? Number(sessionArgs[hoursIdx + 1]) : undefined;
+    const { deleted, remaining } = sessionStore.deleteSessions({ all: allFlag, hours });
+    const label = allFlag ? "all sessions" : hours ? `sessions older than ${hours}h` : "all sessions";
+    console.log(`Deleted ${deleted} sessions (${label}). ${remaining} sessions remain.`);
+    process.exit(0);
+  }
+
+  // surf session <id>  — view a single session log
+  const idArg = sessionArgs.find(a => !a.startsWith("-"));
+  if (idArg) {
+    const found = sessionStore.loadSession(idArg);
+    if (!found) {
+      console.error(`Session not found: ${idArg}`);
+      process.exit(1);
+    }
+    const { meta, log } = found;
+    const status  = meta.status === "completed" ? "✓" : meta.status === "error" ? "✗" : "◌";
+    const elapsed = meta.elapsedMs ? `${(meta.elapsedMs / 1000).toFixed(1)}s` : "-";
+    console.log(`\n${status} ${meta.id}`);
+    console.log(`  Tool:    ${meta.tool}`);
+    console.log(`  Status:  ${meta.status}`);
+    console.log(`  Created: ${meta.createdAt}`);
+    console.log(`  Elapsed: ${elapsed}`);
+    if (meta.args?.query)  console.log(`  Query:   ${meta.args.query}`);
+    if (meta.args?.file)   console.log(`  File:    ${meta.args.file}`);
+    if (meta.args?.model)  console.log(`  Model:   ${meta.args.model}`);
+    if (meta.error)        console.log(`  Error:   ${meta.error.message}`);
+    if (log) {
+      console.log(`\n--- output.log ---`);
+      console.log(log);
+    }
+    process.exit(0);
+  }
+
+  // surf session [--all] [--hours N] [--limit N]  — list sessions
+  const allFlag   = sessionArgs.includes("--all");
+  const hoursIdx  = sessionArgs.indexOf("--hours");
+  const hours     = hoursIdx !== -1 ? Number(sessionArgs[hoursIdx + 1]) : 24;
+  const limitIdx  = sessionArgs.indexOf("--limit");
+  const limit     = limitIdx !== -1 ? Number(sessionArgs[limitIdx + 1]) : 50;
+
+  const sessions = sessionStore.listSessions({ hours, all: allFlag, limit });
+
+  if (sessions.length === 0) {
+    console.log(`No sessions found in the last ${allFlag ? "" : hours + "h "}at ${sessionStore.SESSIONS_DIR}`);
+    console.log(`  surf session --all          Show all sessions`);
+    console.log(`  surf session --hours 72     Last 72 hours`);
+    process.exit(0);
+  }
+
+  // Header
+  console.log(`\nSurf sessions (${sessions.length}) — ${sessionStore.SESSIONS_DIR}\n`);
+  const STATUS_ICON = { completed: "✓", error: "✗", running: "◌", pending: "·", cancelled: "⊘" };
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+
+  // Column widths
+  const maxId    = Math.min(48, Math.max(20, ...sessions.map(s => s.id.length)));
+  const header   = `  ${pad("STATUS",8)} ${pad("TOOL",10)} ${pad("ID", maxId)} ${pad("ELAPSED",8)} CREATED`;
+  console.log(header);
+  console.log("  " + "-".repeat(header.length - 2));
+
+  for (const s of sessions) {
+    const icon    = STATUS_ICON[s.status] || "?";
+    const elapsed = s.elapsedMs ? `${(s.elapsedMs / 1000).toFixed(1)}s` : "-";
+    const created = new Date(s.createdAt).toLocaleString("en-US", {
+      month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+    });
+    const statusLabel = `${icon} ${s.status}`;
+    console.log(`  ${pad(statusLabel,8)} ${pad(s.tool,10)} ${pad(s.id, maxId)} ${pad(elapsed,8)} ${created}`);
+  }
+
+  console.log(`\nUsage:`);
+  console.log(`  surf session <id>             View session log`);
+  console.log(`  surf session --hours 72       Last 72h`);
+  console.log(`  surf session --all            All sessions`);
+  console.log(`  surf session --clear          Delete all`);
+  console.log(`  surf session --clear --hours 24  Delete sessions older than 24h`);
   process.exit(0);
 }
 
@@ -3006,6 +3101,10 @@ if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
       if (requestedProfile) toolArgs.profile = requestedProfile;
       if (toolArgs["generate-image"]) toolArgs.generateImage = toolArgs["generate-image"];
       
+      const sess = sessionStore.createSession("chatgpt", toolArgs, process.env);
+      const _origWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
+
       const startMs = Date.now();
       let lastProgress = "";
       
@@ -3018,11 +3117,15 @@ if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
       });
       
       const durationMs = result.tookMs || (Date.now() - startMs);
+      process.stderr.write = _origWrite;
       
       if (result.imagePath) {
         process.stderr.write(`Image saved: ${result.imagePath}\n`);
       }
       
+      sess.finish({ model: result.model, tookMs: durationMs, imagePath: result.imagePath,
+        responsePreview: result.response ? result.response.slice(0, 160) : "" });
+
       if (wantJson) {
         console.log(JSON.stringify({
           response: result.response,
@@ -3063,10 +3166,16 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
   if (eligibility.eligible) {
     if (requestedProfile) toolArgs.profile = requestedProfile;
     (async () => {
+      const sess = sessionStore.createSession("chatgpt", toolArgs, process.env);
+      const _origWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
       try {
         const bunResult = await runChatGPTViaBun(toolArgs);
+        process.stderr.write = _origWrite;
         if (bunResult.ok) {
           const data = bunResult.result;
+          sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
+            responsePreview: data.response ? data.response.slice(0, 160) : "" });
           if (wantJson) {
             console.log(JSON.stringify(data, null, 2));
           } else {
@@ -3078,11 +3187,14 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
           }
           process.exit(0);
         } else if (bunResult.fallbackRecommended) {
+          process.stderr.write = _origWrite;
           if (requestedProfile) {
+            sess.fail(new Error(bunResult.error || "bun chatgpt failed"));
             console.error(`Error: Bun ChatGPT failed with --profile: ${bunResult.error}`);
             process.exit(1);
           }
           if (hasBunOnlyChatGPTFeature) {
+            sess.fail(new Error(bunResult.error || "bun chatgpt failed"));
             console.error(`Error: ${bunResult.error}`);
             process.exit(1);
           }
@@ -3090,6 +3202,8 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
           startLegacySocketPath();
         } else {
           const errMsg = bunResult.error || "Bun ChatGPT worker error";
+          sess.fail(new Error(errMsg));
+          process.stderr.write = _origWrite;
           if (softFail) {
             console.warn(`Warning: ${errMsg}`);
             process.exit(0);
@@ -3101,6 +3215,8 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
           process.exit(1);
         }
       } catch (err) {
+        sess.fail(err);
+        process.stderr.write = _origWrite;
         const errMsg = `Bun ChatGPT bridge failed: ${err.message}`;
         if (softFail) {
           console.warn(`Warning: ${errMsg}`);
@@ -3157,10 +3273,16 @@ if (tool === "gemini" && shouldUseBunGemini(process.env)) {
     // Pass profile into the toolArgs for the bridge
     if (requestedProfile) toolArgs.profile = requestedProfile;
     (async () => {
+      const sess = sessionStore.createSession("gemini", toolArgs, process.env);
+      const _origWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
       try {
         const bunResult = await runGeminiViaBun(toolArgs);
+        process.stderr.write = _origWrite;
         if (bunResult.ok) {
           const data = bunResult.result;
+          sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
+            responsePreview: data.response ? data.response.slice(0, 160) : "" });
           if (wantJson) {
             console.log(JSON.stringify(data, null, 2));
           } else {
@@ -3174,14 +3296,19 @@ if (tool === "gemini" && shouldUseBunGemini(process.env)) {
         } else if (bunResult.fallbackRecommended) {
           // When --profile was explicit, never fall back (wrong account risk)
           if (requestedProfile) {
+            sess.fail(new Error(bunResult.error || "bun gemini failed"));
+            process.stderr.write = _origWrite;
             console.error(`Error: Bun Gemini failed with --profile: ${bunResult.error}`);
             process.exit(1);
           }
+          process.stderr.write = _origWrite;
           process.stderr.write(`[bun-gemini] Falling back to legacy path: ${bunResult.error}\n`);
           startLegacySocketPath();
         } else {
           // Runtime error — honor --soft-fail / --auto-capture like legacy path
           const errMsg = bunResult.error || "Bun Gemini worker error";
+          sess.fail(new Error(errMsg));
+          process.stderr.write = _origWrite;
           if (softFail) {
             console.warn(`Warning: ${errMsg}`);
             process.exit(0);
@@ -3193,6 +3320,8 @@ if (tool === "gemini" && shouldUseBunGemini(process.env)) {
           process.exit(1);
         }
       } catch (err) {
+        sess.fail(err);
+        process.stderr.write = _origWrite;
         const errMsg = `Bun Gemini bridge failed: ${err.message}`;
         if (softFail) {
           console.warn(`Warning: ${errMsg}`);
