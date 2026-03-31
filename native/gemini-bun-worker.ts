@@ -439,30 +439,46 @@ async function uploadFileViaCDP(
   await wv.cdp("DOM.enable");
   await wv.cdp("Page.enable");
 
-  // Click the upload/attachment button
-  const clickedUpload = await pageEval(wv, `
-    (function() {
-      // Try multiple known selectors for the upload trigger
-      var btn = document.querySelector('[aria-label="Open upload file menu"]')
-        || document.querySelector('[aria-label="Upload file"]')
-        || document.querySelector('[aria-label="Attach files"]')
-        || document.querySelector('button[data-test-id*="upload"]')
-        || document.querySelector('.upload-button');
-      if (btn) { btn.click(); return 'menu'; }
-      return 'none';
-    })()
-  `);
+  // Intercept file chooser dialogs so the OS file picker never appears.
+  // When Gemini opens a file chooser, Chrome emits Page.fileChooserOpened
+  // with the backendNodeId of the <input>. We then set files on that exact
+  // input — the one the app activated — not a random pre-existing one.
+  await wv.cdp("Page.setInterceptFileChooserDialog", { enabled: true });
 
-  if (clickedUpload === "none") {
-    // Fallback: try to find a hidden file input directly
-    log("Upload button not found, trying direct file input...");
-  } else {
-    // Wait for menu to appear, then click "Upload file" option
-    await delay(500);
+  const clickUploadSequence = async () => {
+    // Close menu if already open (idempotent)
     await pageEval(wv, `
       (function() {
-        // Click the file upload option in the menu
-        var items = document.querySelectorAll('[role="menuitem"], [data-test-id*="local-images-files-uploader-button"]');
+        var btn = document.querySelector('[aria-label="Close upload file menu"]');
+        if (btn) btn.click();
+      })()
+    `);
+    await delay(300);
+
+    // Open upload menu
+    const clickedUpload = await pageEval(wv, `
+      (function() {
+        var btn = document.querySelector('[aria-label="Open upload file menu"]')
+          || document.querySelector('[aria-label="Upload file"]')
+          || document.querySelector('[aria-label="Attach files"]')
+          || document.querySelector('button[data-test-id*="upload"]')
+          || document.querySelector('.upload-button');
+        if (btn) { btn.click(); return 'menu'; }
+        return 'none';
+      })()
+    `);
+    if (clickedUpload === "none") {
+      throw new Error("Upload button not found on Gemini page");
+    }
+    log(`Upload button: ${clickedUpload}`);
+    await delay(500);
+
+    // Click "Upload files" / "Upload from computer" menu item
+    const clickedItem = await pageEval(wv, `
+      (function() {
+        var btn = document.querySelector('[data-test-id="local-images-files-uploader-button"]');
+        if (btn) { btn.click(); return 'clicked-direct'; }
+        var items = document.querySelectorAll('[role="menuitem"]');
         for (var i = 0; i < items.length; i++) {
           var txt = (items[i].textContent || '').toLowerCase();
           if (txt.includes('upload') || txt.includes('file') || txt.includes('computer')) {
@@ -473,42 +489,96 @@ async function uploadFileViaCDP(
         return 'no-item';
       })()
     `);
-    await delay(300);
-  }
-
-  // Poll for the file input element via CDP (may appear async after menu click)
-  let fileNodeId: number | null = null;
-  const inputDeadline = Date.now() + Math.min(timeoutMs, 10000);
-  while (Date.now() < inputDeadline) {
-    const docResult = (await wv.cdp("DOM.getDocument")) as any;
-    const rootNodeId = docResult.root.nodeId;
-    const searchResult = (await wv.cdp("DOM.querySelectorAll", {
-      nodeId: rootNodeId,
-      selector: 'input[type="file"]',
-    })) as any;
-
-    const nodeIds: number[] = searchResult?.nodeIds || [];
-    if (nodeIds.length > 0) {
-      fileNodeId = nodeIds[0];
-      break;
+    log(`Menu item: ${clickedItem}`);
+    if (clickedItem === "no-item") {
+      throw new Error("Upload menu item not found — Gemini UI may have changed");
     }
-    await delay(300);
+  };
+
+  // Wait for the Page.fileChooserOpened event then set files on the correct input
+  const waitForFileChooser = (attemptTimeoutMs: number): Promise<void> => {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanup = () => {
+        if (timer) { clearTimeout(timer); timer = null; }
+        wv.removeEventListener("Page.fileChooserOpened", handler);
+      };
+
+      const handler = async (event: any) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          // event.data contains { frameId, mode, backendNodeId }
+          const backendNodeId = event.data?.backendNodeId;
+          if (!backendNodeId) {
+            throw new Error("fileChooserOpened event missing backendNodeId");
+          }
+          log(`File chooser opened (backendNodeId=${backendNodeId}), setting files...`);
+          await wv.cdp("DOM.setFileInputFiles", {
+            files: [filePath],
+            backendNodeId,
+          });
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error(`File chooser did not open within ${attemptTimeoutMs / 1000}s`));
+      }, attemptTimeoutMs);
+
+      wv.addEventListener("Page.fileChooserOpened", handler);
+    });
+  };
+
+  // Retry loop — mirrors the extension's 3-attempt strategy
+  const maxAttempts = 3;
+  const attemptTimeouts = [10000, 15000, 20000];
+  let lastError: Error | null = null;
+
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const chooserPromise = waitForFileChooser(
+          Math.min(attemptTimeouts[attempt - 1], timeoutMs),
+        );
+        await clickUploadSequence();
+        await chooserPromise;
+        log("File set via file chooser interception");
+
+        // Wait for upload chip to appear and finish processing
+        await waitForUploadChip(wv, timeoutMs);
+        log("File upload complete");
+        return;
+      } catch (err: any) {
+        lastError = err;
+        log(`Upload attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
+        if (attempt < maxAttempts) {
+          await delay(1000);
+        }
+      }
+    }
+    throw new Error(`File upload failed after ${maxAttempts} attempts: ${lastError?.message}`);
+  } finally {
+    // Always disable interception on exit
+    try {
+      await wv.cdp("Page.setInterceptFileChooserDialog", { enabled: false });
+    } catch {}
   }
+}
 
-  if (fileNodeId === null) {
-    throw new Error("No file input found on page for upload (polled until timeout)");
-  }
-
-  // Set files on the discovered file input
-  await wv.cdp("DOM.setFileInputFiles", {
-    nodeId: fileNodeId,
-    files: [filePath],
-  });
-
-  log("File set on input, waiting for processing...");
-
-  // Wait for file preview chip to appear AND finish processing.
-  // The chip transitions: .image-preview.loading → .image-preview.clickable <img>
+/**
+ * Wait for the Gemini file preview chip to finish processing.
+ * The chip transitions: loading spinner → file name / image preview.
+ */
+async function waitForUploadChip(wv: WebView, timeoutMs: number) {
   await pollUntil(
     () =>
       pageEval(wv, `
@@ -527,8 +597,6 @@ async function uploadFileViaCDP(
     timeoutMs,
     "waitForUpload",
   );
-
-  log("File upload complete");
 }
 
 // ============================================================================

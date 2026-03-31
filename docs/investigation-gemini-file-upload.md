@@ -94,43 +94,46 @@ DOM state, not actual upload completion.
 
 ## The Correct Fix
 
-**Primary: Use `Page.setInterceptFileChooserDialog` + `Page.handleFileChooser`**
+**Implemented: `Page.setInterceptFileChooserDialog` + `Page.fileChooserOpened` CDP event**
 
-This is the proper CDP approach:
-1. Enable interception BEFORE any click
-2. Click the upload button / menu item (triggers the file chooser)
-3. CDP immediately intercepts the dialog (no OS popup appears)
-4. Call `Page.handleFileChooser({ action: "accept", files: [path] })`
-5. The browser creates a proper `File` object with real bytes
-6. Gemini's normal upload flow runs (XHR to Google's API)
-7. Wait for the chip to show "ready"
+This is the proper CDP approach (now live in `gemini-bun-worker.ts`):
+1. `Page.setInterceptFileChooserDialog({ enabled: true })` BEFORE any click
+2. Register `wv.addEventListener("Page.fileChooserOpened", handler)` listener
+3. Click upload button + menu item (triggers file chooser)
+4. CDP intercepts the dialog — no OS popup appears in headless
+5. `event.data.backendNodeId` gives us the **exact** `<input>` the app activated
+6. `DOM.setFileInputFiles({ files: [path], backendNodeId })` on the correct input
+7. Gemini's normal upload flow runs (XHR to Google's API)
+8. Poll for chip `ready` state (existing `waitForUploadChip`)
 
-Note: `Page.handleFileChooser` requires that the file chooser was recently opened. Timing
-is tight — must call it within ~500ms of the click.
+Key details:
+- Uses Bun.WebView's `addEventListener("Page.fileChooserOpened", ...)` — CDP events
+  dispatched as `MessageEvent` with `event.data` = parsed CDP params
+- 3-attempt retry with escalating timeouts (10s, 15s, 20s) — mirrors extension
+- Always disables interception in `finally` block
+- Menu item click result now logged + checked (throws on `"no-item"`)
 
-**Secondary: Verify upload via network poll**
-
-After `handleFileChooser`, poll `surf network` for a successful POST to Gemini's upload endpoint
-before proceeding to type+send the prompt.
+**Why this fixes the root cause:**
+- Old code: `DOM.querySelectorAll('input[type="file"]')` found the **first** (drag-and-drop)
+  input, not the one activated by the menu click. Setting files on the wrong input produced
+  a UI chip but no actual upload to Google servers.
+- New code: `backendNodeId` from the `fileChooserOpened` event identifies the **exact** input
+  that triggered the file chooser, guaranteeing we set files on the correct element.
 
 ---
 
-## Session Logging Plan
+## Session Logging (implemented separately)
 
-Build `~/.surf/sessions/` history alongside the fix so future issues are instantly diagnosable.
+Session logging now lives in `native/session-store.cjs` + `~/.surf/sessions/`. Each run captures
+full stderr progress in `output.log` alongside `meta.json`. The upload button/menu click results
+are now visible in session logs via the worker's `log()` calls:
 
-Each run writes `~/.surf/sessions/YYYY-MM-DD_HH-MM-SS_TOOL.jsonl`:
-```json
-{"event":"start","ts":1234567890,"tool":"gemini","args":{"file":"/tmp/file.md","model":"gemini-3-pro","profile":"dsebban883@gmail.com"},"env":{"bun_gemini":true},"version":"2.8.0"}
-{"event":"step","ts":1234567891,"msg":"[2/6] Authenticating — dsebban883@gmail.com (0.1s)"}
-{"event":"step","ts":1234567892,"msg":"[3/6] Loading Gemini (1.3s)"}
-{"event":"upload_click","ts":1234567893,"result":"menu"}
-{"event":"menu_click","ts":1234567893,"result":"clicked-item"}
-{"event":"file_input","ts":1234567894,"nodeId":42,"selector":"input[type=file]"}
-{"event":"file_set","ts":1234567894,"file":"/tmp/file.md"}
-{"event":"chip_wait","ts":1234567895,"state":"loading"}
-{"event":"chip_ready","ts":1234567896,"state":"ready"}
-{"event":"end","ts":1234567900,"ok":true,"tookMs":13200,"model":"gemini-3-pro"}
+```
+[bun-gemini] Upload button: menu
+[bun-gemini] Menu item: clicked-direct
+[bun-gemini] File chooser opened (backendNodeId=42), setting files...
+[bun-gemini] File set via file chooser interception
+[bun-gemini] File upload complete
 ```
 
-This would have immediately revealed the `"menu_click":"no-item"` or wrong nodeId.
+This would have immediately revealed the old bug (no `backendNodeId` → wrong input targeted).
