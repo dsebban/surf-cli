@@ -1541,12 +1541,28 @@ Quick Examples:
   surf emulate.device "iPhone 14"
   surf window.new "https://example.com" && surf --window-id 123 go "https://other.com"
 
+AI Headless Mode:
+  ChatGPT (recommended — defeats Cloudflare/reCAPTCHA via CloakBrowser):
+    SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "prompt" --profile user@gmail.com
+    SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "prompt" --file code.ts --model gpt-5.4-pro
+    SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "prompt" --generate-image /tmp/out.png
+  Fallback (Bun.WebView):
+    SURF_USE_BUN_CHATGPT=1 surf chatgpt "prompt" --profile user@gmail.com
+
+  Gemini (headless, no extension needed):
+    SURF_USE_BUN_GEMINI=1 surf gemini "prompt" --profile user@gmail.com
+    SURF_USE_BUN_GEMINI=1 surf gemini "prompt" --file data.csv --model gemini-3-pro
+
+  ChatGPT models: instant (gpt-5.3), thinking (gpt-5.4), pro (gpt-5.4-pro)
+  Also accepts legacy aliases: gpt-4o → instant, o3/o4-mini → thinking, o1-pro → pro
+
 More Help:
   surf --help-full           All commands
   surf --help-topic <topic>  Topic guide (refs, semantic, frames, devices...)
   surf <command> --help      Command details
   surf --find <query>        Search for commands
   surf --about <topic>       Learn about a topic
+  surf skills                Print the full agent skill reference (SKILL.md)
 `);
 };
 
@@ -1791,6 +1807,24 @@ if (args[0] === "server") {
     process.exit(1);
   });
   return;
+}
+
+if (args[0] === "skills" || args[0] === "skill") {
+  const fs = require("fs");
+  // Search order: npm package skills dir, then symlinked agent skill
+  const candidatePaths = [
+    path.resolve(__dirname, "../skills/surf/SKILL.md"),
+    path.join(os.homedir(), ".pi", "agent", "skills", "surf", "SKILL.md"),
+    path.join(os.homedir(), ".agents", "skills", "surf", "SKILL.md"),
+  ];
+  const skillPath = candidatePaths.find(p => fs.existsSync(p));
+  if (!skillPath) {
+    console.error("SKILL.md not found. Expected at: " + candidatePaths[0]);
+    console.error("To install: ln -s \"$(npm root -g)/surf-cli/skills/surf\" ~/.agents/skills/surf");
+    process.exit(1);
+  }
+  process.stdout.write(fs.readFileSync(skillPath, "utf-8"));
+  process.exit(0);
 }
 
 if (args[0] === "extension-path" || args[0] === "path") {

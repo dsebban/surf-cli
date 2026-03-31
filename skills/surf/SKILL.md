@@ -1,575 +1,341 @@
 ---
 name: surf
-description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, DevTools streaming, or AI queries via ChatGPT/Gemini/Perplexity/Grok/AI Studio.
+description: Control Chrome browser via CLI for testing, automation, and debugging. Use when the user needs browser automation, screenshots, form filling, page inspection, network/CPU emulation, network capture, or AI queries via ChatGPT/Gemini/Perplexity/Grok/AI Studio.
 ---
 
 # Surf Browser Automation
 
-Control Chrome browser via CLI or Unix socket.
+Control a real Chrome-family browser via CLI / native host / extension. Repo + local CLI verified against **surf-cli v2.8.0**.
 
-## CLI Quick Reference
+## When to use
+
+- real browser interaction; not API guesses
+- screenshots / DOM / console / network capture
+- form fill / file upload / wait / iframe work
+- browser-session AI queries: ChatGPT, Gemini, Perplexity, Grok, AI Studio
+
+## Install / sanity check
+
+Always use the live path from Surf itself; do **not** guess bun/npm paths.
 
 ```bash
-surf --help                    # Full help
-surf <group>                   # Group help (tab, scroll, page, wait, dialog, emulate, form, perf, ai)
-surf --help-full               # All commands
-surf --find <term>             # Search tools
-surf --help-topic <topic>      # Topic guide (refs, semantic, frames, devices, windows)
+surf extension-path              # path to load in chrome://extensions
+surf install <extension-id>      # install native host
+surf tab.list                    # sanity check; should list tabs
 ```
 
-## Core Workflow
+If Surf was upgraded and commands start failing:
+1. reload the unpacked extension from `surf extension-path`
+2. rerun `surf install <extension-id>`
+3. fully restart Chrome
+
+If package-manager paths are nonstandard, set before `surf install`:
 
 ```bash
-# 1. Navigate to page
-surf navigate "https://example.com"
-
-# 2. Read page to get element refs
-surf page.read
-
-# 3. Click by ref or coordinates
-surf click --ref "e1"
-surf click --x 100 --y 200
-
-# 4. Type text
-surf type --text "hello"
-
-# 5. Screenshot
-surf screenshot --output /tmp/shot.png
+export SURF_NODE_PATH=/path/to/node
+export SURF_HOST_PATH=/path/to/native/host.cjs
+export SURF_EXTENSION_PATH=/path/to/extension/dist
 ```
 
-## AI Assistants (No API Keys)
+## Core loop
 
-Query AI models using your browser's logged-in session. Must be logged into the respective service in Chrome.
+```bash
+surf go "https://example.com"
+surf read
+surf click e5
+surf type "hello"
+surf snap
+```
 
-### ChatGPT
+Aliases:
+
+```bash
+surf read        # page.read
+surf snap        # screenshot
+surf go          # navigate
+surf find        # search
+```
+
+## High-signal primitives
+
+### Read / inspect
+
+```bash
+surf read
+surf read --no-text
+surf read --depth 3 --compact
+surf page.text
+surf page.state
+surf element.styles e5
+surf console
+surf network
+```
+
+### Robust targeting
+
+Prefer refs or semantic locators over brittle selectors.
+
+```bash
+surf click e5
+surf locate.role button --name "Submit" --action click
+surf locate.text "Accept" --exact --action click
+surf locate.label "Email" --action fill --value "test@example.com"
+```
+
+### Windows / tabs / frames
+
+```bash
+surf window.new "https://example.com"
+surf read --window-id 123
+surf tab.name app
+surf tab.switch app
+surf frame.list
+surf frame.switch --index 0
+surf frame.main
+```
+
+### Waits / screenshots
+
+```bash
+surf wait 2
+surf wait.element ".loaded"
+surf wait.network
+surf wait.url "/dashboard"
+surf snap --output /tmp/shot.png
+surf snap --fullpage
+```
+
+### Forms / uploads / JS
+
+```bash
+surf type "user@example.com" --ref e12
+surf select e5 "US"
+surf upload --ref e5 --files "/path/to/file.txt"
+surf js "return document.title"
+```
+
+## AI via browser session
+
+Must already be logged into the target service in the browser.
+
+## ChatGPT — prefer headless mode (CloakBrowser)
+
+**Always use `SURF_USE_CLOAK_CHATGPT=1`** for ChatGPT. CloakBrowser defeats detection (33 C++ patches, 0.9 reCAPTCHA score, human-like behavior). Required for `--file`, `--generate-image`, `--profile`.
+
+```bash
+# Standard form — always set SURF_USE_CLOAK_CHATGPT=1
+SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "explain this code" --profile dsebban883@gmail.com
+SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "review this PR" --file diff.patch --profile dsebban883@gmail.com
+SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
+SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "deep analysis" --model gpt-5.4-pro --profile dsebban883@gmail.com
+```
+
+### ChatGPT models (March 2026 lineup)
+
+| Model alias | Maps to | Use for |
+|-------------|---------|--------|
+| `instant`, `gpt-5.3`, `gpt-4o` | GPT-5.3 Instant | fast queries, code gen |
+| `thinking`, `gpt-5.4-thinking`, `o3`, `o4-mini` | GPT-5.4 Thinking | reasoning, math |
+| `pro`, `gpt-5.4-pro`, `o1-pro` | GPT-5.4 Pro | research-grade, hardest tasks |
+
+Progress output (stderr) — structured steps:
+```
+[bun-chatgpt] [1/5] Launching browser — instant (0.0s)
+[bun-chatgpt] [2/5] Authenticating — dsebban883@gmail.com (0.1s)
+[bun-chatgpt] [3/5] Loading ChatGPT (1.2s)
+[bun-chatgpt] [4/5] Sending prompt — ... (3.4s)
+[bun-chatgpt] [5/5] Waiting for response (3.6s)
+[bun-chatgpt] ✓ Done — response preview (instant, 12.1s)
+```
+
+### Headless backends
+
+| Flag | Backend | Notes |
+|------|---------|-------|
+| `SURF_USE_CLOAK_CHATGPT=1` | **CloakBrowser** ← **default** | defeats detection; requires `npm install -g cloakbrowser` |
+| `SURF_USE_BUN_CHATGPT=1` | Bun.WebView | fallback if CloakBrowser unavailable; requires Bun canary |
+| neither | extension path | legacy; no `--file`/`--generate-image`/`--profile` |
+
+### Constraints
+- `--profile` macOS only
+- `--profile` incompatible with `--with-page`
+- `--file` / `--generate-image` / `--profile` require headless flag
+- default timeout **2700s = 45min**
+
+### Long-running ChatGPT / reasoning models
+
+For `gpt-5.4-pro`, Thinking, similar long-think runs: launch in tmux, poll logs.
+
+```bash
+tmux new -d -s surf-chat "bash -lc 'set -x; SURF_USE_CLOAK_CHATGPT=1 surf chatgpt \"complex analysis\" --model gpt-5.4-pro --profile dsebban883@gmail.com --timeout 3000 2>&1 | tee /tmp/surf-chatgpt.log'"
+
+# poll
+tail -f /tmp/surf-chatgpt.log
+
+# inspect session
+tmux attach -t surf-chat
+```
+
+Why: browser-side AI runs can take many minutes; tmux keeps agent unblocked and observable.
+
+### Fallback: extension-based (legacy)
+
+Only when headless unavailable (`--with-page` requires it):
+
 ```bash
 surf chatgpt "explain this code"
-surf chatgpt "summarize" --with-page              # Include current page context
-surf chatgpt "review" --model gpt-4o              # Specify model
-surf chatgpt "analyze" --file document.pdf        # With file attachment
+surf chatgpt "summarize" --with-page
 ```
 
-### Gemini
+## Gemini — preferred: headless mode
+
+**Always use headless mode** with `SURF_USE_BUN_GEMINI=1` and `--profile dsebban883@gmail.com`.
+This bypasses the Chrome extension entirely: Bun launches a headless Chrome, injects cookies
+from the real Chrome profile, and drives Gemini directly via CDP. Faster, no tab pollution,
+no native host required for this path.
+
+```bash
+# Standard form — always include both env var and profile flag
+SURF_USE_BUN_GEMINI=1 surf gemini "explain quantum computing" --profile dsebban883@gmail.com
+SURF_USE_BUN_GEMINI=1 surf gemini "analyze this chart" --file chart.jpg --profile dsebban883@gmail.com
+SURF_USE_BUN_GEMINI=1 surf gemini "summarize this video" --youtube "https://youtube.com/..." --profile dsebban883@gmail.com
+```
+
+Progress output (stderr) — structured steps, safe to parse:
+```
+[bun-gemini] [1/6] Launching browser — gemini-3-pro (0.0s)
+[bun-gemini] [2/6] Authenticating — dsebban883@gmail.com (0.1s)
+[bun-gemini] [3/6] Loading Gemini (1.3s)
+[bun-gemini] [4/6] Uploading file — photo.jpg (4.8s)
+[bun-gemini] [5/6] Sending prompt — ... (8.2s)
+[bun-gemini] [6/6] Waiting for response (8.5s)
+[bun-gemini] ✓ Done — response preview (gemini-3-pro, 15.1s)
+```
+
+Local `surf gemini --help` documents these model names:
+- `gemini-3-pro` (default)
+- `gemini-2.5-pro`
+- `gemini-2.5-flash`
+
+**`gemini-3.1-pro-preview` also works** via `--model` even though help doesn't list it.
+Use it for highest-quality image analysis and reasoning.
+
+### Fallback: extension-based (legacy)
+
+Only use when headless is unavailable (`--with-page` requires it; non-macOS; Bun missing):
+
 ```bash
 surf gemini "explain quantum computing"
-surf gemini "summarize" --with-page               # Include page context
-surf gemini "analyze" --file data.csv             # Attach file
-surf gemini "a robot surfing" --generate-image /tmp/robot.png
-surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg
-surf gemini "summarize" --youtube "https://youtube.com/..."
-surf gemini "hello" --model gemini-2.5-flash      # Models: gemini-3-pro (default), gemini-2.5-pro, gemini-2.5-flash
-surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9
+surf gemini "summarize" --with-page
 ```
 
-### Perplexity
+### Image generation / editing
+
 ```bash
-surf perplexity "what is quantum computing"
-surf perplexity "explain this page" --with-page   # Include page context
-surf perplexity "deep dive" --mode research       # Research mode (Pro)
-surf perplexity "latest news" --model sonar       # Model selection (Pro)
+SURF_USE_BUN_GEMINI=1 surf gemini "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
+SURF_USE_BUN_GEMINI=1 surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9 --profile dsebban883@gmail.com
+SURF_USE_BUN_GEMINI=1 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile dsebban883@gmail.com
 ```
 
-### Grok (via x.com - requires X.com login in Chrome)
+Important:
+- these image flags live on **`surf gemini`**, not `surf aistudio`
+- if you need the newest Google model ids, prefer **AI Studio** section below; Gemini web help lags model naming
+- headless mode requires Bun canary (`bun upgrade --canary`) — already installed on this machine
+
+## AI Studio — prefer for latest Gemini 3.1 model ids
+
+Local `surf aistudio --help` says `--model` is **best-effort**: pass an AI Studio model id; if invalid, AI Studio falls back to the **last-selected UI model**.
+
+Preferred ids:
+- `gemini-3.1-pro-preview` — best quality / reasoning / code review
+- `gemini-3.1-flash-lite-preview` — fast + cheap text work
+- `gemini-3.1-flash-image-preview` — **Nano Banana 2**; latest Flash image model name in AI Studio / Google docs
+
 ```bash
-surf grok "what are the latest AI trends on X"    # Search X posts
-surf grok "analyze @username recent activity"     # Profile analysis  
-surf grok "summarize this page" --with-page       # Include page context
-surf grok "find viral AI posts" --deep-search     # DeepSearch mode
-surf grok "quick question" --model fast           # Models: auto, fast, expert, thinking (default)
+surf aistudio "review this architecture" --model gemini-3.1-pro-preview
+surf aistudio "summarize this page" --with-page --model gemini-3.1-flash-lite-preview
+surf aistudio "deep analysis" --model gemini-3.1-pro-preview
 ```
 
-**Grok Validation & Troubleshooting:**
-```bash
-# Validate Grok UI and check available models (no query sent)
-surf grok --validate
+Notes:
+- default timeout from local help: **300s**; raise for hard tasks
+- for long pro runs, use tmux + poll same as ChatGPT
+- `surf aistudio` does **not** expose dedicated `--generate-image` / `--edit-image` flags in local help
+- use AI Studio for latest model selection; use `surf gemini` for Surf's built-in image CLI flow
 
-# If models changed, save discovered models to surf.json config
-surf grok --validate --save-models
-```
+### Nano Banana 2 note
 
-### AI Studio (via aistudio.google.com - requires Google login in Chrome)
-```bash
-surf aistudio "explain quantum computing"
-surf aistudio "redteam this" --with-page          # Include current page context
-surf aistudio "quick answer" --model gemini-3-flash-preview  # Model selection
-surf aistudio "analyze" --timeout 600             # Custom timeout (default: 300s)
-```
+Official Google naming: **`gemini-3.1-flash-image-preview` = Nano Banana 2**.
 
-**Why AI Studio over Gemini?** AI Studio gives access to less restricted Gemini models. For Gemini 3 Pro the difference can be significant with certain prompts. Downside: aggressive per-day rate limits on Pro and Flash models.
+Practical Surf guidance:
+- latest Google model naming / selection -> `surf aistudio --model gemini-3.1-flash-image-preview`
+- CLI image save/edit flow -> `surf gemini ... --generate-image/--edit-image`
 
-**Model selection is best-effort:** Pass any AI Studio model id (e.g. `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-flash-lite-latest`). If the model isn't found, AI Studio uses whatever model was last selected in the UI.
+If you want both together, try explicit model selection in Gemini web first; if UI/model selection drifts, AI Studio is source-of-truth for current model ids.
 
-### AI Studio App Builder
+## AI Studio App Builder
+
 ```bash
 surf aistudio.build "build a portfolio site"
-surf aistudio.build "todo app" --model gemini-3.1-pro-preview   # Model override
-surf aistudio.build "crm dashboard" --output ./out              # Extract zip to directory
-surf aistudio.build "game" --keep-open --timeout 600            # Keep tab open, 10min timeout
+surf aistudio.build "todo app" --model gemini-3.1-pro-preview
+surf aistudio.build "crm dashboard" --output ./out
+surf aistudio.build "game" --keep-open --timeout 600
 ```
 
-Automates AI Studio's App Builder at `aistudio.google.com/apps`. Types your prompt, clicks Build, waits for completion, downloads the generated zip, and optionally extracts it.
+## Perplexity / Grok
 
-- `--output <dir>` extracts the zip to a directory
-- `--model <id>` overrides the model in Advanced Settings
-- `--timeout <seconds>` build timeout (default: 600s)
-- `--keep-open` leaves the AI Studio tab open after completion
-
-Returns `zipPath`, `extractedPath`, `model`, `buildDuration`, and `tookMs`.
-
-### AI Tool Troubleshooting
-
-When AI queries fail, check these common issues:
-
-1. **Not logged in**: The error "login required" means you need to log into the service in Chrome (chatgpt.com, gemini.google.com, perplexity.ai, x.com, or aistudio.google.com)
-2. **Model selection failed**: The UI may have changed. Run `surf grok --validate` to check
-3. **Response timeout**: Thinking models (ChatGPT o1, Grok thinking) can take 45+ seconds. AI Studio builds can take several minutes.
-4. **Element not found**: The service's UI changed. Check for surf-cli updates
-
-**Debugging workflow for agents:**
 ```bash
-# 1. Check if the service is accessible and UI is valid
+surf perplexity "deep dive on X" --mode research
+surf grok "latest AI agent trends on X"
 surf grok --validate
-
-# 2. If models mismatch, update the local settings
 surf grok --validate --save-models
-
-# 3. Retry with explicit model name from validation output
-surf grok "query" --model <model-from-validation>
-
-# 4. If still failing, try with longer timeout
-surf grok "query" --timeout 600
-```
-
-## Tab Management
-
-```bash
-surf tab.list
-surf tab.new "https://google.com"
-surf tab.switch 12345
-surf tab.close 12345
-surf tab.reload                # Reload current tab
-
-# Named tabs (aliases)
-surf tab.name myapp            # Name current tab
-surf tab.switch myapp          # Switch by name
-surf tab.named                 # List named tabs
-surf tab.unname myapp          # Remove name
-
-# Tab groups
-surf tab.group                 # Create/add to tab group
-surf tab.ungroup               # Remove from group
-surf tab.groups                # List all tab groups
-```
-
-## Window Management
-
-```bash
-surf window.list                              # List all windows
-surf window.list --tabs                       # Include tab details
-surf window.new                               # New window
-surf window.new --url "https://example.com"   # New window with URL
-surf window.new --incognito                   # New incognito window
-surf window.new --unfocused                   # Don't focus new window
-surf window.focus 12345                       # Focus window by ID
-surf window.close 12345                       # Close window
-surf window.resize --id 123 --width 1920 --height 1080
-surf window.resize --id 123 --state maximized # States: normal, minimized, maximized, fullscreen
-```
-
-**Window isolation for agents:**
-```bash
-# Create isolated window for agent work
-surf window.new "https://example.com"
-# Returns window ID, use with subsequent commands:
-surf --window-id 123 tab.list
-surf --window-id 123 go "https://other.com"
-```
-
-## Input Methods
-
-```bash
-# CDP method (real events) - default
-surf type --text "hello"
-surf click --x 100 --y 200
-
-# JS method (DOM manipulation) - for contenteditable
-surf type --text "hello" --selector "#input" --method js
-
-# Keys
-surf key Enter
-surf key "cmd+a"
-surf key.repeat --key Tab --count 5           # Repeat key presses
-
-# Hover and drag
-surf hover --ref e5
-surf drag --from-x 100 --from-y 100 --to-x 200 --to-y 200
-```
-
-## Page Inspection
-
-```bash
-surf page.read                 # Accessibility tree with refs + page text
-surf page.read --no-text       # Interactive elements only (no text content)
-surf page.read --ref e5        # Get specific element details
-surf page.read --depth 3       # Limit tree depth
-surf page.read --compact       # Minimal output for LLM efficiency
-surf page.text                 # Plain text content only
-surf page.state                # Modals, loading state, scroll info
-```
-
-## Semantic Element Location
-
-Find and act on elements by role, text, or label instead of refs:
-
-```bash
-# Find by ARIA role
-surf locate.role button --name "Submit" --action click
-surf locate.role textbox --name "Email" --action fill --value "test@example.com"
-surf locate.role link --all                    # Return all matches
-
-# Find by text content
-surf locate.text "Sign In" --action click
-surf locate.text "Accept" --exact --action click
-
-# Find form field by label
-surf locate.label "Username" --action fill --value "john"
-surf locate.label "Password" --action fill --value "secret"
-```
-
-**Actions:** `click`, `fill`, `hover`, `text` (get text content)
-
-## Text Search
-
-```bash
-surf search "login"                    # Find text in page
-surf search "Error" --case-sensitive   # Case-sensitive
-surf search "button" --limit 5         # Limit results
-surf find "login"                      # Alias for search
-```
-
-## Element Inspection
-
-```bash
-surf element.styles e5                 # Get computed styles by ref
-surf element.styles ".card"            # Or by CSS selector
-# Returns: font, color, background, border, padding, bounding box
-```
-
-## Scrolling
-
-```bash
-surf scroll.bottom
-surf scroll.top  
-surf scroll.to --y 500         # Scroll to Y position
-surf scroll.to --ref e5        # Scroll element into view
-surf scroll.by --y 200         # Scroll by amount
-surf scroll.info               # Get scroll position
-```
-
-## Waiting
-
-```bash
-surf wait 2                    # Wait 2 seconds
-surf wait.element ".loaded"    # Wait for element
-surf wait.network              # Wait for network idle
-surf wait.url "/success"       # Wait for URL pattern
-surf wait.dom --stable 100     # Wait for DOM stability
-surf wait.load                 # Wait for page load complete
-```
-
-## Dialog Handling
-
-```bash
-surf dialog.info               # Get current dialog type/message
-surf dialog.accept             # Accept (OK)
-surf dialog.accept --text "response"  # Accept prompt with text
-surf dialog.dismiss            # Dismiss (Cancel)
-```
-
-## Device/Network Emulation
-
-```bash
-# Network throttling
-surf emulate.network slow-3g   # Presets: slow-3g, fast-3g, 4g, offline
-surf emulate.network reset     # Disable throttling
-
-# CPU throttling  
-surf emulate.cpu 4             # 4x slower
-surf emulate.cpu 1             # Reset
-
-# Device emulation (19 presets)
-surf emulate.device "iPhone 14"
-surf emulate.device "Pixel 7"
-surf emulate.device --list     # List available devices
-
-# Custom viewport
-surf emulate.viewport --width 1280 --height 720
-surf emulate.touch --enable    # Enable touch emulation
-
-# Geolocation
-surf emulate.geo --lat 37.7749 --lon -122.4194
-surf emulate.geo --clear
-```
-
-## Form Automation
-
-```bash
-surf page.read                 # Get element refs first
-
-# Fill by ref
-surf form.fill --data '[{"ref":"e1","value":"John"},{"ref":"e2","value":"john@example.com"}]'
-
-# Checkboxes: true/false
-surf form.fill --data '[{"ref":"e7","value":true}]'
-
-# Dropdown selection
-surf select e5 "Option A"                    # By value (default)
-surf select e5 "Option A" "Option B"         # Multi-select
-surf select e5 --by label "Display Text"     # By visible label
-surf select e5 --by index 2                  # By index (0-based)
-```
-
-## File Upload
-
-```bash
-surf upload --ref e5 --files "/path/to/file.txt"
-surf upload --ref e5 --files "/path/file1.txt,/path/file2.txt"
-```
-
-## Iframe Handling
-
-```bash
-surf frame.list                # List frames with IDs
-surf frame.switch "FRAME_ID"   # Switch to iframe context
-surf frame.main                # Return to main frame
-surf frame.js --id "FRAME_ID" --code "return document.title"
-
-# After frame.switch, subsequent commands target that frame:
-surf frame.switch "iframe-1"
-surf page.read                 # Reads iframe content
-surf click e5                  # Clicks in iframe
-surf frame.main                # Back to main page
-```
-
-## Network Inspection
-
-```bash
-surf network                   # List captured requests
-surf network --stream          # Real-time network events
-surf network.get --id "req-123"   # Full request details
-surf network.body --id "req-123"  # Get response body
-surf network.curl --id "req-123"  # Generate curl command
-surf network.origins           # List origins with stats
-surf network.stats             # Capture statistics
-surf network.export            # Export all requests
-surf network.clear             # Clear captured requests
-```
-
-## Console
-
-```bash
-surf console                   # Get console messages
-surf console --stream          # Real-time console
-surf console --stream --level error  # Errors only
-```
-
-## JavaScript Execution
-
-```bash
-surf js "return document.title"
-surf js "document.querySelector('.btn').click()"
-```
-
-## Performance
-
-```bash
-surf perf.metrics              # Current metrics snapshot
-surf perf.start                # Start trace
-surf perf.stop                 # Stop and get results
-```
-
-## Screenshots
-
-```bash
-surf screenshot                           # Auto-saves to /tmp/surf-snap-*.png
-surf screenshot --output /tmp/shot.png    # Save to specific file
-surf screenshot --selector ".card"        # Element only
-surf screenshot --full-page               # Full page scroll capture
-surf screenshot --no-save                 # Return base64 only, don't save file
-```
-
-## Zoom
-
-```bash
-surf zoom                      # Get current zoom level
-surf zoom 1.5                  # Set zoom to 150%
-surf zoom 1                    # Reset to 100%
-```
-
-## Cookies & Storage
-
-```bash
-surf cookie.list               # List cookies for current page
-surf cookie.list --domain .google.com
-surf cookie.set --name "token" --value "abc123"
-surf cookie.get --name "token"
-surf cookie.clear              # Clear all cookies
-```
-
-## History & Bookmarks
-
-```bash
-surf history --query "github" --max 20
-surf bookmarks --query "docs"
-surf bookmark.add --url "https://..." --title "My Bookmark"
-surf bookmark.remove
-```
-
-## Health Checks & Smoke Tests
-
-```bash
-surf health --url "http://localhost:3000"
-surf smoke --urls "http://localhost:3000" "http://localhost:3000/about"
-surf smoke --urls "..." --screenshot /tmp/smoke
 ```
 
 ## Workflows
 
-Execute multi-step browser automation as a single command with smart auto-waits.
-
-### Inline Workflows
+Use `surf do` to collapse many browser steps into one deterministic run.
 
 ```bash
-# Pipe-separated commands
-surf do 'go "https://example.com" | click e5 | screenshot'
-
-# Multi-step login flow
-surf do 'go "https://example.com/login" | type "user@example.com" --selector "#email" | type "pass" --selector "#password" | click --selector "button[type=submit]"'
-
-# Validate without executing
-surf do 'go "url" | click e5' --dry-run
-```
-
-### Named Workflows
-
-Save workflows as JSON files in `~/.surf/workflows/` (user) or `./.surf/workflows/` (project):
-
-```bash
-# List available workflows
+surf do 'go "https://example.com" | click e5 | snap'
+surf do --file workflow.json
 surf workflow.list
-
-# Show workflow details
 surf workflow.info my-workflow
-
-# Run by name with arguments
-surf do my-workflow --email "user@example.com" --password "secret"
-
-# Validate workflow file
-surf workflow.validate workflow.json
+surf workflow.validate ./workflow.json
 ```
 
-### Workflow JSON Format
+## Troubleshooting
 
-```json
-{
-  "name": "Login Flow",
-  "description": "Automate login process",
-  "args": {
-    "email": { "required": true },
-    "password": { "required": true },
-    "url": { "default": "https://example.com/login" }
-  },
-  "steps": [
-    { "tool": "navigate", "args": { "url": "%{url}" } },
-    { "tool": "type", "args": { "text": "%{email}", "selector": "input[name=email]" } },
-    { "tool": "type", "args": { "text": "%{password}", "selector": "input[name=password]" } },
-    { "tool": "click", "args": { "selector": "button[type=submit]" } },
-    { "tool": "screenshot", "args": {}, "as": "result" }
-  ]
-}
-```
+### `Unknown tool: aistudio` after upgrade
 
-### Loops and Step Outputs
+Old extension loaded. Fix:
+1. `surf extension-path`
+2. reload unpacked extension from that path
+3. `surf install <extension-id>`
+4. restart Chrome
 
-```json
-{
-  "steps": [
-    // Capture step output for later use
-    { "tool": "js", "args": { "code": "return [1,2,3]" }, "as": "items" },
-    
-    // Fixed iterations
-    { "repeat": 5, "steps": [
-      { "tool": "click", "args": { "ref": "e5" } }
-    ]},
-    
-    // Iterate over array
-    { "each": "%{items}", "as": "item", "steps": [
-      { "tool": "js", "args": { "code": "console.log('%{item}')" } }
-    ]},
-    
-    // Repeat until condition
-    { "repeat": 20, "until": { "tool": "js", "args": { "code": "return done" } }, "steps": [...] }
-  ]
-}
-```
+### `Connection refused. Native host not running.`
 
-### Workflow Options
+Usually extension/native-host mismatch.
+- rerun `surf install <extension-id>`
+- toggle extension off/on
+- restart Chrome
+- then `surf tab.list`
 
-```bash
---file, -f <path>     # Load from JSON file
---dry-run             # Parse and validate without executing
---on-error stop|continue  # Error handling (default: stop)
---step-delay <ms>     # Delay between steps (default: 100, 0 to disable)
---no-auto-wait        # Disable automatic waits
---json                # Structured JSON output
-```
+### Model selection seems ignored
 
-**Auto-waits:** Commands automatically wait for completion:
-- Navigation (`go`, `back`, `forward`) → waits for page load
-- Clicks, key presses, form fills → waits for DOM stability
-- Tab switches → waits for tab to load
-
-**Why use `do`?** Instead of 6-8 separate CLI calls with LLM orchestration between each, a workflow executes deterministically. Faster, cheaper, and more reliable.
-
-## Error Diagnostics
-
-```bash
-# Auto-capture screenshot + console on failure
-surf wait.element ".missing" --auto-capture --timeout 2000
-# Saves to /tmp/surf-error-*.png
-```
-
-## Common Options
-
-```bash
---tab-id <id>         # Target specific tab
---window-id <id>      # Target specific window
---json                # Raw JSON output  
---auto-capture        # Screenshot + console on error
---timeout <ms>        # Override default timeout
-```
+Expected for AI Studio best-effort model setting. If a passed model id is invalid, AI Studio uses the last-selected UI model. For critical runs:
+- do a short smoke query first
+- confirm returned model in the UI
+- then run the expensive prompt
 
 ## Tips
 
-1. **First CDP operation is slow** (~5-8s) - debugger attachment overhead, subsequent calls fast
-2. **Use refs from page.read** for reliable element targeting over CSS selectors
-3. **JS method for contenteditable** - Modern editors (ChatGPT, Claude, Notion) need `--method js`
-4. **Named tabs for workflows** - `tab.name app` then `tab.switch app`
-5. **Auto-capture for debugging** - `--auto-capture` saves diagnostics on failure
-6. **AI tools use browser session** - Must be logged into the service (ChatGPT, Gemini, Perplexity, Grok, AI Studio), no API keys needed
-7. **Grok validation** - Run `surf grok --validate` if queries fail to check UI changes
-8. **Long timeouts for thinking models** - ChatGPT o1, Grok thinking can take 60+ seconds. AI Studio builds default to 600s.
-9. **AI Studio for unrestricted Gemini** - `surf aistudio` gives less filtered responses than `surf gemini` for the same models
-10. **Use `surf do` for multi-step tasks** - Reduces token overhead and improves reliability
-11. **Dry-run workflows first** - `surf do '...' --dry-run` validates without executing
-12. **Window isolation** - Use `window.new` + `--window-id` to keep agent work separate from your browsing
-13. **Semantic locators** - `locate.role`, `locate.text`, `locate.label` for more robust element finding
-14. **Frame context** - Use `frame.switch` before interacting with iframe content
-
-## Socket API
-
-For programmatic access:
-
-```bash
-echo '{"type":"tool_request","method":"execute_tool","params":{"tool":"tab.list","args":{}},"id":"1"}' | nc -U /tmp/surf.sock
-```
+1. use refs / semantic locators over selectors
+2. use isolated windows for agent work
+3. first CDP action can be slower than later ones
+4. use tmux + log polling for long AI/browser jobs
+5. prefer **AI Studio** for latest Google model ids
+6. prefer **headless Gemini** (`SURF_USE_BUN_GEMINI=1 --profile dsebban883@gmail.com`) for all Gemini work; fall back to extension only for `--with-page`
+7. prefer **headless ChatGPT** (`SURF_USE_CLOAK_CHATGPT=1 --profile dsebban883@gmail.com`) for all ChatGPT work; fall back to extension only for `--with-page`
+8. use `surf extension-path`; don't hardcode bun/npm install paths
+9. if unsure, check local truth first: `surf <command> --help`
