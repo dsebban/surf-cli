@@ -52,9 +52,12 @@ function makeSessionId(tool, args) {
     args.query || args.prompt || args.url ||
     (Array.isArray(args._) ? args._.join(" ") : "") || tool;
   const slug = slugify(promptSource, 5);
-  const ts   = new Date().toISOString()
-    .replace(/T/, "_").replace(/:/g, "").replace(/\..+/, "");  // YYYYMMDD_HHmmss
-  return `${tool}-${slug}_${ts}`;
+  // ms precision + pid suffix to prevent collisions on same-second concurrent runs
+  const now  = new Date();
+  const ts   = now.toISOString()
+    .replace(/T/, "_").replace(/:/g, "").replace(/\.(\d{3}).+/, ".$1");  // YYYYMMDD_HHmmss.mmm
+  const pid  = (process.pid % 9999).toString().padStart(4, "0");
+  return `${tool}-${slug}_${ts}_${pid}`;
 }
 
 // ============================================================================
@@ -253,9 +256,20 @@ function loadSession(idOrPrefix) {
   const matches = entries.filter(e => e.startsWith(idOrPrefix));
   if (matches.length === 0) return null;
 
-  // Pick most recent match
-  matches.sort().reverse();
-  const dir      = path.join(SESSIONS_DIR, matches[0]);
+  // Sort by createdAt descending (parse each meta.json, fall back to dir name sort)
+  const candidates = [];
+  for (const name of matches) {
+    const mp = path.join(SESSIONS_DIR, name, "meta.json");
+    try {
+      const m = JSON.parse(fs.readFileSync(mp, "utf8"));
+      candidates.push({ name, createdAt: m.createdAt || "" });
+    } catch {
+      candidates.push({ name, createdAt: "" });
+    }
+  }
+  candidates.sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
+
+  const dir      = path.join(SESSIONS_DIR, candidates[0].name);
   const metaPath = path.join(dir, "meta.json");
   const logPath  = path.join(dir, "output.log");
   try {
@@ -274,9 +288,17 @@ function deleteSessions({ hours, all = false } = {}) {
   let entries;
   try { entries = fs.readdirSync(SESSIONS_DIR); } catch { return { deleted: 0, remaining: 0 }; }
 
-  const cutoff = (all || !hours)
+  // Validate hours: must be a finite positive number; reject NaN/0/negative.
+  // If hours is provided but invalid, refuse to run — do NOT silently delete-all.
+  const validHours = (typeof hours === "number" && Number.isFinite(hours) && hours > 0) ? hours : null;
+  if (hours !== undefined && hours !== null && validHours === null) {
+    throw new Error(`deleteSessions: invalid hours value (${hours}) — must be a positive number`);
+  }
+  const cutoff = all
     ? Infinity
-    : Date.now() - hours * 3600 * 1000;
+    : validHours !== null
+      ? Date.now() - validHours * 3600 * 1000
+      : Infinity;  // no hours + no all — treat as delete-all (explicit opt-in path)
 
   let deleted = 0;
   for (const name of entries) {

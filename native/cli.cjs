@@ -1840,9 +1840,17 @@ if (args[0] === "session" || args[0] === "sessions") {
 
   // surf session --clear [--hours N | --all]
   if (sessionArgs.includes("--clear")) {
-    const allFlag   = sessionArgs.includes("--all");
-    const hoursIdx  = sessionArgs.indexOf("--hours");
-    const hours     = hoursIdx !== -1 ? Number(sessionArgs[hoursIdx + 1]) : undefined;
+    const allFlag  = sessionArgs.includes("--all");
+    const hoursIdx = sessionArgs.indexOf("--hours");
+    let hours      = undefined;
+    if (hoursIdx !== -1) {
+      const raw = Number(sessionArgs[hoursIdx + 1]);
+      if (!Number.isFinite(raw) || raw <= 0) {
+        console.error(`Error: --hours must be a positive number (got: ${sessionArgs[hoursIdx + 1]})`);
+        process.exit(1);
+      }
+      hours = raw;
+    }
     const { deleted, remaining } = sessionStore.deleteSessions({ all: allFlag, hours });
     const label = allFlag ? "all sessions" : hours ? `sessions older than ${hours}h` : "all sessions";
     console.log(`Deleted ${deleted} sessions (${label}). ${remaining} sessions remain.`);
@@ -1877,11 +1885,13 @@ if (args[0] === "session" || args[0] === "sessions") {
   }
 
   // surf session [--all] [--hours N] [--limit N]  — list sessions
-  const allFlag   = sessionArgs.includes("--all");
-  const hoursIdx  = sessionArgs.indexOf("--hours");
-  const hours     = hoursIdx !== -1 ? Number(sessionArgs[hoursIdx + 1]) : 24;
-  const limitIdx  = sessionArgs.indexOf("--limit");
-  const limit     = limitIdx !== -1 ? Number(sessionArgs[limitIdx + 1]) : 50;
+  const allFlag  = sessionArgs.includes("--all");
+  const hoursIdx = sessionArgs.indexOf("--hours");
+  const rawHours = hoursIdx !== -1 ? Number(sessionArgs[hoursIdx + 1]) : 24;
+  const hours    = (Number.isFinite(rawHours) && rawHours > 0) ? rawHours : 24;
+  const limitIdx = sessionArgs.indexOf("--limit");
+  const rawLimit = limitIdx !== -1 ? Number(sessionArgs[limitIdx + 1]) : 50;
+  const limit    = (Number.isFinite(rawLimit) && rawLimit > 0) ? Math.floor(rawLimit) : 50;
 
   const sessions = sessionStore.listSessions({ hours, all: allFlag, limit });
 
@@ -3092,22 +3102,22 @@ if (tool === "chatgpt" && requestedProfile) {
 
 if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
   (async () => {
-    try {
-      if (!isCloakBrowserAvailable()) {
-        console.error("Error: CloakBrowser not installed. Run: npm install -g cloakbrowser");
-        process.exit(1);
-      }
-      
-      if (requestedProfile) toolArgs.profile = requestedProfile;
-      if (toolArgs["generate-image"]) toolArgs.generateImage = toolArgs["generate-image"];
-      
-      const sess = sessionStore.createSession("chatgpt", toolArgs, process.env);
-      const _origWrite = process.stderr.write.bind(process.stderr);
-      process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
+    if (!isCloakBrowserAvailable()) {
+      console.error("Error: CloakBrowser not installed. Run: npm install -g cloakbrowser");
+      process.exit(1);
+    }
 
-      const startMs = Date.now();
-      let lastProgress = "";
-      
+    if (requestedProfile) toolArgs.profile = requestedProfile;
+    if (toolArgs["generate-image"]) toolArgs.generateImage = toolArgs["generate-image"];
+
+    // Session + stderr intercept declared OUTSIDE try so finally can always clean up
+    const sess = sessionStore.createSession("chatgpt", toolArgs, process.env);
+    const _origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
+
+    const startMs = Date.now();
+    let lastProgress = "";
+    try {
       const result = await queryWithCloakBrowser(toolArgs, (progress) => {
         // Trace events: live thinking/reasoning phase (mirrors bun worker ⏳ logs)
         if (progress.type === "trace") {
@@ -3125,17 +3135,14 @@ if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
           lastProgress = msg;
         }
       });
-      
+
       const durationMs = result.tookMs || (Date.now() - startMs);
-      process.stderr.write = _origWrite;
-      
-      if (result.imagePath) {
-        process.stderr.write(`Image saved: ${result.imagePath}\n`);
-      }
-      
       sess.finish({ model: result.model, tookMs: durationMs, imagePath: result.imagePath,
         responsePreview: result.response ? result.response.slice(0, 160) : "" });
 
+      if (result.imagePath) {
+        process.stderr.write(`Image saved: ${result.imagePath}\n`);
+      }
       if (wantJson) {
         console.log(JSON.stringify({
           response: result.response,
@@ -3152,6 +3159,7 @@ if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
       }
       process.exit(0);
     } catch (err) {
+      sess.fail(err);
       const errMsg = `CloakBrowser failed: ${err.message}`;
       if (softFail) {
         console.warn(`Warning: ${errMsg}`);
@@ -3162,6 +3170,10 @@ if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
         await performAutoCapture();
       }
       process.exit(1);
+    } finally {
+      // Always restore stderr — even if process.exit() is called (sync exit skips this,
+      // but it guards against thrown exceptions that don't immediately exit)
+      process.stderr.write = _origWrite;
     }
   })();
   return; // Prevent falling through to Bun or legacy
@@ -3208,6 +3220,8 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
             console.error(`Error: ${bunResult.error}`);
             process.exit(1);
           }
+          // Mark bun attempt as cancelled — legacy path will run independently (no new session)
+          sess.fail(Object.assign(new Error(bunResult.error || "bun chatgpt fallback"), { code: "fallback" }));
           process.stderr.write(`[bun-chatgpt] Falling back to legacy path: ${bunResult.error}\n`);
           startLegacySocketPath();
         } else {
@@ -3312,6 +3326,8 @@ if (tool === "gemini" && shouldUseBunGemini(process.env)) {
             process.exit(1);
           }
           process.stderr.write = _origWrite;
+          // Mark bun attempt as cancelled — legacy path will run independently
+          sess.fail(Object.assign(new Error(bunResult.error || "bun gemini fallback"), { code: "fallback" }));
           process.stderr.write(`[bun-gemini] Falling back to legacy path: ${bunResult.error}\n`);
           startLegacySocketPath();
         } else {
