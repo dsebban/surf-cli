@@ -124,6 +124,10 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
             case "error":
               settle(reject, Object.assign(new Error(msg.message), { code: msg.code }));
               break;
+            case "trace":
+              // Live thinking/reasoning phase feedback — mirrors bun worker's ⏳ stderr logs
+              onProgress({ type: "trace", phase: msg.phase, isThinking: msg.isThinking });
+              break;
             case "log":
               if (process.env.SURF_DEBUG) {
                 process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);

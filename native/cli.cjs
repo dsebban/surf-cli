@@ -3109,6 +3109,16 @@ if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
       let lastProgress = "";
       
       const result = await queryWithCloakBrowser(toolArgs, (progress) => {
+        // Trace events: live thinking/reasoning phase (mirrors bun worker ⏳ logs)
+        if (progress.type === "trace") {
+          const msg = `[cloak-chatgpt] ⏳ ${progress.phase}`;
+          if (msg !== lastProgress) {
+            process.stderr.write(msg + "\n");
+            lastProgress = msg;
+          }
+          return;
+        }
+        // Step progress events
         const msg = `[cloak-chatgpt] [${progress.step}/${progress.total}] ${progress.message}`;
         if (msg !== lastProgress) {
           process.stderr.write(msg + "\n");

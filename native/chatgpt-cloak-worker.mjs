@@ -156,19 +156,24 @@ const EXTRACT_TEXT_JS = `(() => {
 
 const DETECT_PHASE_JS = `(() => {
   const stop = document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop"]');
-  if (!stop) return '';
-  const turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
+  if (!stop) return { phase: '', isThinking: false };
+  const turns = document.querySelectorAll(
+    'section[data-testid^="conversation-turn-"], article[data-testid^="conversation-turn-"], div[data-testid^="conversation-turn-"]'
+  );
   let last = null;
   for (let k = turns.length - 1; k >= 0; k--) {
     const sr = turns[k].querySelector('.sr-only');
     if (sr && (sr.textContent || '').toLowerCase().includes('chatgpt said')) { last = turns[k]; break; }
   }
-  if (!last) return 'Connecting';
+  if (!last) return { phase: 'Connecting', isThinking: true };
   const md = last.querySelector('.markdown');
-  if (md && (md.textContent || '').trim()) return 'Responding';
+  if (md && (md.textContent || '').trim()) return { phase: 'Responding', isThinking: false };
+  // Thinking/reasoning phase: extract visible label (remove noise, take first line)
   const clone = last.cloneNode(true);
-  clone.querySelectorAll('.sr-only, .markdown, button, nav').forEach(el => el.remove());
-  return (clone.textContent || '').trim() || 'Processing';
+  clone.querySelectorAll('.sr-only, .markdown, button, nav, form, script, style').forEach(el => el.remove());
+  const raw = (clone.textContent || '').trim();
+  const label = raw.split('\\n')[0].trim().slice(0, 80) || 'Thinking';
+  return { phase: label, isThinking: true };
 })()`;
 
 // ============================================================================
@@ -368,6 +373,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     const deadline = Date.now() + timeout * 1000;
     let responseText = '';
     let stableCycles = 0;
+    let lastChangeAtMs = Date.now();
     let lastText = '';
     let lastPhase = '';
     let imagePath = null;
@@ -375,10 +381,13 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     while (Date.now() < deadline) {
       await sleep(500);
 
-      // Detect phase
-      const phase = await page.evaluate(DETECT_PHASE_JS);
+      // Detect phase — returns { phase, isThinking }
+      const phaseResult = await page.evaluate(DETECT_PHASE_JS);
+      const phase = (phaseResult && phaseResult.phase) || phaseResult || '';
       if (phase && phase !== lastPhase) {
         log('info', `⏳ ${phase}`);
+        // Emit structured trace event so bridge+CLI can render it like bun worker does
+        emit({ type: 'trace', phase, isThinking: !!(phaseResult && phaseResult.isThinking) });
         lastPhase = phase;
       }
 
@@ -388,12 +397,15 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       // Check streaming
       const isStreaming = await page.locator('button[data-testid="stop-button"], button[aria-label="Stop"]').count() > 0;
 
-      // Stability check
-      if (text && text === lastText && !isStreaming) {
-        stableCycles++;
-        if (stableCycles >= 3) break; // stable for 1.5s after streaming ended
-      } else {
+      // Stability check (mirrors bun advanceTextStability: requiredStableCycles=2, minStableMs=1200)
+      const nowMs = Date.now();
+      if (text !== lastText) {
         stableCycles = 0;
+        lastChangeAtMs = nowMs;
+      } else if (text && !isStreaming) {
+        stableCycles++;
+        const stableMs = nowMs - lastChangeAtMs;
+        if (stableCycles >= 2 && stableMs >= 1200) break;
       }
       lastText = text;
       if (text) responseText = text;
