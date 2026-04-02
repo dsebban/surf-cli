@@ -362,9 +362,28 @@ function advanceTextStability({ text, previousText, isStreaming, finished, stabl
 // ============================================================================
 // Thinking trace extraction — reads React fiber state (works headless)
 
-const EXTRACT_THINKING_TRACE_JS = `(() => {
-  // Find "Thought for" / "Thinking for" button near assistant turn
-  var buttons = Array.from(document.querySelectorAll('button'));
+// Max thoughts to return (cap payload size for very long Pro sessions)
+const MAX_THINKING_TRACE_THOUGHTS = 100;
+const MAX_THOUGHT_CONTENT_CHARS = 2000;
+
+// Accepts optional turnId to scope extraction to the current response turn.
+// Falls back to last assistant turn if turnId not provided.
+const makeExtractThinkingTraceJS = (rawTurnId) => {
+  // Sanitize turnId — only allow alphanumeric, hyphens, underscores (data-testid values)
+  const turnId = rawTurnId && /^[a-zA-Z0-9_-]+$/.test(rawTurnId) ? rawTurnId : null;
+  return `(() => {
+  ${FIND_LAST_ASSISTANT_JS}
+  // Scope to specific turn if turnId provided, otherwise use last assistant
+  var targetTurn = null;
+  ${turnId ? `
+  var specificTurn = document.querySelector('[data-testid="${turnId}"]');
+  if (specificTurn) targetTurn = specificTurn;
+  ` : ''}
+  if (!targetTurn) targetTurn = lastAssistant;
+  if (!targetTurn) return null;
+
+  // Find "Thought for" / "Thinking for" button WITHIN the target turn only
+  var buttons = Array.from(targetTurn.querySelectorAll('button'));
   var thoughtBtn = buttons.find(function(b) {
     return /Thought for|Thinking for/i.test(b.innerText || b.textContent);
   });
@@ -374,6 +393,8 @@ const EXTRACT_THINKING_TRACE_JS = `(() => {
   var fiberKey = Object.keys(thoughtBtn).find(function(k) { return k.startsWith('__reactFiber$'); });
   if (!fiberKey) return null;
 
+  var MAX_THOUGHTS = ${MAX_THINKING_TRACE_THOUGHTS};
+  var MAX_CONTENT = ${MAX_THOUGHT_CONTENT_CHARS};
   var fiber = thoughtBtn[fiberKey];
   var depth = 0;
   while (fiber && depth < 50) {
@@ -389,12 +410,15 @@ const EXTRACT_THINKING_TRACE_JS = `(() => {
 
         // Extract thoughts array (point-by-point reasoning trace)
         if (m.content.content_type === 'thoughts' && Array.isArray(m.content.thoughts)) {
-          for (var j = 0; j < m.content.thoughts.length; j++) {
+          for (var j = 0; j < m.content.thoughts.length && thoughts.length < MAX_THOUGHTS; j++) {
             var t = m.content.thoughts[j];
             if (typeof t === 'string') {
-              thoughts.push({ summary: '', content: t });
+              thoughts.push({ summary: '', content: t.slice(0, MAX_CONTENT) });
             } else if (t && typeof t === 'object') {
-              thoughts.push({ summary: t.summary || '', content: t.content || '' });
+              thoughts.push({
+                summary: (t.summary || '').slice(0, 200),
+                content: (t.content || '').slice(0, MAX_CONTENT),
+              });
             }
           }
         }
@@ -409,17 +433,24 @@ const EXTRACT_THINKING_TRACE_JS = `(() => {
       }
 
       if (thoughts.length === 0 && !recapText) return null;
-      return { thoughts: thoughts, durationSec: durationSec, recapText: recapText };
+      return {
+        thoughts: thoughts,
+        durationSec: durationSec,
+        recapText: recapText,
+        truncated: thoughts.length >= MAX_THOUGHTS,
+      };
     }
     fiber = fiber.return;
     depth++;
   }
   return null;
 })()`;
+};
 
-async function extractThinkingTrace(page) {
+async function extractThinkingTrace(page, turnId) {
   try {
-    const result = await page.evaluate(EXTRACT_THINKING_TRACE_JS);
+    const js = makeExtractThinkingTraceJS(turnId || null);
+    const result = await page.evaluate(js);
     return result;
   } catch (e) {
     log('warn', 'Thinking trace extraction failed', { error: e.message });
@@ -659,6 +690,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     let lastText = '';
     let lastPhase = '';
     let imagePath = null;
+    let responseTurnId = null;
 
     while (Date.now() < deadline) {
       await sleep(500);
@@ -693,6 +725,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
 
       // Track activity — only if we see a NEW turn (not baseline stale content)
       const isNewTurn = dom.turnId && dom.turnId !== baselineTurnId;
+      if (isNewTurn) responseTurnId = dom.turnId;
       const hasStreamContent = stream.text && stream.text.length > 0;
       if (hasStreamContent || isNewTurn) {
         sawActivity = true;
@@ -732,7 +765,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     // Thinking trace extraction (post-response, from React fiber state)
     let thinkingTrace = null;
     try {
-      thinkingTrace = await extractThinkingTrace(page);
+      thinkingTrace = await extractThinkingTrace(page, responseTurnId);
       if (thinkingTrace) {
         log('info', 'Thinking trace captured', {
           thoughtCount: thinkingTrace.thoughts?.length || 0,

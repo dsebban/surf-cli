@@ -193,7 +193,7 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
       partial: !!msg.partial,
       backend: msg.backend || "cloak",
       conversationId: msg.conversationId || conversationId || null,
-      thinkingTrace: msg.thinkingTrace || undefined,
+      ...(msg.thinkingTrace ? { thinkingTrace: msg.thinkingTrace } : {}),
     }),
   });
 }
