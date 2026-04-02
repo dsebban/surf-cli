@@ -1,7 +1,7 @@
 /**
  * ChatGPT CloakBrowser Bridge
  *
- * Node.js module that spawns the CloakBrowser worker (.mjs) and
+ * Node.js module that spawns CloakBrowser workers (.mjs) and
  * communicates via stdin/stdout JSON-lines protocol.
  */
 
@@ -9,23 +9,21 @@ const { spawn } = require("child_process");
 const { existsSync } = require("fs");
 const { join, dirname } = require("path");
 
-const WORKER_PATH = join(__dirname, "chatgpt-cloak-worker.mjs");
+const DEFAULT_RUNTIME = { spawn, existsSync };
+let runtime = { ...DEFAULT_RUNTIME };
+
+const QUERY_WORKER_PATH = join(__dirname, "chatgpt-cloak-worker.mjs");
+const CHATS_WORKER_PATH = join(__dirname, "chatgpt-cloak-chats-worker.mjs");
 
 // ---------------------------------------------------------------------------
 // Availability check
 // ---------------------------------------------------------------------------
 
-/**
- * Check if CloakBrowser is available.
- * CloakBrowser is ESM-only so require.resolve() fails — we probe for the
- * package directory instead.
- */
 function isCloakBrowserAvailable() {
   try {
-    // Walk up from this file to find node_modules/cloakbrowser
     let dir = __dirname;
     for (let i = 0; i < 6; i++) {
-      if (existsSync(join(dir, "node_modules", "cloakbrowser", "package.json"))) return true;
+      if (runtime.existsSync(join(dir, "node_modules", "cloakbrowser", "package.json"))) return true;
       const parent = dirname(dir);
       if (parent === dir) break;
       dir = parent;
@@ -36,28 +34,7 @@ function isCloakBrowserAvailable() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Bridge
-// ---------------------------------------------------------------------------
-
-/**
- * Run a ChatGPT query via the CloakBrowser worker process.
- *
- * @param {Object}   opts
- * @param {string}   opts.prompt          Prompt text
- * @param {string}  [opts.model]          Model identifier
- * @param {string}  [opts.file]           File path to attach
- * @param {string}  [opts.profile]        Chrome profile email for cookie auth
- * @param {string}  [opts.generateImage]  Save path for generated image
- * @param {number}  [opts.timeout=120]    Seconds
- * @param {Function} onProgress           ({ step, total, message }) => void
- * @returns {Promise<{ response:string, model:string, tookMs:number, imagePath:string|null, partial:boolean, backend:string }>}
- */
-async function queryWithCloakBrowser(opts, onProgress = () => {}) {
-  const { model, file, profile, timeout = 120 } = opts;
-  const prompt = opts.prompt || opts.query || "";
-  const generateImage = opts["generate-image"] || opts.generateImage || null;
-
+function ensureAvailability(workerPath) {
   if (!isCloakBrowserAvailable()) {
     throw Object.assign(
       new Error("CloakBrowser not installed. Run: npm install cloakbrowser playwright-core"),
@@ -65,19 +42,27 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
     );
   }
 
-  if (!existsSync(WORKER_PATH)) {
+  if (!runtime.existsSync(workerPath)) {
     throw Object.assign(
-      new Error("CloakBrowser worker not found: " + WORKER_PATH),
+      new Error("CloakBrowser worker not found: " + workerPath),
       { code: "worker_not_found" }
     );
   }
+}
+
+function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () => {}, mapSuccess = (msg) => msg }) {
+  ensureAvailability(workerPath);
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const settle = (fn, val) => { if (!settled) { settled = true; fn(val); } };
+    const settle = (fn, value) => {
+      if (!settled) {
+        settled = true;
+        fn(value);
+      }
+    };
 
-    // Spawn worker — use same Node.js as the CLI
-    const worker = spawn(process.execPath, [WORKER_PATH], {
+    const worker = runtime.spawn(process.execPath, [workerPath], {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
@@ -86,17 +71,12 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
       },
     });
 
-    // Timeout
     const timeoutMs = timeout * 1000;
     const timer = setTimeout(() => {
       worker.kill("SIGTERM");
-      settle(reject, Object.assign(
-        new Error(`CloakBrowser worker killed after ${timeoutMs}ms`),
-        { code: "timeout" }
-      ));
+      settle(reject, Object.assign(new Error(`CloakBrowser worker killed after ${timeoutMs}ms`), { code: "timeout" }));
     }, timeoutMs);
 
-    // Stdout protocol
     let stdoutBuf = "";
     worker.stdout.setEncoding("utf8");
     worker.stdout.on("data", (chunk) => {
@@ -112,20 +92,12 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
               onProgress(msg);
               break;
             case "success":
-              settle(resolve, {
-                response: msg.response || msg.text || "",
-                model: msg.model,
-                tookMs: msg.tookMs || msg.durationMs || 0,
-                imagePath: msg.imagePath || null,
-                partial: !!msg.partial,
-                backend: msg.backend || "cloak",
-              });
+              settle(resolve, mapSuccess(msg));
               break;
             case "error":
-              settle(reject, Object.assign(new Error(msg.message), { code: msg.code }));
+              settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
               break;
             case "trace":
-              // Live thinking/reasoning phase feedback — mirrors bun worker's ⏳ stderr logs
               onProgress({ type: "trace", phase: msg.phase, isThinking: msg.isThinking });
               break;
             case "log":
@@ -135,12 +107,11 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
               break;
           }
         } catch {
-          // non-JSON — ignore
+          // Ignore non-JSON lines.
         }
       }
     });
 
-    // Stderr — forward download progress
     worker.stderr.setEncoding("utf8");
     worker.stderr.on("data", (chunk) => {
       if (chunk.includes("[cloakbrowser]")) {
@@ -148,30 +119,125 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
       }
     });
 
-    // Exit
-    worker.on("exit", (code, signal) => {
+    const tryHandleLine = (line) => {
+      if (!line || !line.trim()) return false;
+      try {
+        const msg = JSON.parse(line);
+        switch (msg.type) {
+          case "progress":
+            onProgress(msg);
+            return false;
+          case "success":
+            settle(resolve, mapSuccess(msg));
+            return true;
+          case "error":
+            settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
+            return true;
+          case "trace":
+            onProgress({ type: "trace", phase: msg.phase, isThinking: msg.isThinking });
+            return false;
+          case "log":
+            if (process.env.SURF_DEBUG) process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);
+            return false;
+          default:
+            return false;
+        }
+      } catch {
+        return false;
+      }
+    };
+
+    worker.on("close", (code, signal) => {
       clearTimeout(timer);
       if (settled) return;
+      if (stdoutBuf.trim()) {
+        const handled = tryHandleLine(stdoutBuf);
+        stdoutBuf = "";
+        if (handled || settled) return;
+      }
       if (signal) {
-        settle(reject, Object.assign(
-          new Error(`CloakBrowser worker killed by ${signal}`),
-          { code: "worker_killed", signal }
-        ));
+        settle(reject, Object.assign(new Error(`CloakBrowser worker killed by ${signal}`), { code: "worker_killed", signal }));
       } else {
-        settle(reject, Object.assign(
-          new Error(`CloakBrowser worker exited ${code} without result`),
-          { code: "worker_exit", exitCode: code }
-        ));
+        settle(reject, Object.assign(new Error(`CloakBrowser worker exited ${code} without result`), { code: "worker_exit", exitCode: code }));
       }
     });
 
-    // Send query — worker reads one query then exits
-    worker.stdin.write(JSON.stringify({
-      type: "query",
-      prompt, model, file, profile, timeout, generateImage,
-    }) + "\n");
-    // Don't end stdin — worker exits after processing
+    worker.stdin.write(JSON.stringify(request) + "\n");
   });
 }
 
-module.exports = { isCloakBrowserAvailable, queryWithCloakBrowser };
+async function queryWithCloakBrowser(opts, onProgress = () => {}) {
+  const { model, file, profile, timeout = 120, conversationId } = opts;
+  const prompt = opts.prompt || opts.query || "";
+  const generateImage = opts["generate-image"] || opts.generateImage || null;
+
+  return runCloakWorker({
+    workerPath: QUERY_WORKER_PATH,
+    request: {
+      type: "query",
+      prompt,
+      model,
+      file,
+      profile,
+      timeout,
+      generateImage,
+      conversationId,
+    },
+    timeout,
+    onProgress,
+    mapSuccess: (msg) => ({
+      response: msg.response || msg.text || "",
+      model: msg.model,
+      tookMs: msg.tookMs || msg.durationMs || 0,
+      imagePath: msg.imagePath || null,
+      partial: !!msg.partial,
+      backend: msg.backend || "cloak",
+      conversationId: msg.conversationId || conversationId || null,
+      thinkingTrace: msg.thinkingTrace || undefined,
+    }),
+  });
+}
+
+async function manageChatsWithCloakBrowser(opts, onProgress = () => {}) {
+  const timeout = opts.timeout || 120;
+  return runCloakWorker({
+    workerPath: CHATS_WORKER_PATH,
+    request: {
+      type: "chats",
+      action: opts.action,
+      conversationId: opts.conversationId,
+      query: opts.query,
+      limit: opts.limit,
+      all: opts.all,
+      profile: opts.profile,
+      timeout,
+      title: opts.title,
+      fileId: opts.fileId,
+      includeBytes: opts.includeBytes,
+      outputPath: opts.outputPath,
+    },
+    timeout,
+    onProgress,
+    mapSuccess: (msg) => {
+      const out = { ...msg };
+      delete out.type;
+      return out;
+    },
+  });
+}
+
+function __setBridgeRuntimeForTests(overrides = {}) {
+  runtime = { ...runtime, ...overrides };
+}
+
+function __resetBridgeRuntimeForTests() {
+  runtime = { ...DEFAULT_RUNTIME };
+}
+
+module.exports = {
+  isCloakBrowserAvailable,
+  queryWithCloakBrowser,
+  manageChatsWithCloakBrowser,
+  __setBridgeRuntimeForTests,
+  __resetBridgeRuntimeForTests,
+};

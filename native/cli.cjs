@@ -11,7 +11,9 @@ const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { shouldUseBunGemini, isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
 const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require("./chatgpt-bun-bridge.cjs");
-const { isCloakBrowserAvailable, queryWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
+const { isCloakBrowserAvailable, queryWithCloakBrowser, manageChatsWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
+const chatgptChatsFormatter = require("./chatgpt-chats-formatter.cjs");
+const chatgptChatsCache = require("./chatgpt-chats-cache.cjs");
 const sessionStore = require("./session-store.cjs");
 const { version: VERSION } = require("../package.json");
 
@@ -365,6 +367,45 @@ const TOOLS = {
           { cmd: 'chatgpt "robot surfing" --generate-image /tmp/robot.png', desc: "Generate image (headless)" },
           { cmd: 'chatgpt "hello" --profile me@gmail.com', desc: "Use Chrome profile (headless)" },
         ]
+      },
+      "chatgpt.chats": {
+        desc: "List, search, view, and export ChatGPT conversations (Cloak only)",
+        args: ["conversation_id"],
+        opts: {
+          limit: "List count or last N visible messages when viewing",
+          all: "Fetch all conversations",
+          search: "Search conversations by query",
+          export: "Export viewed conversation to file",
+          format: "Export format: markdown|json",
+          rename: "Rename a conversation by ID",
+          delete: "Delete a conversation by ID",
+          "download-file": "Download attached file by file ID (use with --output)",
+          continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
+          "no-cache": "Bypass local chats cache",
+          timeout: "Timeout in seconds (default: 120)",
+          profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1)",
+        },
+        examples: [
+          { cmd: "chatgpt.chats", desc: "List recent conversations" },
+          { cmd: 'chatgpt.chats --search "auth system"', desc: "Search conversations" },
+          { cmd: "chatgpt.chats <conversation-id>", desc: "View conversation" },
+          { cmd: "chatgpt.chats <conversation-id> --export /tmp/chat.md", desc: "Export markdown" },
+          { cmd: 'chatgpt.chats <conversation-id> --rename "New Title"', desc: "Rename conversation" },
+        ],
+      },
+      "chatgpt.reply": {
+        desc: "Reply inside an existing ChatGPT conversation (Cloak only)",
+        args: ["conversation_id", "prompt"],
+        opts: {
+          model: "Model override (optional)",
+          continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
+          timeout: "Timeout in seconds (default: 120)",
+          profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1)",
+        },
+        examples: [
+          { cmd: 'chatgpt.reply <conversation-id> "follow-up question"', desc: "Reply in-thread" },
+          { cmd: 'chatgpt.reply <conversation-id> "follow-up" --model gpt-5.4-thinking', desc: "Reply with model override" },
+        ],
       },
       "gemini": { 
         desc: "Send prompt to Gemini (uses browser cookies)", 
@@ -2663,6 +2704,8 @@ const PRIMARY_ARG_MAP = {
   ai: "query",
   gemini: "query",
   chatgpt: "query",
+  "chatgpt.chats": "conversationId",
+  "chatgpt.reply": "conversationId",
   perplexity: "query",
   grok: "query",
   aistudio: "query",
@@ -2731,6 +2774,11 @@ if (firstArg !== undefined) {
     else if (/^-?\d+$/.test(val)) val = parseInt(val, 10);
     toolArgs[primaryKey] = val;
   }
+}
+
+if (tool === "chatgpt.reply") {
+  toolArgs.prompt = positional.slice(2).join(" ").trim();
+  toolArgs.query = toolArgs.prompt;
 }
 
 if (tool === "js" && toolArgs.file) {
@@ -2823,6 +2871,10 @@ if (tool === "chatgpt") {
   if (toolArgs.file && typeof toolArgs.file === "string") {
     toolArgs.file = path.resolve(toolArgs.file);
   }
+}
+
+if (tool === "chatgpt.chats" && typeof toolArgs.export === "string") {
+  toolArgs.export = path.resolve(toolArgs.export);
 }
 
 if (tool === "screenshot" && outputPath) {
@@ -3053,6 +3105,221 @@ const performAutoCapture = async () => {
   }
 };
 
+const CHATGPT_CLOAK_ONLY_TOOLS = new Set(["chatgpt.chats", "chatgpt.reply"]);
+
+const withOptionalHeadedCloak = async (enabled, fn) => {
+  const previous = process.env.CLOAK_HEADLESS;
+  if (enabled) process.env.CLOAK_HEADLESS = "0";
+  try {
+    return await fn();
+  } finally {
+    if (enabled) {
+      if (previous === undefined) delete process.env.CLOAK_HEADLESS;
+      else process.env.CLOAK_HEADLESS = previous;
+    }
+  }
+};
+
+const printChatGptChatsResult = (result, opts = {}) => {
+  if (result.action === "rename") {
+    if (wantJson) console.log(JSON.stringify(result ?? null, null, 2));
+    else console.log(`Renamed conversation ${result.conversationId} to: ${result.title}`);
+    return;
+  }
+  if (result.action === "delete") {
+    if (wantJson) console.log(JSON.stringify(result ?? null, null, 2));
+    else console.log(`Deleted conversation: ${result.conversationId}`);
+    return;
+  }
+  if (result.action === "download") {
+    if (wantJson) console.log(JSON.stringify(result ?? null, null, 2));
+    else if (result.file?.savedPath) console.log(`Downloaded file to: ${result.file.savedPath}`);
+    else if (!opts.outputPath) console.log(result.result?.download_url || `Download ready for file: ${result.fileId}`);
+    return;
+  }
+
+  if (result.action === "get") {
+    const markdown = chatgptChatsFormatter.formatConversationMarkdown({
+      conversation: result.conversation,
+      messageLimit: opts.messageLimit,
+    });
+    if (opts.exportPath) {
+      const format = chatgptChatsFormatter.inferExportFormat({
+        exportPath: opts.exportPath,
+        explicitFormat: opts.format,
+      });
+      fs.mkdirSync(path.dirname(opts.exportPath), { recursive: true });
+      fs.writeFileSync(
+        opts.exportPath,
+        format === "json" ? JSON.stringify(result.conversation, null, 2) + "\n" : markdown,
+      );
+      console.log(`Exported conversation to: ${opts.exportPath}`);
+    }
+    if (wantJson) {
+      console.log(JSON.stringify(result.conversation ?? null, null, 2));
+      return;
+    }
+    if (!opts.exportPath) process.stdout.write(markdown);
+    return;
+  }
+
+  if (wantJson) {
+    console.log(JSON.stringify(result ?? null, null, 2));
+    return;
+  }
+
+  const label = result.action === "search"
+    ? `ChatGPT Search — ${result.query}`
+    : "ChatGPT Conversations";
+  console.log(chatgptChatsFormatter.formatConversationList({
+    items: result.items,
+    total: result.total,
+    label,
+  }));
+};
+
+const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
+  if (!isCloakBrowserAvailable()) {
+    console.error("Error: CloakBrowser not installed. Run: npm install -g cloakbrowser");
+    process.exit(1);
+  }
+
+  const sess = sessionStore.createSession(sessionTool, queryArgs, process.env);
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (data, ...rest) => {
+    sess.step(String(typeof data === "string" ? data : data.toString()).trimEnd());
+    return originalWrite(data, ...rest);
+  };
+
+  const startMs = Date.now();
+  let lastProgress = "";
+  try {
+    const result = await withOptionalHeadedCloak(queryArgs.continueInBrowser === true, () => queryWithCloakBrowser(queryArgs, (progress) => {
+      if (progress.type === "trace") {
+        const msg = `[cloak-${sessionTool}] ⏳ ${progress.phase}`;
+        if (msg !== lastProgress) {
+          process.stderr.write(msg + "\n");
+          lastProgress = msg;
+        }
+        return;
+      }
+      const msg = `[cloak-${sessionTool}] [${progress.step}/${progress.total}] ${progress.message}`;
+      if (msg !== lastProgress) {
+        process.stderr.write(msg + "\n");
+        lastProgress = msg;
+      }
+    }));
+
+    const durationMs = result.tookMs || (Date.now() - startMs);
+    if (sessionTool === "chatgpt.reply") chatgptChatsCache.invalidateCachedChats();
+    sess.finish({
+      model: result.model || sessionTool,
+      tookMs: durationMs,
+      imagePath: result.imagePath,
+      responsePreview: result.response ? result.response.slice(0, 160) : `${sessionTool} completed`,
+    });
+
+    if (result.imagePath) process.stderr.write(`Image saved: ${result.imagePath}\n`);
+    if (result.thinkingTrace) {
+      const tc = result.thinkingTrace;
+      const tCount = tc.thoughts ? tc.thoughts.length : 0;
+      const dur = tc.durationSec ? `${tc.durationSec}s` : (tc.recapText || 'unknown');
+      process.stderr.write(`[cloak-${sessionTool}] 🧠 Thinking trace: ${tCount} step(s), ${dur}\n`);
+    }
+    if (wantJson) {
+      console.log(JSON.stringify({
+        response: result.response,
+        model: result.model,
+        tookMs: durationMs,
+        imagePath: result.imagePath || undefined,
+        partial: result.partial || undefined,
+        backend: "cloak",
+        conversationId: result.conversationId || undefined,
+        thinkingTrace: result.thinkingTrace || undefined,
+      }, null, 2));
+    } else {
+      console.log(result.response);
+      const suffix = result.partial ? " | partial" : "";
+      console.error(`\n[${result.model || "unknown"} | ${(durationMs / 1000).toFixed(1)}s | cloak${suffix}]`);
+    }
+    process.exit(0);
+  } catch (err) {
+    sess.fail(err);
+    const errMsg = `CloakBrowser failed: ${err.message}`;
+    if (softFail) {
+      console.warn(`Warning: ${errMsg}`);
+      process.exit(0);
+    }
+    console.error(`Error: ${errMsg}`);
+    if (autoCapture) await performAutoCapture();
+    process.exit(1);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+};
+
+const runChatGptChatsDirect = async (chatArgs, renderOpts = {}) => {
+  if (!isCloakBrowserAvailable()) {
+    console.error("Error: CloakBrowser not installed. Run: npm install -g cloakbrowser");
+    process.exit(1);
+  }
+
+  const sess = sessionStore.createSession("chatgpt.chats", chatArgs, process.env);
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (data, ...rest) => {
+    sess.step(String(typeof data === "string" ? data : data.toString()).trimEnd());
+    return originalWrite(data, ...rest);
+  };
+
+  const startMs = Date.now();
+  let lastProgress = "";
+  try {
+    const cacheable = ["list", "search", "get"].includes(chatArgs.action)
+      && chatArgs.useCache !== false
+      && chatArgs.continueInBrowser !== true;
+    if (cacheable) {
+      const cached = chatgptChatsCache.getCachedChats(chatArgs);
+      if (cached) {
+        sess.step("[cache] hit chatgpt chats cache");
+        sess.finish({ model: `chatgpt.chats:${cached.action}:cache`, tookMs: Date.now() - startMs, responsePreview: `${cached.action} cache` });
+        printChatGptChatsResult(cached, renderOpts);
+        process.exit(0);
+      }
+    }
+
+    const result = await withOptionalHeadedCloak(chatArgs.continueInBrowser === true, () => manageChatsWithCloakBrowser(chatArgs, (progress) => {
+      const msg = `[cloak-chatgpt.chats] [${progress.step}/${progress.total}] ${progress.message}`;
+      if (msg !== lastProgress) {
+        process.stderr.write(msg + "\n");
+        lastProgress = msg;
+      }
+    }));
+
+    if (cacheable) chatgptChatsCache.setCachedChats(chatArgs, result);
+    if (["rename", "delete"].includes(chatArgs.action)) chatgptChatsCache.invalidateCachedChats();
+
+    const durationMs = Date.now() - startMs;
+    const preview = result.action === "get"
+      ? `view ${result.conversationId || ""}`
+      : `${result.action} ${(result.items || []).length}/${result.total || 0}`;
+    sess.finish({ model: `chatgpt.chats:${result.action}`, tookMs: durationMs, responsePreview: preview.trim() });
+    printChatGptChatsResult(result, renderOpts);
+    process.exit(0);
+  } catch (err) {
+    sess.fail(err);
+    const errMsg = `CloakBrowser failed: ${err.message}`;
+    if (softFail) {
+      console.warn(`Warning: ${errMsg}`);
+      process.exit(0);
+    }
+    console.error(`Error: ${errMsg}`);
+    if (autoCapture) await performAutoCapture();
+    process.exit(1);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Bun-native ChatGPT path (opt-in via SURF_USE_BUN_CHATGPT=1)
 // ---------------------------------------------------------------------------
@@ -3084,15 +3351,20 @@ if (tool === "chatgpt" && hasBunOnlyChatGPTFeature && !shouldUseBunChatGPT(proce
   process.exit(1);
 }
 
-if (tool === "chatgpt" && requestedProfile) {
+if ((tool === "chatgpt" || CHATGPT_CLOAK_ONLY_TOOLS.has(tool)) && requestedProfile) {
   if (process.platform !== "darwin") {
     console.error("Error: --profile is only supported on macOS");
     process.exit(1);
   }
-  if (toolArgs["with-page"] || toolArgs.withPage) {
+  if (tool === "chatgpt" && (toolArgs["with-page"] || toolArgs.withPage)) {
     console.error("Error: --profile cannot be used with --with-page");
     process.exit(1);
   }
+}
+
+if (CHATGPT_CLOAK_ONLY_TOOLS.has(tool) && !shouldUseCloakChatGPT()) {
+  console.error("Error: this command requires CloakBrowser mode (set SURF_USE_CLOAK_CHATGPT=1)");
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -3102,81 +3374,129 @@ if (tool === "chatgpt" && requestedProfile) {
 
 if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
   (async () => {
-    if (!isCloakBrowserAvailable()) {
-      console.error("Error: CloakBrowser not installed. Run: npm install -g cloakbrowser");
-      process.exit(1);
-    }
-
     if (requestedProfile) toolArgs.profile = requestedProfile;
     if (toolArgs["generate-image"]) toolArgs.generateImage = toolArgs["generate-image"];
-
-    // Session + stderr intercept declared OUTSIDE try so finally can always clean up
-    const sess = sessionStore.createSession("chatgpt", toolArgs, process.env);
-    const _origWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
-
-    const startMs = Date.now();
-    let lastProgress = "";
-    try {
-      const result = await queryWithCloakBrowser(toolArgs, (progress) => {
-        // Trace events: live thinking/reasoning phase (mirrors bun worker ⏳ logs)
-        if (progress.type === "trace") {
-          const msg = `[cloak-chatgpt] ⏳ ${progress.phase}`;
-          if (msg !== lastProgress) {
-            process.stderr.write(msg + "\n");
-            lastProgress = msg;
-          }
-          return;
-        }
-        // Step progress events
-        const msg = `[cloak-chatgpt] [${progress.step}/${progress.total}] ${progress.message}`;
-        if (msg !== lastProgress) {
-          process.stderr.write(msg + "\n");
-          lastProgress = msg;
-        }
-      });
-
-      const durationMs = result.tookMs || (Date.now() - startMs);
-      sess.finish({ model: result.model, tookMs: durationMs, imagePath: result.imagePath,
-        responsePreview: result.response ? result.response.slice(0, 160) : "" });
-
-      if (result.imagePath) {
-        process.stderr.write(`Image saved: ${result.imagePath}\n`);
-      }
-      if (wantJson) {
-        console.log(JSON.stringify({
-          response: result.response,
-          model: result.model,
-          tookMs: durationMs,
-          imagePath: result.imagePath || undefined,
-          partial: result.partial || undefined,
-          backend: "cloak"
-        }, null, 2));
-      } else {
-        console.log(result.response);
-        const suffix = result.partial ? ' | partial' : '';
-        console.error(`\n[${result.model || 'unknown'} | ${(durationMs / 1000).toFixed(1)}s | cloak${suffix}]`);
-      }
-      process.exit(0);
-    } catch (err) {
-      sess.fail(err);
-      const errMsg = `CloakBrowser failed: ${err.message}`;
-      if (softFail) {
-        console.warn(`Warning: ${errMsg}`);
-        process.exit(0);
-      }
-      console.error(`Error: ${errMsg}`);
-      if (autoCapture) {
-        await performAutoCapture();
-      }
-      process.exit(1);
-    } finally {
-      // Always restore stderr — even if process.exit() is called (sync exit skips this,
-      // but it guards against thrown exceptions that don't immediately exit)
-      process.stderr.write = _origWrite;
-    }
+    await runChatGptCloakQueryDirect("chatgpt", toolArgs);
   })();
   return; // Prevent falling through to Bun or legacy
+}
+
+if (tool === "chatgpt.chats") {
+  const exportPath = toolArgs.export;
+  const explicitFormat = toolArgs.format;
+  const searchQuery = typeof toolArgs.search === "string" ? toolArgs.search.trim() : "";
+  const conversationId = typeof toolArgs.conversationId === "string" ? toolArgs.conversationId.trim() : "";
+  const renameTitle = typeof toolArgs.rename === "string" ? toolArgs.rename.trim() : "";
+  const fileId = typeof toolArgs["download-file"] === "string" ? toolArgs["download-file"].trim() : "";
+  const limit = toolArgs.limit === undefined ? undefined : parseInt(String(toolArgs.limit), 10);
+  const wantsDelete = toolArgs.delete === true;
+  const continueInBrowser = toolArgs.continue === true;
+  const useCache = toolArgs["no-cache"] !== true;
+
+  if (toolArgs.limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+    console.error("Error: --limit must be a positive integer");
+    process.exit(1);
+  }
+  if (conversationId && searchQuery) {
+    console.error("Error: cannot use conversation ID with --search");
+    process.exit(1);
+  }
+  if (toolArgs.all && conversationId) {
+    console.error("Error: --all is only valid when listing conversations");
+    process.exit(1);
+  }
+  if (toolArgs.all && toolArgs.limit !== undefined) {
+    console.error("Error: --all cannot be combined with --limit");
+    process.exit(1);
+  }
+  if (exportPath && !conversationId) {
+    console.error("Error: --export requires a conversation ID");
+    process.exit(1);
+  }
+  if (explicitFormat && !["markdown", "md", "json"].includes(String(explicitFormat).toLowerCase())) {
+    console.error("Error: --format must be markdown, md, or json");
+    process.exit(1);
+  }
+
+  const advancedCount = [renameTitle ? 1 : 0, wantsDelete ? 1 : 0, fileId ? 1 : 0].reduce((sum, n) => sum + n, 0);
+  if (advancedCount > 1) {
+    console.error("Error: use only one of --rename, --delete, or --download-file");
+    process.exit(1);
+  }
+  if ((renameTitle || wantsDelete || fileId) && !conversationId) {
+    console.error("Error: conversation ID required for this action");
+    process.exit(1);
+  }
+  if (fileId && !outputPath) {
+    console.error("Error: --download-file requires --output <path>");
+    process.exit(1);
+  }
+  if (outputPath && !fileId) {
+    console.error("Error: --output is only supported with --download-file");
+    process.exit(1);
+  }
+  if ((renameTitle || wantsDelete || fileId) && exportPath) {
+    console.error("Error: --export is only supported when viewing a conversation");
+    process.exit(1);
+  }
+
+  const action = renameTitle
+    ? "rename"
+    : wantsDelete
+      ? "delete"
+      : fileId
+        ? "download"
+        : conversationId
+          ? "get"
+          : searchQuery
+            ? "search"
+            : "list";
+  (async () => {
+    const chatArgs = {
+      action,
+      conversationId: conversationId || undefined,
+      query: searchQuery || undefined,
+      limit,
+      all: toolArgs.all === true,
+      profile: requestedProfile,
+      timeout: toolArgs.timeout,
+      title: renameTitle || undefined,
+      fileId: fileId || undefined,
+      includeBytes: !!fileId,
+      outputPath: outputPath || undefined,
+      continueInBrowser,
+      useCache,
+    };
+    await runChatGptChatsDirect(chatArgs, {
+      messageLimit: action === "get" ? limit : undefined,
+      exportPath,
+      format: explicitFormat,
+      outputPath,
+    });
+  })();
+  return;
+}
+
+if (tool === "chatgpt.reply") {
+  const conversationId = typeof toolArgs.conversationId === "string" ? toolArgs.conversationId.trim() : "";
+  const prompt = typeof toolArgs.prompt === "string" ? toolArgs.prompt.trim() : "";
+  if (!conversationId || !prompt) {
+    console.error("Error: Usage: surf chatgpt.reply <conversation-id> \"prompt\"");
+    process.exit(1);
+  }
+
+  (async () => {
+    const replyArgs = {
+      ...toolArgs,
+      profile: requestedProfile,
+      prompt,
+      query: prompt,
+      conversationId,
+      continueInBrowser: toolArgs.continue === true,
+    };
+    await runChatGptCloakQueryDirect("chatgpt.reply", replyArgs);
+  })();
+  return;
 }
 
 // ---------------------------------------------------------------------------

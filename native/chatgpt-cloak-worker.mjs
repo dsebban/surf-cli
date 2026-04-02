@@ -139,62 +139,310 @@ async function waitForReady(page, timeoutMs = 30_000) {
   return { ready: false, loggedIn: false };
 }
 
+async function waitForConversationReady(page, conversationId, timeoutMs = 30_000) {
+  const expectedPath = `/c/${conversationId}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const currentUrl = page.url();
+    const state = await page.evaluate(() => {
+      if (document.querySelector('#prompt-textarea')) return 'ready';
+      const btns = Array.from(document.querySelectorAll('button, a'));
+      if (btns.some((b) => /^(log in|sign in|sign up)$/i.test((b.textContent || '').trim()))) return 'login';
+      return 'loading';
+    });
+
+    if (state === 'login') return { ready: false, loggedIn: false, currentUrl };
+    if (currentUrl.includes(expectedPath) && state === 'ready') {
+      return { ready: true, loggedIn: true, currentUrl };
+    }
+    if (currentUrl === 'https://chatgpt.com/' || currentUrl === 'https://chatgpt.com') {
+      return { ready: false, loggedIn: true, currentUrl };
+    }
+    await sleep(1000);
+  }
+  return { ready: false, loggedIn: true, currentUrl: page.url() };
+}
+
 // ============================================================================
-// Response text extraction from DOM
+// Shared selectors — unified assistant-turn detection (mirrors bun worker)
+
+const ASSISTANT_SELECTOR =
+  '[data-message-author-role="assistant"], [data-turn="assistant"]';
+
+const CONVERSATION_TURN_SELECTOR =
+  'section[data-testid^="conversation-turn"], article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"]';
+
+const STOP_BUTTON_SELECTOR =
+  'button[data-testid="stop-button"], button[aria-label="Stop"]';
+
+const FINISHED_ACTION_SELECTOR =
+  'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"]';
+
+// Helper JS fragment: resolve last assistant turn node (shared by extract/detect/image)
+const FIND_LAST_ASSISTANT_JS = `
+  var TURN_SEL = '${CONVERSATION_TURN_SELECTOR}';
+  var ASSISTANT_SEL = '${ASSISTANT_SELECTOR}';
+  function isAssistant(node) {
+    if (!(node instanceof HTMLElement)) return false;
+    var sr = node.querySelector('.sr-only');
+    if (sr) {
+      var srText = (sr.textContent || '').toLowerCase().trim();
+      if (srText.includes('chatgpt said') || srText.includes('assistant said')) return true;
+      if (srText.includes('you said') || srText.includes('user said')) return false;
+    }
+    var role = (node.getAttribute('data-message-author-role') || '').toLowerCase();
+    if (role === 'assistant') return true;
+    if (role === 'user') return false;
+    var turn = (node.getAttribute('data-turn') || '').toLowerCase();
+    if (turn === 'assistant') return true;
+    return !!node.querySelector(ASSISTANT_SEL);
+  }
+  var turns = document.querySelectorAll(TURN_SEL);
+  var lastAssistant = null;
+  for (var i = turns.length - 1; i >= 0; i--) {
+    if (isAssistant(turns[i])) { lastAssistant = turns[i]; break; }
+  }
+`;
+
+// ============================================================================
+// Response text extraction from DOM — structured return + innerText
 
 const EXTRACT_TEXT_JS = `(() => {
-  const turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
-  for (let k = turns.length - 1; k >= 0; k--) {
-    const sr = turns[k].querySelector('.sr-only');
-    if (sr && (sr.textContent || '').toLowerCase().includes('chatgpt said')) {
-      const md = turns[k].querySelector('.markdown');
-      return md ? (md.textContent || '').trim() : '';
-    }
+  ${FIND_LAST_ASSISTANT_JS}
+  var FINISH_SEL = '${FINISHED_ACTION_SELECTOR}';
+  if (!lastAssistant) return { text: '', finished: false, messageId: null, hasAssistantTurn: false };
+  var text = '';
+  var md = lastAssistant.querySelector('.markdown');
+  if (md) {
+    text = (md.innerText || '').trim();
+  } else {
+    var content = lastAssistant.querySelector('[data-message-content]')
+               || lastAssistant.querySelector('.prose')
+               || lastAssistant;
+    var clone = content.cloneNode(true);
+    var remove = clone.querySelectorAll('.sr-only, button, nav, form, script, style');
+    for (var r = 0; r < remove.length; r++) remove[r].remove();
+    text = (clone.innerText || '').trim();
   }
-  return '';
+  var msgEl = lastAssistant.querySelector('[data-message-id]');
+  var messageId = msgEl ? msgEl.getAttribute('data-message-id') : null;
+  var finished = !!lastAssistant.querySelector(FINISH_SEL);
+  var turnId = lastAssistant.getAttribute('data-testid') || null;
+  return { text: text, finished: finished, messageId: messageId, hasAssistantTurn: true, turnId: turnId };
 })()`;
 
 const DETECT_PHASE_JS = `(() => {
-  const stop = document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop"]');
+  var STOP_SEL = '${STOP_BUTTON_SELECTOR}';
+  var stop = document.querySelector(STOP_SEL);
   if (!stop) return { phase: '', isThinking: false };
-  const turns = document.querySelectorAll(
-    'section[data-testid^="conversation-turn-"], article[data-testid^="conversation-turn-"], div[data-testid^="conversation-turn-"]'
-  );
-  let last = null;
-  for (let k = turns.length - 1; k >= 0; k--) {
-    const sr = turns[k].querySelector('.sr-only');
-    if (sr && (sr.textContent || '').toLowerCase().includes('chatgpt said')) { last = turns[k]; break; }
-  }
-  if (!last) return { phase: 'Connecting', isThinking: true };
-  const md = last.querySelector('.markdown');
-  if (md && (md.textContent || '').trim()) return { phase: 'Responding', isThinking: false };
-  // Thinking/reasoning phase: extract visible label (remove noise, take first line)
-  const clone = last.cloneNode(true);
-  clone.querySelectorAll('.sr-only, .markdown, button, nav, form, script, style').forEach(el => el.remove());
-  const raw = (clone.textContent || '').trim();
-  const label = raw.split('\\n')[0].trim().slice(0, 80) || 'Thinking';
+  ${FIND_LAST_ASSISTANT_JS}
+  if (!lastAssistant) return { phase: 'Connecting', isThinking: true };
+  var md = lastAssistant.querySelector('.markdown');
+  if (md && (md.innerText || '').trim()) return { phase: 'Responding', isThinking: false };
+  var clone = lastAssistant.cloneNode(true);
+  clone.querySelectorAll('.sr-only, .markdown, button, nav, form, script, style').forEach(function(el) { el.remove(); });
+  var raw = (clone.textContent || '').trim();
+  var label = raw.split('\\n')[0].trim().slice(0, 80) || 'Thinking';
   return { phase: label, isThinking: true };
 })()`;
 
 // ============================================================================
-// Image detection + save
+// SSE fetch stream capture — ported from bun worker
+
+async function injectFetchStreamCapture(page) {
+  await page.evaluate(`
+    (function() {
+      if (window.__surfChatFetchPatched) return;
+      window.__surfChatFetchPatched = true;
+      window.__surfChatResponse = { text: '', done: false, messageId: null, model: null, parts: [] };
+      var origFetch = window.fetch;
+      window.fetch = function() {
+        var args = arguments;
+        var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+        var opts = args[1] || {};
+        var method = (opts.method || 'GET').toUpperCase();
+        var result = origFetch.apply(this, args);
+        var isConv = method === 'POST' && (url.indexOf('/backend-api/f/conversation') !== -1 || url.indexOf('/backend-api/conversation') !== -1);
+        if (isConv) {
+          result.then(function(resp) {
+            if (!resp.body || !resp.ok) return;
+            window.__surfChatResponse = { text: '', done: false, messageId: null, model: null, parts: [] };
+            var clone = resp.clone();
+            var reader = clone.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            function applyOp(op) {
+              var r = window.__surfChatResponse;
+              var m = op.p.match(/^\\/message\\/content\\/parts\\/(\\d+)$/);
+              if (m) {
+                var idx = parseInt(m[1], 10);
+                while (r.parts.length <= idx) r.parts.push('');
+                if (op.o === 'append' && typeof op.v === 'string') r.parts[idx] += op.v;
+                else if (op.o === 'replace') r.parts[idx] = typeof op.v === 'string' ? op.v : JSON.stringify(op.v);
+                r.text = r.parts.join('');
+                return;
+              }
+              if (op.p === '/message/status' && op.o === 'replace' && op.v === 'finished_successfully') { r.done = true; return; }
+              if (op.p === '/message/id' && op.o === 'replace' && typeof op.v === 'string') { r.messageId = op.v; return; }
+              if (op.p === '/message/metadata/model_slug' && op.o === 'replace' && typeof op.v === 'string') { r.model = op.v; return; }
+            }
+            function pump() {
+              reader.read().then(function(chunk) {
+                if (chunk.done) { window.__surfChatResponse.done = true; return; }
+                buf += decoder.decode(chunk.value, { stream: true });
+                var lines = buf.split('\\n');
+                buf = lines.pop() || '';
+                for (var i = 0; i < lines.length; i++) {
+                  var line = lines[i].trim();
+                  if (!line) continue;
+                  if (line.indexOf('event:') === 0) continue;
+                  if (line.indexOf('data: ') === 0) line = line.slice(6).trim();
+                  if (line === '[DONE]') { window.__surfChatResponse.done = true; continue; }
+                  if (line === 'message_stream_complete') { window.__surfChatResponse.done = true; continue; }
+                  if (line[0] !== '{') continue;
+                  try {
+                    var obj = JSON.parse(line);
+                    if (obj.type === 'message_stream_complete') { window.__surfChatResponse.done = true; continue; }
+                    var msg = (obj.v && obj.v.message) || obj.message;
+                    if (msg && msg.author && msg.author.role === 'assistant' && msg.content && msg.content.parts) {
+                      var t = msg.content.parts.join('');
+                      if (t) { window.__surfChatResponse.text = t; window.__surfChatResponse.parts = msg.content.parts.slice(); }
+                      if (msg.id) window.__surfChatResponse.messageId = msg.id;
+                      if (msg.metadata && msg.metadata.model_slug) window.__surfChatResponse.model = msg.metadata.model_slug;
+                      if (msg.status === 'finished_successfully') window.__surfChatResponse.done = true;
+                      continue;
+                    }
+                    if (typeof obj.o === 'string' && typeof obj.p === 'string') { applyOp(obj); continue; }
+                    if (Array.isArray(obj.v)) {
+                      for (var j = 0; j < obj.v.length; j++) {
+                        var op = obj.v[j];
+                        if (typeof op.o === 'string' && typeof op.p === 'string') applyOp(op);
+                      }
+                      continue;
+                    }
+                  } catch(e) {}
+                }
+                pump();
+              }).catch(function() { window.__surfChatResponse.done = true; });
+            }
+            pump();
+          }).catch(function() {});
+        }
+        return result;
+      };
+    })()
+  `);
+}
+
+async function readStreamResponse(page) {
+  return await page.evaluate(`window.__surfChatResponse || { text: '', done: false, messageId: null, model: null }`);
+}
+
+// ============================================================================
+// Text arbitration + stability — local equivalents of bun helpers
+
+// Note: streamDone accepted to match bun helper call shape but not consulted here
+function chooseBestText({ streamText, domText, streamDone, domFinished }) {
+  if (domFinished && domText.length > 0) return domText;
+  if (streamText.length > 0) return streamText;
+  return domText || streamText;
+}
+
+function advanceTextStability({ text, previousText, isStreaming, finished, stableCycles, lastChangeAtMs, nowMs, requiredStableCycles, minStableMs }) {
+  if (text !== previousText) return { stableCycles: 0, lastChangeAtMs: nowMs, shouldComplete: false };
+  if (finished && text.length > 0) return { stableCycles: stableCycles + 1, lastChangeAtMs, shouldComplete: true };
+  const newStable = stableCycles + 1;
+  const stableMs = nowMs - lastChangeAtMs;
+  if (!isStreaming && text.length > 0 && newStable >= requiredStableCycles && stableMs >= minStableMs) {
+    return { stableCycles: newStable, lastChangeAtMs, shouldComplete: true };
+  }
+  return { stableCycles: newStable, lastChangeAtMs, shouldComplete: false };
+}
+
+// ============================================================================
+// Thinking trace extraction — reads React fiber state (works headless)
+
+const EXTRACT_THINKING_TRACE_JS = `(() => {
+  // Find "Thought for" / "Thinking for" button near assistant turn
+  var buttons = Array.from(document.querySelectorAll('button'));
+  var thoughtBtn = buttons.find(function(b) {
+    return /Thought for|Thinking for/i.test(b.innerText || b.textContent);
+  });
+  if (!thoughtBtn) return null;
+
+  // Walk React fiber tree to find allMessages with thinking data
+  var fiberKey = Object.keys(thoughtBtn).find(function(k) { return k.startsWith('__reactFiber$'); });
+  if (!fiberKey) return null;
+
+  var fiber = thoughtBtn[fiberKey];
+  var depth = 0;
+  while (fiber && depth < 50) {
+    if (fiber.memoizedProps && fiber.memoizedProps.allMessages) {
+      var msgs = fiber.memoizedProps.allMessages;
+      var thoughts = [];
+      var durationSec = null;
+      var recapText = null;
+
+      for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (!m || !m.content) continue;
+
+        // Extract thoughts array (point-by-point reasoning trace)
+        if (m.content.content_type === 'thoughts' && Array.isArray(m.content.thoughts)) {
+          for (var j = 0; j < m.content.thoughts.length; j++) {
+            var t = m.content.thoughts[j];
+            if (typeof t === 'string') {
+              thoughts.push({ summary: '', content: t });
+            } else if (t && typeof t === 'object') {
+              thoughts.push({ summary: t.summary || '', content: t.content || '' });
+            }
+          }
+        }
+
+        // Extract duration and recap from reasoning_recap message
+        if (m.content.content_type === 'reasoning_recap') {
+          recapText = m.content.content || null;
+          if (m.metadata && typeof m.metadata.finished_duration_sec === 'number') {
+            durationSec = m.metadata.finished_duration_sec;
+          }
+        }
+      }
+
+      if (thoughts.length === 0 && !recapText) return null;
+      return { thoughts: thoughts, durationSec: durationSec, recapText: recapText };
+    }
+    fiber = fiber.return;
+    depth++;
+  }
+  return null;
+})()`;
+
+async function extractThinkingTrace(page) {
+  try {
+    const result = await page.evaluate(EXTRACT_THINKING_TRACE_JS);
+    return result;
+  } catch (e) {
+    log('warn', 'Thinking trace extraction failed', { error: e.message });
+    return null;
+  }
+}
+
+// ============================================================================
+// Image detection + save — uses unified assistant-root resolution
 
 async function detectAndSaveImage(page, savePath) {
-  // Find <img> inside the last assistant turn
-  const imgData = await page.evaluate(() => {
-    const turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
-    for (let k = turns.length - 1; k >= 0; k--) {
-      const sr = turns[k].querySelector('.sr-only');
-      if (!sr || !(sr.textContent || '').toLowerCase().includes('chatgpt said')) continue;
-      const imgs = turns[k].querySelectorAll('img:not([alt="User"]):not([alt="ChatGPT"])');
-      for (const img of imgs) {
-        if (img.naturalWidth > 100 && img.naturalHeight > 100) {
-          return { src: img.src, width: img.naturalWidth, height: img.naturalHeight };
-        }
+  const imgData = await page.evaluate(`(() => {
+    ${FIND_LAST_ASSISTANT_JS}
+    if (!lastAssistant) return null;
+    var imgs = lastAssistant.querySelectorAll('img:not([alt="User"]):not([alt="ChatGPT"])');
+    for (var i = 0; i < imgs.length; i++) {
+      var img = imgs[i];
+      if (img.naturalWidth > 100 && img.naturalHeight > 100) {
+        return { src: img.src, width: img.naturalWidth, height: img.naturalHeight };
       }
     }
     return null;
-  });
+  })()`);
 
   if (!imgData) return null;
 
@@ -225,7 +473,7 @@ async function detectAndSaveImage(page, savePath) {
 // ============================================================================
 // Main query handler
 
-async function runQuery({ prompt, model, file, profile, timeout = 120, generateImage }) {
+async function runQuery({ prompt, model, file, profile, timeout = 120, generateImage, conversationId }) {
   const t0 = Date.now();
   const resolved = resolveModel(model);
   const useInjectedProfile = !!profile;
@@ -282,28 +530,55 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     }
 
     // ── Phase 3: Navigate ────────────────────────────────────────────
-    progress(3, 6, 'Loading ChatGPT');
-    await page.goto('https://chatgpt.com/', {
+    progress(3, 6, conversationId ? 'Loading conversation' : 'Loading ChatGPT');
+    const targetUrl = conversationId
+      ? `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`
+      : 'https://chatgpt.com/';
+    await page.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 60_000,
     });
     await sleep(2000); // human-like dwell
 
-    const { ready, loggedIn } = await waitForReady(page, 30_000);
-    log('info', 'Page state', { ready, loggedIn });
+    if (conversationId) {
+      const convoReady = await waitForConversationReady(page, conversationId, 30_000);
+      log('info', 'Conversation page state', convoReady);
+      if (!convoReady.loggedIn) {
+        fail('login_required',
+          useInjectedProfile
+            ? `Login failed for profile "${profile}". Session cookie may be expired.`
+            : 'ChatGPT login required. Use --profile <email> or log in via CLOAK_HEADLESS=0.'
+        );
+        return;
+      }
+      if (!convoReady.ready) {
+        const code = convoReady.currentUrl.includes(`/c/${conversationId}`)
+          ? 'conversation_load_timeout'
+          : 'conversation_not_found';
+        fail(code, `Failed to load conversation ${conversationId}`);
+        return;
+      }
+    } else {
+      const { ready, loggedIn } = await waitForReady(page, 30_000);
+      log('info', 'Page state', { ready, loggedIn });
 
-    if (!ready) {
-      fail('ui_timeout', 'ChatGPT page did not become ready within 30s');
-      return;
+      if (!ready) {
+        fail('ui_timeout', 'ChatGPT page did not become ready within 30s');
+        return;
+      }
+      if (!loggedIn) {
+        fail('login_required',
+          useInjectedProfile
+            ? `Login failed for profile "${profile}". Session cookie may be expired.`
+            : 'ChatGPT login required. Use --profile <email> or log in via CLOAK_HEADLESS=0.'
+        );
+        return;
+      }
     }
-    if (!loggedIn) {
-      fail('login_required',
-        useInjectedProfile
-          ? `Login failed for profile "${profile}". Session cookie may be expired.`
-          : 'ChatGPT login required. Use --profile <email> or log in via CLOAK_HEADLESS=0.'
-      );
-      return;
-    }
+
+    // ── Inject SSE stream capture (must be before any send) ──────────
+    await injectFetchStreamCapture(page);
+    log('info', 'SSE stream capture injected');
 
     // ── Phase 4: Model selection ─────────────────────────────────────
     if (resolved.tid) {
@@ -363,15 +638,22 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     await textarea.type(finalPrompt);
     await sleep(300);
 
+    // Capture baseline before send (detect stale assistant turns)
+    const baseline = await page.evaluate(EXTRACT_TEXT_JS);
+    const baselineTurnId = baseline.turnId || null;
+    log('info', 'Baseline captured', { turnId: baselineTurnId });
+
     // Send
     const sendBtn = page.locator('button[data-testid="send-button"]').first();
     await sendBtn.click({ timeout: 10_000 });
 
-    // ── Phase 6: Wait for response ───────────────────────────────────
+    // ── Phase 6: Wait for response (hybrid stream + DOM) ────────────
     progress(6, 6, 'Waiting for response');
 
     const deadline = Date.now() + timeout * 1000;
     let responseText = '';
+    let sawActivity = false;
+    let capturedModel = null;
     let stableCycles = 0;
     let lastChangeAtMs = Date.now();
     let lastText = '';
@@ -381,34 +663,85 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     while (Date.now() < deadline) {
       await sleep(500);
 
-      // Detect phase — returns { phase, isThinking }
+      // 1. Detect phase
       const phaseResult = await page.evaluate(DETECT_PHASE_JS);
-      const phase = (phaseResult && phaseResult.phase) || phaseResult || '';
+      const phase = (phaseResult && phaseResult.phase) || '';
       if (phase && phase !== lastPhase) {
         log('info', `⏳ ${phase}`);
-        // Emit structured trace event so bridge+CLI can render it like bun worker does
         emit({ type: 'trace', phase, isThinking: !!(phaseResult && phaseResult.isThinking) });
         lastPhase = phase;
       }
 
-      // Extract text
-      const text = sanitize(await page.evaluate(EXTRACT_TEXT_JS));
+      // 2. DOM snapshot (structured)
+      const dom = await page.evaluate(EXTRACT_TEXT_JS);
+      const sanitizedDom = sanitize(dom.text || '');
 
-      // Check streaming
-      const isStreaming = await page.locator('button[data-testid="stop-button"], button[aria-label="Stop"]').count() > 0;
+      // 3. Stream snapshot
+      const stream = await readStreamResponse(page);
+      if (stream.model) capturedModel = stream.model;
 
-      // Stability check (mirrors bun advanceTextStability: requiredStableCycles=2, minStableMs=1200)
-      const nowMs = Date.now();
-      if (text !== lastText) {
-        stableCycles = 0;
-        lastChangeAtMs = nowMs;
-      } else if (text && !isStreaming) {
-        stableCycles++;
-        const stableMs = nowMs - lastChangeAtMs;
-        if (stableCycles >= 2 && stableMs >= 1200) break;
+      // 4. Streaming state
+      const isStreaming = await page.locator(STOP_BUTTON_SELECTOR).count() > 0;
+
+      // 5. Arbitrate best text
+      const currentText = chooseBestText({
+        streamText: stream.text || '',
+        domText: sanitizedDom,
+        streamDone: !!stream.done,
+        domFinished: !!dom.finished,
+      });
+
+      // Track activity — only if we see a NEW turn (not baseline stale content)
+      const isNewTurn = dom.turnId && dom.turnId !== baselineTurnId;
+      const hasStreamContent = stream.text && stream.text.length > 0;
+      if (hasStreamContent || isNewTurn) {
+        sawActivity = true;
       }
-      lastText = text;
-      if (text) responseText = text;
+      if (!sawActivity) continue;
+
+      // 6. Completion: stream.done with stream text = authoritative
+      if (stream.done && stream.text && stream.text.length > 0) {
+        responseText = currentText || sanitizedDom || stream.text;
+        break;
+      }
+
+      // 7. DOM stability fallback (requiredStableCycles=4, minStableMs=2500)
+      const stability = advanceTextStability({
+        text: currentText,
+        previousText: lastText,
+        isStreaming,
+        finished: !!dom.finished,
+        stableCycles,
+        lastChangeAtMs,
+        nowMs: Date.now(),
+        requiredStableCycles: 4,
+        minStableMs: 2500,
+      });
+      stableCycles = stability.stableCycles;
+      lastChangeAtMs = stability.lastChangeAtMs;
+      lastText = currentText;
+
+      if (stability.shouldComplete && currentText.length > 0) {
+        responseText = currentText;
+        break;
+      }
+
+      if (currentText) responseText = currentText;
+    }
+
+    // Thinking trace extraction (post-response, from React fiber state)
+    let thinkingTrace = null;
+    try {
+      thinkingTrace = await extractThinkingTrace(page);
+      if (thinkingTrace) {
+        log('info', 'Thinking trace captured', {
+          thoughtCount: thinkingTrace.thoughts?.length || 0,
+          durationSec: thinkingTrace.durationSec,
+          recapText: thinkingTrace.recapText,
+        });
+      }
+    } catch (e) {
+      log('warn', 'Thinking trace extraction error', { error: e.message });
     }
 
     // Image detection
@@ -429,16 +762,18 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
 
     success({
       response: responseText,
-      model: resolved.mode,
+      model: capturedModel || model || resolved.mode,
       tookMs: durationMs,
       imagePath,
-      partial: Date.now() >= (t0 + timeout * 1000),
+      partial: Date.now() >= deadline,
       backend: 'cloak',
+      conversationId: conversationId || null,
+      thinkingTrace: thinkingTrace || undefined,
     });
 
   } catch (e) {
-    log('error', 'Query failed', { error: e.message, stack: e.stack });
-    fail('query_failed', e.message);
+    log('error', 'Query failed', { error: e.message, stack: e.stack, code: e.code });
+    fail(e.code || 'query_failed', e.message);
   } finally {
     await context.close();
     if (tempDir) {
