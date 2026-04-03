@@ -739,11 +739,14 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       }
 
       // 7. DOM stability fallback (requiredStableCycles=4, minStableMs=2500)
+      // While model is still in thinking phase (stop button visible + thinking label),
+      // treat as streaming to prevent premature completion on thinking-phase text.
+      const isThinkingPhase = isStreaming && phaseResult && phaseResult.isThinking;
       const stability = advanceTextStability({
         text: currentText,
         previousText: lastText,
-        isStreaming,
-        finished: !!dom.finished,
+        isStreaming: isStreaming || isThinkingPhase,
+        finished: !!dom.finished && !isThinkingPhase,
         stableCycles,
         lastChangeAtMs,
         nowMs: Date.now(),
