@@ -106,10 +106,6 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
       const myRequestId = ++requestId;
 
       switch (action.action) {
-        case "close":
-          done(undefined);
-          break;
-
         case "load_list":
           state.phase = "loading_list";
           state.statusMessage = "Loading recent conversations…";
@@ -247,27 +243,30 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
     // Open the overlay
     await ctx.ui.custom<string | undefined>(
       (tui, theme, _keybindings, done) => {
+        const handleError = (err: unknown) => {
+          state.phase = "error";
+          state.lastError = {
+            code: "command_failed",
+            message: String((err as Error)?.message ?? err),
+          };
+          state.statusMessage = state.lastError.message;
+          overlay?.updateState(state);
+        };
+
         overlay = new SurfChatsOverlay({
           tui,
           theme,
           state,
+          done,
           callbacks: {
             onAction: (action) => {
-              handleAction(action, done).catch((err) => {
-                state.phase = "error";
-                state.lastError = {
-                  code: "command_failed",
-                  message: String(err?.message ?? err),
-                };
-                state.statusMessage = state.lastError.message;
-                overlay?.updateState(state);
-              });
+              handleAction(action, done).catch(handleError);
             },
           },
         });
 
         // Trigger initial load after overlay is constructed
-        handleAction({ action: "load_list" }, done).catch(() => {});
+        handleAction({ action: "load_list" }, done).catch(handleError);
 
         return overlay;
       },

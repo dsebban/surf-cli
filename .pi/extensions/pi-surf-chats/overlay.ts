@@ -7,7 +7,7 @@
  */
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth, type TUI } from "@mariozechner/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, type TUI, type Component, type Focusable } from "@mariozechner/pi-tui";
 import type { ControllerState, ConversationItem, DetailRecord, SurfChatsError } from "./types.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,7 +51,6 @@ function truncate(text: string, max: number): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type OverlayAction =
-  | { action: "close" }
   | { action: "inject"; conversationId: string; markdown: string; title: string }
   | { action: "export"; conversationId: string; title: string }
   | { action: "load_list" }
@@ -66,10 +65,11 @@ export interface OverlayCallbacks {
 // Overlay Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export class SurfChatsOverlay {
+export class SurfChatsOverlay implements Component, Focusable {
   private theme: Theme;
   private tui: TUI;
   private callbacks: OverlayCallbacks;
+  private done: (result?: string) => void;
   private state: ControllerState;
 
   // Scroll state for detail pane
@@ -82,11 +82,13 @@ export class SurfChatsOverlay {
     tui: TUI;
     theme: Theme;
     state: ControllerState;
+    done: (result?: string) => void;
     callbacks: OverlayCallbacks;
   }) {
     this.tui = opts.tui;
     this.theme = opts.theme;
     this.state = opts.state;
+    this.done = opts.done;
     this.callbacks = opts.callbacks;
   }
 
@@ -113,7 +115,7 @@ export class SurfChatsOverlay {
         this.callbacks.onAction({ action: "load_list" }); // exit search, reload recent
         return;
       }
-      this.callbacks.onAction({ action: "close" });
+      this.done(); // close overlay directly
       return;
     }
 
@@ -305,8 +307,14 @@ export class SurfChatsOverlay {
     return lines;
   }
 
-  invalidate(): void {}
-  dispose(): void {}
+  invalidate(): void {
+    // No cached rendering state to clear
+  }
+
+  dispose(): void {
+    // Cleanup on overlay close
+    this.focused = false;
+  }
 
   // ─── Private renderers ────────────────────────────────────────────────────
 
