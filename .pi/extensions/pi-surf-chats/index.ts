@@ -129,12 +129,85 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
     let closed = false;
     let activeAbort: AbortController | null = null;
 
+    // ── Delete queue ─────────────────────────────────────────────────
+    // Deletes run independently from load/search/export so they don't
+    // cancel each other. Multiple deletes are queued and processed
+    // sequentially.
+    const deleteQueue: Array<{ ids: string[]; titles: string[] }> = [];
+    let deleteRunning = false;
+    let deleteAbort: AbortController | null = null;
+
+    async function processDeleteQueue(done: (result?: string) => void): Promise<void> {
+      if (deleteRunning || closed) return;
+      deleteRunning = true;
+      while (deleteQueue.length > 0 && !closed) {
+        const batch = deleteQueue.shift()!;
+        const ids = batch.ids;
+        const count = ids.length;
+        state.phase = "deleting";
+        state.statusMessage = count > 1 ? `Deleting ${count} conversations…` : `Deleting "${batch.titles[0]}"…`;
+        state.pendingDeleteId = null;
+        state.pendingDeleteTitle = null;
+        state.lastError = null;
+        overlay?.updateState(state);
+
+        const abort = new AbortController();
+        deleteAbort = abort;
+        try {
+          await client.bulkDeleteConversations(ids, abort.signal);
+          if (closed) break;
+
+          // Remove from list + caches
+          const deleteSet = new Set(ids);
+          state.items = state.items.filter((item) => !deleteSet.has(item.id));
+          for (const id of ids) {
+            state.detailCache.delete(id);
+            state.markedIds.delete(id);
+          }
+          if (persistentListCache) {
+            persistentListCache.items = persistentListCache.items.filter((item) => !deleteSet.has(item.id));
+          }
+          if (state.selectedIndex >= state.items.length) {
+            state.selectedIndex = Math.max(0, state.items.length - 1);
+          }
+
+          if (ctx.hasUI) {
+            const label = count > 1 ? `${count} conversations` : batch.titles[0] ?? "conversation";
+            ctx.ui.notify(`Deleted: ${label}`, "info");
+          }
+        } catch (err) {
+          if (closed) break;
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Delete failed: ${(err as SurfChatsError).message ?? "unknown error"}`, "error");
+          }
+        }
+        deleteAbort = null;
+      }
+      deleteRunning = false;
+      // Restore idle if no other operation is in progress
+      if (!closed && state.phase === "deleting") {
+        state.phase = "idle";
+        state.statusMessage = deleteQueue.length > 0 ? "" : "";
+        overlay?.updateState(state);
+      }
+    }
+
     // Action handler — bridges overlay events to async operations
     async function handleAction(action: OverlayAction, done: (result?: string) => void): Promise<void> {
       if (closed) return;
-      activeAbort?.abort();
-      const abort = new AbortController();
-      activeAbort = abort;
+
+      // Non-exclusive actions: toggle_mark, delete flow, cancel
+      // These never cancel in-flight loads/exports.
+      if (action.action === "toggle_mark" || action.action === "delete" ||
+          action.action === "confirm_delete" || action.action === "cancel_delete") {
+        // handled below in switch — no abort
+      } else {
+        // Exclusive actions: load_list, search, load_more, load_detail, export, inject
+        activeAbort?.abort();
+        const newAbort = new AbortController();
+        activeAbort = newAbort;
+      }
+      const abort = activeAbort ?? new AbortController();
       const myRequestId = ++requestId;
       const isStale = () => closed || requestId !== myRequestId || abort.signal.aborted;
 
@@ -362,47 +435,13 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
         }
 
         case "confirm_delete": {
-          const ids = action.conversationIds;
-          const count = ids.length;
-          state.phase = "deleting";
-          state.statusMessage = count > 1 ? `Deleting ${count} conversations…` : `Deleting "${action.titles[0]}"…`;
-          state.pendingDeleteId = null;
-          state.pendingDeleteTitle = null;
-          state.lastError = null;
-          overlay?.updateState(state);
-
-          try {
-            await client.bulkDeleteConversations(ids, abort.signal);
-            if (isStale()) return;
-
-            // Remove from list + caches
-            const deleteSet = new Set(ids);
-            state.items = state.items.filter((item) => !deleteSet.has(item.id));
-            for (const id of ids) {
-              state.detailCache.delete(id);
-              state.markedIds.delete(id);
+          // Queue and process — does not block other actions
+          deleteQueue.push({ ids: action.conversationIds, titles: action.titles });
+          processDeleteQueue(done).catch((err) => {
+            if (!closed && ctx.hasUI) {
+              ctx.ui.notify(`Delete error: ${(err as Error).message}`, "error");
             }
-            if (persistentListCache) {
-              persistentListCache.items = persistentListCache.items.filter((item) => !deleteSet.has(item.id));
-            }
-            // Clamp selection
-            if (state.selectedIndex >= state.items.length) {
-              state.selectedIndex = Math.max(0, state.items.length - 1);
-            }
-            state.phase = "idle";
-            state.statusMessage = "";
-
-            if (ctx.hasUI) {
-              const label = count > 1 ? `${count} conversations` : action.titles[0] ?? "conversation";
-              ctx.ui.notify(`Deleted: ${label}`, "info");
-            }
-          } catch (err) {
-            if (isStale()) return;
-            state.phase = "error";
-            state.lastError = err as SurfChatsError;
-            state.statusMessage = (err as SurfChatsError).message ?? "Delete failed";
-          }
-          if (!closed) overlay?.updateState(state);
+          });
           break;
         }
       }
@@ -416,6 +455,9 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
           requestId += 1;
           activeAbort?.abort();
           activeAbort = null;
+          deleteAbort?.abort();
+          deleteAbort = null;
+          deleteQueue.length = 0;
           overlay = null;
         };
 
