@@ -189,7 +189,13 @@ describe("cdp-stealth", () => {
 
       expect(result.languages).toContain("fr-FR");
       expect(result.languages).toContain("fr");
-      expect(result.platform).toBe("MacIntel"); // running on macOS
+      let expectedPlatform = "Linux x86_64";
+      if (process.platform === "darwin") {
+        expectedPlatform = "MacIntel";
+      } else if (process.platform === "win32") {
+        expectedPlatform = "Win32";
+      }
+      expect(result.platform).toBe(expectedPlatform);
       expect(result.acceptLanguage).toContain("fr-FR");
     });
   });
