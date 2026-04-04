@@ -286,6 +286,10 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
     const detailRunner = createQueueRunner<{ conversationId: string }>(
       async (item, signal) => {
         const { conversationId } = item;
+        // Remove from queued tracking
+        const qi = state.detailLane.queuedConversationIds.indexOf(conversationId);
+        if (qi !== -1) state.detailLane.queuedConversationIds.splice(qi, 1);
+
         // dedupe: already cached or already active
         if (state.detailCache.has(conversationId)) return;
         if (state.detailLane.activeConversationId === conversationId) return;
@@ -327,6 +331,10 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
         if (state.exportLane.activeConversationId === conversationId) return;
         if (state.exportLane.queuedConversationIds.includes(conversationId)) return;
 
+        // Remove from queued tracking
+        const eqi = state.exportLane.queuedConversationIds.indexOf(conversationId);
+        if (eqi !== -1) state.exportLane.queuedConversationIds.splice(eqi, 1);
+
         state.exportLane.activeConversationId = conversationId;
         state.exportLane.error = null;
         state.exportLane.lastExportPath = null;
@@ -367,6 +375,10 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
 
     const deleteRunner = createQueueRunner<DeleteRequest>(
       async (request, signal) => {
+        // Remove from queued tracking
+        const dqi = state.deleteLane.queuedRequests.indexOf(request);
+        if (dqi !== -1) state.deleteLane.queuedRequests.splice(dqi, 1);
+
         // Filter out ids already removed by earlier deletes
         const liveIds = request.conversationIds.filter(id =>
           state.items.some(it => it.id === id),
