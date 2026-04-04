@@ -3153,7 +3153,11 @@ const printChatGptChatsResult = (result, opts = {}) => {
         opts.exportPath,
         format === "json" ? JSON.stringify(result.conversation, null, 2) + "\n" : markdown,
       );
-      console.log(`Exported conversation to: ${opts.exportPath}`);
+      if (wantJson) {
+        process.stderr.write(`Exported conversation to: ${opts.exportPath}\n`);
+      } else {
+        console.log(`Exported conversation to: ${opts.exportPath}`);
+      }
     }
     if (wantJson) {
       console.log(JSON.stringify(result.conversation ?? null, null, 2));
@@ -3176,6 +3180,9 @@ const printChatGptChatsResult = (result, opts = {}) => {
     total: result.total,
     label,
   }));
+  if (result.action === "search" && result.partial) {
+    console.error(`Note: search fallback scanned recent ${result.fallbackScanned || 0} of ${result.fallbackTotal || "?"} conversations.`);
+  }
 };
 
 const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
