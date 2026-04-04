@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let tempHome = "";
 
@@ -68,7 +68,10 @@ describe("chatgpt-chats-cache", () => {
   it("invalidates entries by predicate", () => {
     const cache = loadCacheModule();
     cache.setCachedChats({ action: "list", limit: 5 }, { action: "list", items: [], total: 0 });
-    cache.setCachedChats({ action: "search", query: "auth" }, { action: "search", items: [], total: 0 });
+    cache.setCachedChats(
+      { action: "search", query: "auth" },
+      { action: "search", items: [], total: 0 },
+    );
 
     // Remove only search entries
     cache.invalidateCachedChats((parsed: any) => parsed?.action === "search");

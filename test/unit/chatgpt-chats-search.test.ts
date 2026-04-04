@@ -15,7 +15,7 @@ describe("chatgpt-chats-search", () => {
       ],
     });
 
-    expect(items.map((item) => item.id)).toEqual(["c2", "c1"]);
+    expect(items.map((item: any) => item.id)).toEqual(["c2", "c1"]);
     expect(items[0].conversation_id).toBe("c2");
   });
 
@@ -31,17 +31,24 @@ describe("chatgpt-chats-search", () => {
       "surf e2e final 20260402t192754z",
     );
 
-    expect(matches.map((item) => item.id)).toEqual(["c1"]);
+    expect(matches.map((item: any) => item.id)).toEqual(["c1"]);
   });
 
   it("dedupes backend and local fallback results while preserving freshest metadata", () => {
     const merged = mergeConversationSearchItems(
-      [{ id: "c1", title: "Surf E2E Final 20260402T192754Z", snippet: "FILE_READY", update_time: "2026-04-02T19:34:00.000Z" }],
+      [
+        {
+          id: "c1",
+          title: "Surf E2E Final 20260402T192754Z",
+          snippet: "FILE_READY",
+          update_time: "2026-04-02T19:34:00.000Z",
+        },
+      ],
       [{ id: "c1", title: "FILE_READY", snippet: null, update_time: "2026-04-02T19:28:00.000Z" }],
       [{ id: "c2", title: "Another", update_time: "2026-04-02T19:20:00.000Z" }],
     );
 
-    expect(merged.map((item) => item.id)).toEqual(["c1", "c2"]);
+    expect(merged.map((item: any) => item.id)).toEqual(["c1", "c2"]);
     expect(merged[0].title).toBe("Surf E2E Final 20260402T192754Z");
     expect(merged[0].snippet).toBe("FILE_READY");
   });

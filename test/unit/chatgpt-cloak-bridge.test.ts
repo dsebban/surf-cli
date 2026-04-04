@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 function createWorker() {
   const worker = new EventEmitter() as any;
@@ -26,13 +26,17 @@ describe("chatgpt-cloak-bridge", () => {
 
     const promise = bridge.queryWithCloakBrowser({ query: "hello", timeout: 5 });
 
-    expect(worker.stdin.write).toHaveBeenCalledWith(
-      expect.stringContaining('"type":"query"')
-    );
+    expect(worker.stdin.write).toHaveBeenCalledWith(expect.stringContaining('"type":"query"'));
 
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "success", response: "hi", model: "gpt-5.3", tookMs: 1234, backend: "cloak" }) + "\n"
+      `${JSON.stringify({
+        type: "success",
+        response: "hi",
+        model: "gpt-5.3",
+        tookMs: 1234,
+        backend: "cloak",
+      })}\n`,
     );
 
     await expect(promise).resolves.toEqual({
@@ -54,15 +58,24 @@ describe("chatgpt-cloak-bridge", () => {
     bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
     const progress = vi.fn();
 
-    const promise = bridge.manageChatsWithCloakBrowser({ action: "list", limit: 2, timeout: 5 }, progress);
+    const promise = bridge.manageChatsWithCloakBrowser(
+      { action: "list", limit: 2, timeout: 5 },
+      progress,
+    );
 
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "progress", step: 1, total: 4, message: "Loading" }) + "\n"
+      `${JSON.stringify({ type: "progress", step: 1, total: 4, message: "Loading" })}\n`,
     );
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "success", action: "list", items: [{ id: "c1" }], total: 1, backend: "cloak" }) + "\n"
+      `${JSON.stringify({
+        type: "success",
+        action: "list",
+        items: [{ id: "c1" }],
+        total: 1,
+        backend: "cloak",
+      })}\n`,
     );
 
     await expect(promise).resolves.toEqual({
@@ -71,7 +84,12 @@ describe("chatgpt-cloak-bridge", () => {
       total: 1,
       backend: "cloak",
     });
-    expect(progress).toHaveBeenCalledWith({ type: "progress", step: 1, total: 4, message: "Loading" });
+    expect(progress).toHaveBeenCalledWith({
+      type: "progress",
+      step: 1,
+      total: 4,
+      message: "Loading",
+    });
     bridge.__resetBridgeRuntimeForTests();
   });
 
@@ -81,10 +99,19 @@ describe("chatgpt-cloak-bridge", () => {
     const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
     bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
 
-    const promise = bridge.manageChatsWithCloakBrowser({ action: "get", conversationId: "bad", timeout: 5 });
+    const promise = bridge.manageChatsWithCloakBrowser({
+      action: "get",
+      conversationId: "bad",
+      timeout: 5,
+    });
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "error", code: "conversation_not_found", message: "Missing", details: { status: 404 } }) + "\n"
+      `${JSON.stringify({
+        type: "error",
+        code: "conversation_not_found",
+        message: "Missing",
+        details: { status: 404 },
+      })}\n`,
     );
 
     await expect(promise).rejects.toMatchObject({
@@ -111,7 +138,14 @@ describe("chatgpt-cloak-bridge", () => {
     };
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "success", response: "answer", model: "gpt-5-4-thinking", tookMs: 15000, backend: "cloak", thinkingTrace: trace }) + "\n"
+      `${JSON.stringify({
+        type: "success",
+        response: "answer",
+        model: "gpt-5-4-thinking",
+        tookMs: 15000,
+        backend: "cloak",
+        thinkingTrace: trace,
+      })}\n`,
     );
 
     await expect(promise).resolves.toEqual({
@@ -137,7 +171,13 @@ describe("chatgpt-cloak-bridge", () => {
 
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "success", response: "hi", model: "gpt-5.3", tookMs: 500, backend: "cloak" }) + "\n"
+      `${JSON.stringify({
+        type: "success",
+        response: "hi",
+        model: "gpt-5.3",
+        tookMs: 500,
+        backend: "cloak",
+      })}\n`,
     );
 
     const result = await promise;
@@ -157,7 +197,7 @@ describe("chatgpt-cloak-bridge", () => {
 
     worker.stdout.emit(
       "data",
-      JSON.stringify({
+      `${JSON.stringify({
         type: "trace",
         traceType: "thinking_text",
         phase: "Thinking",
@@ -166,12 +206,13 @@ describe("chatgpt-cloak-bridge", () => {
         thoughtDelta: "Plan\nFirst, inspect the inputs.",
         thoughtCount: 1,
         durationSec: 4,
-      }) + "\n"
+      })}\n`,
     );
 
     worker.stdout.emit(
       "data",
-      JSON.stringify({ type: "success", response: "done", model: "gpt-5-4-pro", tookMs: 1000 }) + "\n"
+      JSON.stringify({ type: "success", response: "done", model: "gpt-5-4-pro", tookMs: 1000 }) +
+        "\n",
     );
 
     await promise;
@@ -186,7 +227,7 @@ describe("chatgpt-cloak-bridge", () => {
         thoughtDelta: "Plan\nFirst, inspect the inputs.",
         thoughtCount: 1,
         durationSec: 4,
-      })
+      }),
     );
 
     bridge.__resetBridgeRuntimeForTests();

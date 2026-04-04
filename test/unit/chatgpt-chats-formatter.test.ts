@@ -93,7 +93,12 @@ describe("chatgpt-chats-formatter", () => {
     const items = formatter.normalizeConversationItems({
       items: [
         { id: "b", title: "Older", create_time: "2025-03-30T11:05:00.000Z" },
-        { id: "a", title: "Newer", update_time: "2025-03-30T14:22:00.000Z", create_time: "2025-03-30T10:00:00.000Z" },
+        {
+          id: "a",
+          title: "Newer",
+          update_time: "2025-03-30T14:22:00.000Z",
+          create_time: "2025-03-30T10:00:00.000Z",
+        },
       ],
     });
 
@@ -161,7 +166,11 @@ describe("chatgpt-chats-formatter", () => {
   it("formats conversation list table", () => {
     const output = formatter.formatConversationList({
       items: [
-        { id: "abc1234567890", title: "Auth system design", update_time: "2025-03-30T14:22:00.000Z" },
+        {
+          id: "abc1234567890",
+          title: "Auth system design",
+          update_time: "2025-03-30T14:22:00.000Z",
+        },
       ],
       total: 1,
     });
@@ -172,7 +181,9 @@ describe("chatgpt-chats-formatter", () => {
   });
 
   it("returns empty-state list output", () => {
-    expect(formatter.formatConversationList({ items: [], total: 0 })).toBe("No conversations found.");
+    expect(formatter.formatConversationList({ items: [], total: 0 })).toBe(
+      "No conversations found.",
+    );
   });
 
   it("infers export format from explicit flag or extension", () => {

@@ -112,8 +112,7 @@ describe("cdp-stealth", () => {
           calls.push(method);
           if (method === "Browser.getVersion") {
             return {
-              userAgent:
-                "Mozilla/5.0 HeadlessChrome/146.0.0.0 Safari/537.36",
+              userAgent: "Mozilla/5.0 HeadlessChrome/146.0.0.0 Safari/537.36",
             };
           }
           return {};
@@ -171,9 +170,7 @@ describe("cdp-stealth", () => {
         }),
       };
 
-      await expect(stealth.applyCdpStealth(mockWv)).rejects.toThrow(
-        "CDP unsupported",
-      );
+      await expect(stealth.applyCdpStealth(mockWv)).rejects.toThrow("CDP unsupported");
     });
 
     it("returns correct metadata", async () => {

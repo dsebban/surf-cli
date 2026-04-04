@@ -162,7 +162,10 @@ describe("chatgpt-bun-bridge", () => {
 
       const fs = require("node:fs");
       const path = require("node:path");
-      const tmpWorker = path.join(require("node:os").tmpdir(), "surf-test-chatgpt-bad-json-worker.ts");
+      const tmpWorker = path.join(
+        require("node:os").tmpdir(),
+        "surf-test-chatgpt-bad-json-worker.ts",
+      );
       fs.writeFileSync(tmpWorker, 'process.stdout.write("NOT_JSON\\n");\n');
 
       const { spawn } = require("node:child_process");

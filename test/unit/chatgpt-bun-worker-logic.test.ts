@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildChatGptModelSelectionSpec,
   advanceTextStability,
-  createEmptyChatGptStreamState,
   applyChatGptFramePayload,
-  sanitizeChatGptAssistantText,
+  buildChatGptModelSelectionSpec,
   chooseBestText,
+  createEmptyChatGptStreamState,
+  sanitizeChatGptAssistantText,
 } from "../../native/chatgpt-bun-worker-logic";
 
 describe("chatgpt-bun-worker-logic", () => {
@@ -128,14 +128,23 @@ describe("chatgpt-bun-worker-logic", () => {
 
     it("accumulates delta v1 single ops across calls", () => {
       let s = createEmptyChatGptStreamState();
-      s = applyChatGptFramePayload(s, `data: {"o":"append","p":"/message/content/parts/0","v":"Hel"}`);
-      s = applyChatGptFramePayload(s, `data: {"o":"append","p":"/message/content/parts/0","v":"lo"}`);
+      s = applyChatGptFramePayload(
+        s,
+        `data: {"o":"append","p":"/message/content/parts/0","v":"Hel"}`,
+      );
+      s = applyChatGptFramePayload(
+        s,
+        `data: {"o":"append","p":"/message/content/parts/0","v":"lo"}`,
+      );
       expect(s.text).toBe("Hello");
     });
 
     it("parses delta v1 batch ops", () => {
       const payload = `data: {"v":[{"o":"append","p":"/message/content/parts/0","v":" world"},{"o":"replace","p":"/message/status","v":"finished_successfully"}]}`;
-      let s = applyChatGptFramePayload(createEmptyChatGptStreamState(), `data: {"o":"append","p":"/message/content/parts/0","v":"Hello"}`);
+      let s = applyChatGptFramePayload(
+        createEmptyChatGptStreamState(),
+        `data: {"o":"append","p":"/message/content/parts/0","v":"Hello"}`,
+      );
       s = applyChatGptFramePayload(s, payload);
       expect(s.text).toBe("Hello world");
       expect(s.done).toBe(true);
@@ -197,14 +206,23 @@ describe("chatgpt-bun-worker-logic", () => {
     });
 
     it("handles delta replace on parts (overwrite)", () => {
-      let s = applyChatGptFramePayload(createEmptyChatGptStreamState(), `data: {"o":"append","p":"/message/content/parts/0","v":"draft"}`);
-      s = applyChatGptFramePayload(s, `data: {"o":"replace","p":"/message/content/parts/0","v":"final"}`);
+      let s = applyChatGptFramePayload(
+        createEmptyChatGptStreamState(),
+        `data: {"o":"append","p":"/message/content/parts/0","v":"draft"}`,
+      );
+      s = applyChatGptFramePayload(
+        s,
+        `data: {"o":"replace","p":"/message/content/parts/0","v":"final"}`,
+      );
       expect(s.text).toBe("final");
     });
 
     it("is immutable — does not mutate input state", () => {
       const s0 = createEmptyChatGptStreamState();
-      const s1 = applyChatGptFramePayload(s0, `data: {"o":"append","p":"/message/content/parts/0","v":"test"}`);
+      const s1 = applyChatGptFramePayload(
+        s0,
+        `data: {"o":"append","p":"/message/content/parts/0","v":"test"}`,
+      );
       expect(s0.text).toBe("");
       expect(s0.parts).toEqual([]);
       expect(s1.text).toBe("test");
@@ -221,7 +239,9 @@ describe("chatgpt-bun-worker-logic", () => {
     });
 
     it("strips ChatGPT Instruments and Give feedback", () => {
-      expect(sanitizeChatGptAssistantText("ChatGPT Instruments\n\n2+2\n\nGive feedback")).toBe("2+2");
+      expect(sanitizeChatGptAssistantText("ChatGPT Instruments\n\n2+2\n\nGive feedback")).toBe(
+        "2+2",
+      );
     });
 
     it("strips multiple UI chrome lines", () => {
@@ -231,7 +251,9 @@ describe("chatgpt-bun-worker-logic", () => {
 
     it("preserves legitimate prose mentioning UI words", () => {
       const raw = "The give feedback button is useful\nCopy the text to clipboard";
-      expect(sanitizeChatGptAssistantText(raw)).toBe("The give feedback button is useful\nCopy the text to clipboard");
+      expect(sanitizeChatGptAssistantText(raw)).toBe(
+        "The give feedback button is useful\nCopy the text to clipboard",
+      );
     });
 
     it("returns empty for empty input", () => {
@@ -257,48 +279,58 @@ describe("chatgpt-bun-worker-logic", () => {
 
   describe("chooseBestText", () => {
     it("prefers DOM when finished and non-empty", () => {
-      expect(chooseBestText({
-        streamText: "stream",
-        domText: "dom",
-        streamDone: true,
-        domFinished: true,
-      })).toBe("dom");
+      expect(
+        chooseBestText({
+          streamText: "stream",
+          domText: "dom",
+          streamDone: true,
+          domFinished: true,
+        }),
+      ).toBe("dom");
     });
 
     it("prefers stream when DOM not finished", () => {
-      expect(chooseBestText({
-        streamText: "stream",
-        domText: "",
-        streamDone: false,
-        domFinished: false,
-      })).toBe("stream");
+      expect(
+        chooseBestText({
+          streamText: "stream",
+          domText: "",
+          streamDone: false,
+          domFinished: false,
+        }),
+      ).toBe("stream");
     });
 
     it("prefers stream when DOM finished but empty", () => {
-      expect(chooseBestText({
-        streamText: "stream",
-        domText: "",
-        streamDone: true,
-        domFinished: true,
-      })).toBe("stream");
+      expect(
+        chooseBestText({
+          streamText: "stream",
+          domText: "",
+          streamDone: true,
+          domFinished: true,
+        }),
+      ).toBe("stream");
     });
 
     it("returns DOM when stream empty", () => {
-      expect(chooseBestText({
-        streamText: "",
-        domText: "dom",
-        streamDone: false,
-        domFinished: false,
-      })).toBe("dom");
+      expect(
+        chooseBestText({
+          streamText: "",
+          domText: "dom",
+          streamDone: false,
+          domFinished: false,
+        }),
+      ).toBe("dom");
     });
 
     it("returns empty when both empty", () => {
-      expect(chooseBestText({
-        streamText: "",
-        domText: "",
-        streamDone: false,
-        domFinished: false,
-      })).toBe("");
+      expect(
+        chooseBestText({
+          streamText: "",
+          domText: "",
+          streamDone: false,
+          domFinished: false,
+        }),
+      ).toBe("");
     });
   });
 
