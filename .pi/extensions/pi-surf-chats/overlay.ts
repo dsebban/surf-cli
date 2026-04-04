@@ -171,10 +171,17 @@ export class SurfChatsOverlay implements Component, Focusable {
       return;
     }
 
-    // Escape: exit search mode or close overlay
+    // Escape: search → detail → close (three-tier)
     if (matchesKey(data, "escape")) {
       if (s.searchEditActive) {
         this.callbacks.onAction({ action: "load_list" });
+        return;
+      }
+      // If viewing a conversation detail, go back to list
+      if (s.loadedConversationId) {
+        s.loadedConversationId = null;
+        this.detailScrollOffset = 0;
+        this.tui.requestRender();
         return;
       }
       this.callbacks.onClose();
@@ -239,7 +246,7 @@ export class SurfChatsOverlay implements Component, Focusable {
     // ↓ / ↑ arrows → scroll detail when loaded, otherwise navigate list
     if (matchesKey(data, "down")) {
       const sel = s.items[s.selectedIndex];
-      if (sel && s.detailCache.has(sel.id)) {
+      if (sel && s.loadedConversationId === sel.id && s.detailCache.has(sel.id)) {
         const maxScroll = Math.max(0, this.detailTotalLines - this.detailViewHeight());
         this.detailScrollOffset = Math.min(this.detailScrollOffset + 3, maxScroll);
         this.tui.requestRender();
@@ -257,7 +264,7 @@ export class SurfChatsOverlay implements Component, Focusable {
     }
     if (matchesKey(data, "up")) {
       const sel = s.items[s.selectedIndex];
-      if (sel && s.detailCache.has(sel.id)) {
+      if (sel && s.loadedConversationId === sel.id && s.detailCache.has(sel.id)) {
         this.detailScrollOffset = Math.max(this.detailScrollOffset - 3, 0);
         this.tui.requestRender();
         return;
@@ -289,13 +296,22 @@ export class SurfChatsOverlay implements Component, Focusable {
 
       const cached = s.detailCache.get(selected.id);
       if (cached) {
-        this.callbacks.onAction({
-          action: "inject",
-          conversationId: selected.id,
-          markdown: cached.markdown,
-          title: cached.summary.title,
-        });
+        if (s.loadedConversationId === selected.id) {
+          // Already viewing detail → inject into context
+          this.callbacks.onAction({
+            action: "inject",
+            conversationId: selected.id,
+            markdown: cached.markdown,
+            title: cached.summary.title,
+          });
+        } else {
+          // Cached but not viewing → show detail (instant)
+          s.loadedConversationId = selected.id;
+          this.detailScrollOffset = 0;
+          this.tui.requestRender();
+        }
       } else {
+        // Not cached → load
         this.callbacks.onAction({ action: "load_detail", conversationId: selected.id });
       }
       return;
@@ -554,8 +570,8 @@ export class SurfChatsOverlay implements Component, Focusable {
       return lines;
     }
 
-    // Cached detail available
-    const cached = s.detailCache.get(selected.id);
+    // Cached detail available — only show when actively viewing (loadedConversationId)
+    const cached = s.loadedConversationId === selected.id ? s.detailCache.get(selected.id) : null;
     if (cached) {
       lines.push(th.fg("accent", ` ${truncateVisible(cached.summary.title, Math.max(1, width - 1))}`));
       const meta = [
