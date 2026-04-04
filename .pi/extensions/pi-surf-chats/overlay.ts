@@ -8,7 +8,7 @@
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type TUI, type Component, type Focusable } from "@mariozechner/pi-tui";
-import type { ControllerState, ConversationItem, DetailRecord, SurfChatsError } from "./types.js";
+import type { ControllerState } from "./types.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -36,14 +36,53 @@ function formatRelativeTime(value: unknown): string {
   return `${Math.floor(day / 7)}w`;
 }
 
-function pad(text: string, width: number): string {
+function padEndVisible(text: string, width: number): string {
   const w = visibleWidth(text);
-  return w >= width ? text : text + " ".repeat(width - w);
+  return w >= width ? truncateToWidth(text, width) : text + " ".repeat(width - w);
 }
 
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return max <= 1 ? text.slice(0, max) : text.slice(0, max - 1) + "…";
+function padStartVisible(text: string, width: number): string {
+  const w = visibleWidth(text);
+  return w >= width ? truncateToWidth(text, width) : " ".repeat(width - w) + text;
+}
+
+function truncateVisible(text: string, max: number): string {
+  return max <= 0 ? "" : truncateToWidth(text, max);
+}
+
+function compactPath(value: string | null, max: number): string {
+  if (!value) return "not found";
+  if (visibleWidth(value) <= max) return value;
+  const parts = value.split("/").filter(Boolean);
+  if (parts.length <= 2) return truncateToWidth(value, max);
+  const compact = `…/${parts.slice(-2).join("/")}`;
+  return truncateToWidth(compact, max);
+}
+
+function wrapText(text: string, width: number): string[] {
+  if (width <= 0) return [""];
+  if (!text) return [""];
+
+  const out: string[] = [];
+  for (const rawLine of text.split("\n")) {
+    if (!rawLine) {
+      out.push("");
+      continue;
+    }
+
+    let line = "";
+    for (const ch of Array.from(rawLine)) {
+      const candidate = line + ch;
+      if (visibleWidth(candidate) <= width) {
+        line = candidate;
+      } else {
+        out.push(line);
+        line = ch;
+      }
+    }
+    out.push(line);
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,11 +93,13 @@ export type OverlayAction =
   | { action: "inject"; conversationId: string; markdown: string; title: string }
   | { action: "export"; conversationId: string; title: string }
   | { action: "load_list" }
+  | { action: "load_more" }
   | { action: "search"; query: string }
   | { action: "load_detail"; conversationId: string };
 
 export interface OverlayCallbacks {
   onAction: (action: OverlayAction) => void;
+  onClose: () => void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,7 +156,8 @@ export class SurfChatsOverlay implements Component, Focusable {
         this.callbacks.onAction({ action: "load_list" }); // exit search, reload recent
         return;
       }
-      this.done(); // close overlay directly
+      this.callbacks.onClose();
+      this.done();
       return;
     }
 
@@ -155,29 +197,70 @@ export class SurfChatsOverlay implements Component, Focusable {
       return;
     }
 
-    // j/k or ↑↓ → navigate list
-    if (data === "j" || matchesKey(data, "down")) {
+    // j / k → always navigate list; trigger load_more at end
+    if (data === "j") {
+      if (s.items.length === 0) return;
+      if (s.selectedIndex === s.items.length - 1 && s.hasMore && s.phase === "idle") {
+        this.callbacks.onAction({ action: "load_more" });
+        return;
+      }
       s.selectedIndex = Math.min(s.selectedIndex + 1, s.items.length - 1);
       this.detailScrollOffset = 0;
       this.tui.requestRender();
       return;
     }
-    if (data === "k" || matchesKey(data, "up")) {
-      s.selectedIndex = Math.max(s.selectedIndex - 1, 0);
+    if (data === "k") {
+      if (s.items.length === 0) return;
+      s.selectedIndex = Math.max(0, s.selectedIndex - 1);
       this.detailScrollOffset = 0;
       this.tui.requestRender();
       return;
     }
 
-    // PgUp/PgDn → scroll detail pane
+    // ↓ / ↑ arrows → scroll detail when loaded, otherwise navigate list
+    if (matchesKey(data, "down")) {
+      const sel = s.items[s.selectedIndex];
+      if (sel && s.detailCache.has(sel.id)) {
+        const maxScroll = Math.max(0, this.detailTotalLines - this.detailViewHeight());
+        this.detailScrollOffset = Math.min(this.detailScrollOffset + 3, maxScroll);
+        this.tui.requestRender();
+        return;
+      }
+      // No detail loaded — fall back to list navigation
+      if (s.items.length === 0) return;
+      if (s.selectedIndex === s.items.length - 1 && s.hasMore && s.phase === "idle") {
+        this.callbacks.onAction({ action: "load_more" });
+        return;
+      }
+      s.selectedIndex = Math.min(s.selectedIndex + 1, s.items.length - 1);
+      this.detailScrollOffset = 0;
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, "up")) {
+      const sel = s.items[s.selectedIndex];
+      if (sel && s.detailCache.has(sel.id)) {
+        this.detailScrollOffset = Math.max(this.detailScrollOffset - 3, 0);
+        this.tui.requestRender();
+        return;
+      }
+      // No detail loaded — fall back to list navigation
+      if (s.items.length === 0) return;
+      s.selectedIndex = Math.max(0, s.selectedIndex - 1);
+      this.detailScrollOffset = 0;
+      this.tui.requestRender();
+      return;
+    }
+
+    // PgUp/PgDn / J/K → scroll detail pane (larger jumps)
     if (matchesKey(data, "pageDown") || data === "J") {
       const maxScroll = Math.max(0, this.detailTotalLines - this.detailViewHeight());
-      this.detailScrollOffset = Math.min(this.detailScrollOffset + 5, maxScroll);
+      this.detailScrollOffset = Math.min(this.detailScrollOffset + 10, maxScroll);
       this.tui.requestRender();
       return;
     }
     if (matchesKey(data, "pageUp") || data === "K") {
-      this.detailScrollOffset = Math.max(this.detailScrollOffset - 5, 0);
+      this.detailScrollOffset = Math.max(this.detailScrollOffset - 10, 0);
       this.tui.requestRender();
       return;
     }
@@ -226,23 +309,22 @@ export class SurfChatsOverlay implements Component, Focusable {
 
   render(width: number): string[] {
     const th = this.theme;
-    const innerW = Math.max(20, width - 2);
+    if (width <= 0) return [];
+    if (width < 8) return [truncateToWidth("surf", width)];
+
+    const innerW = Math.max(1, width - 2);
     const border = (s: string) => th.fg("borderMuted", s);
 
     const lines: string[] = [];
 
     // ── Title bar ──
-    const titleText = " 🏄 Surf Chats ";
+    const titleText = th.fg("accent", " 🏄 Surf Chats ");
     const modeText = this.state.mode === "search"
       ? th.fg("warning", ` Search: "${this.state.activeQuery}" `)
       : th.fg("dim", " Recent ");
-    const titleLen = visibleWidth(titleText) + visibleWidth(modeText);
-    const titlePad = Math.max(0, innerW - titleLen);
     lines.push(
       border("┌") +
-      th.fg("accent", titleText) +
-      modeText +
-      border("─".repeat(titlePad)) +
+      truncateToWidth(padEndVisible(titleText + modeText, innerW), innerW) +
       border("┐")
     );
 
@@ -279,23 +361,30 @@ export class SurfChatsOverlay implements Component, Focusable {
 
     const maxRows = Math.max(leftLines.length, visibleRight.length, availableRows);
     for (let i = 0; i < Math.min(maxRows, availableRows); i++) {
-      const left = pad(leftLines[i] ?? "", leftW);
+      const left = padEndVisible(leftLines[i] ?? "", leftW);
       const right = visibleRight[i] ?? "";
       lines.push(
         border("│") +
         truncateToWidth(left, leftW) +
         sep +
-        truncateToWidth(pad(right, rightW), rightW) +
+        truncateToWidth(padEndVisible(right, rightW), rightW) +
         border("│")
       );
     }
 
-    // ── Footer hints ──
+    // ── Footer hints + debug ──
+    const moreHint = !this.state.searchEditActive && this.state.hasMore ? " • j/↓ more" : "";
     const hints = this.state.searchEditActive
       ? "Enter submit • Esc cancel"
-      : "j/k move • Enter open/inject • / search • e export • r refresh • Esc close";
+      : `j/k list • ↑↓ scroll detail • Enter inject • / search • e export • r refresh • Esc close${moreHint}`;
+    const debugCli = ` CLI: ${compactPath(this.state.resolvedCliPath, Math.max(8, innerW - 6))}`;
+    const debugFmt = ` Formatter: ${compactPath(this.state.resolvedFormatterPath, Math.max(8, innerW - 12))}`;
+    const debugProfile = ` Profile: ${this.state.resolvedProfile ?? "none"}`;
     lines.push(border("├") + border("─".repeat(innerW)) + border("┤"));
     lines.push(this.frameLine(th.fg("dim", ` ${hints}`), innerW, border));
+    lines.push(this.frameLine(th.fg("muted", debugCli), innerW, border));
+    lines.push(this.frameLine(th.fg("muted", debugFmt), innerW, border));
+    lines.push(this.frameLine(th.fg("muted", debugProfile), innerW, border));
 
     // ── Export notification ──
     if (this.state.lastExportPath) {
@@ -319,14 +408,14 @@ export class SurfChatsOverlay implements Component, Focusable {
   // ─── Private renderers ────────────────────────────────────────────────────
 
   private frameLine(content: string, innerW: number, border: (s: string) => string): string {
-    return border("│") + truncateToWidth(pad(content, innerW), innerW) + border("│");
+    return border("│") + truncateToWidth(padEndVisible(content, innerW), innerW) + border("│");
   }
 
   private availableRows(headerLines: number): number {
     const termRows = this.tui.terminal.rows || 24;
     const maxOverlay = Math.floor(termRows * 0.7);
-    // Reserve: header lines already rendered + footer (3 lines) + border (1)
-    return Math.max(5, maxOverlay - headerLines - 4);
+    // Reserve: header lines already rendered + footer/debug (6 lines) + border (1)
+    return Math.max(5, maxOverlay - headerLines - 7);
   }
 
   private detailViewHeight(): number {
@@ -344,25 +433,37 @@ export class SurfChatsOverlay implements Component, Focusable {
     }
     if (s.items.length === 0) return lines;
 
-    // Column widths
-    const timeW = 5;
-    const idW = 0; // skip ID in compact view
-    const titleW = Math.max(10, width - timeW - 3);
+    // Scroll list so selected item is always visible
+    const listViewH = this.availableRows(3);
+    const listScrollOffset = Math.max(0, s.selectedIndex - listViewH + 3);
+    const visibleItems = s.items.slice(listScrollOffset, listScrollOffset + listViewH);
 
-    for (let i = 0; i < s.items.length; i++) {
-      const item = s.items[i]!;
+    // Column widths
+    const timeW = Math.min(5, Math.max(3, Math.floor(width * 0.22)));
+    const titleW = Math.max(1, width - timeW - 2);
+
+    for (let vi = 0; vi < visibleItems.length; vi++) {
+      const i = listScrollOffset + vi;
+      const item = visibleItems[vi]!;
       const isSelected = i === s.selectedIndex;
       const isCached = s.detailCache.has(item.id);
       const prefix = isSelected ? th.fg("accent", "→") : " ";
       const time = formatRelativeTime(item.update_time);
-      const title = truncate(item.title, titleW);
+      const title = truncateVisible(item.title, titleW);
       const cachedMark = isCached ? th.fg("success", "•") : " ";
 
       const line = `${prefix}${cachedMark}` +
-        th.fg(isSelected ? "accent" : "text", title.padEnd(titleW)) +
-        th.fg("dim", time.padStart(timeW));
+        th.fg(isSelected ? "accent" : "text", padEndVisible(title, titleW)) +
+        th.fg("dim", padStartVisible(time, timeW));
 
       lines.push(truncateToWidth(line, width));
+    }
+
+    // Load-more hint at the bottom when more pages available
+    if (s.hasMore && s.phase === "idle") {
+      lines.push(th.fg("dim", truncateToWidth(" ↓ more (press j)", width)));
+    } else if (s.phase === "loading_list") {
+      lines.push(th.fg("warning", truncateToWidth(" ⟳ loading…", width)));
     }
 
     return lines;
@@ -402,31 +503,30 @@ export class SurfChatsOverlay implements Component, Focusable {
     const cached = s.detailCache.get(selected.id);
     if (cached) {
       // Header
-      lines.push(th.fg("accent", ` ${cached.summary.title}`));
+      lines.push(th.fg("accent", ` ${truncateVisible(cached.summary.title, Math.max(1, width - 1))}`));
       const meta = [
         cached.summary.model,
         `${cached.summary.totalMessages} msgs`,
       ].filter(Boolean).join(" · ");
-      lines.push(th.fg("dim", ` ${meta}`));
-      lines.push(th.fg("borderMuted", " " + "─".repeat(width - 2)));
+      lines.push(th.fg("dim", ` ${truncateVisible(meta, Math.max(1, width - 1))}`));
+      lines.push(th.fg("borderMuted", " " + "─".repeat(Math.max(0, width - 2))));
 
-      // Messages
-      for (const msg of cached.summary.messages) {
-        const who = msg.role === "user" ? th.fg("accent", "You") : th.fg("text", "ChatGPT");
+      if (cached.summary.messages.length === 0) {
+        const maxTextW = Math.max(1, width - 2);
         lines.push("");
-        lines.push(` ${who}`);
+        lines.push(th.fg("dim", " Markdown preview"));
+        for (const tl of wrapText(cached.markdown, maxTextW).slice(0, 80)) {
+          lines.push(th.fg("dim", ` ${truncateToWidth(tl, maxTextW)}`));
+        }
+      } else {
+        for (const msg of cached.summary.messages) {
+          const who = msg.role === "user" ? th.fg("accent", "You") : th.fg("text", "ChatGPT");
+          lines.push("");
+          lines.push(` ${who}`);
 
-        // Wrap message text
-        const maxTextW = width - 2;
-        const textLines = msg.text.split("\n");
-        for (const tl of textLines) {
-          if (tl.length <= maxTextW) {
-            lines.push(th.fg("dim", ` ${tl}`));
-          } else {
-            // Simple word wrap
-            for (let pos = 0; pos < tl.length; pos += maxTextW) {
-              lines.push(th.fg("dim", ` ${tl.slice(pos, pos + maxTextW)}`));
-            }
+          const maxTextW = Math.max(1, width - 2);
+          for (const tl of wrapText(msg.text, maxTextW)) {
+            lines.push(th.fg("dim", ` ${truncateToWidth(tl, maxTextW)}`));
           }
         }
       }
@@ -437,7 +537,7 @@ export class SurfChatsOverlay implements Component, Focusable {
     }
 
     // Not loaded yet
-    lines.push(th.fg("text", ` ${selected.title}`));
+    lines.push(th.fg("text", ` ${truncateVisible(selected.title, Math.max(1, width - 1))}`));
     lines.push(th.fg("dim", ` ID: ${selected.id}`));
     lines.push(th.fg("dim", ` Updated: ${formatRelativeTime(selected.update_time)}`));
     lines.push("");

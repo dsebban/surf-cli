@@ -77,4 +77,19 @@ export interface ControllerState {
   lastError: SurfChatsError | null;
   lastExportPath: string | null;
   searchEditActive: boolean;
+  resolvedCliPath: string | null;
+  resolvedFormatterPath: string | null;
+  resolvedProfile: string | null;
+  /** Current fetch limit; grows as user loads more */
+  currentLimit: number;
+  /** True when items.length === currentLimit (more may be available) */
+  hasMore: boolean;
+}
+
+/** Cached list result (for instant display on re-open) */
+export interface ListCacheEntry {
+  mode: "recent" | "search";
+  query: string;
+  items: ConversationItem[];
+  loadedAt: number;
 }

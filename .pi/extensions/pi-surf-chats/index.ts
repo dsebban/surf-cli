@@ -16,7 +16,16 @@ import os from "node:os";
 import fs from "node:fs";
 import { SurfChatsClient } from "./surf-client.js";
 import { SurfChatsOverlay, type OverlayAction } from "./overlay.js";
-import type { ControllerState, SurfChatsError } from "./types.js";
+import type { ControllerState, DetailRecord, ListCacheEntry, SurfChatsError } from "./types.js";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Module-level persistent cache (survives overlay close/reopen within pi session)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const persistentDetailCache = new Map<string, DetailRecord>();
+let persistentListCache: ListCacheEntry | null = null;
+
+const LIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min before a stale list triggers visible refresh
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Export path helpers
@@ -63,20 +72,32 @@ function buildExportPath(title: string, conversationId: string): string {
 // Controller
 // ─────────────────────────────────────────────────────────────────────────────
 
+const INITIAL_LIMIT = 30;
+const PAGE_SIZE = 30;
+
 function createInitialState(): ControllerState {
+  // Hydrate from persistent caches for instant display
+  const cachedItems = persistentListCache?.mode === "recent" ? persistentListCache.items : [];
+  const hasCache = cachedItems.length > 0;
+
   return {
     mode: "recent",
     searchDraft: "",
     activeQuery: "",
-    items: [],
+    items: cachedItems,
     selectedIndex: 0,
-    detailCache: new Map(),
-    phase: "idle",
-    statusMessage: "",
+    detailCache: persistentDetailCache, // shared reference — survives across sessions
+    phase: hasCache ? "idle" : "loading_list",
+    statusMessage: hasCache ? "" : "Loading recent conversations…",
     loadedConversationId: null,
     lastError: null,
     lastExportPath: null,
     searchEditActive: false,
+    resolvedCliPath: null,
+    resolvedFormatterPath: null,
+    resolvedProfile: null,
+    currentLimit: INITIAL_LIMIT,
+    hasMore: cachedItems.length >= INITIAL_LIMIT,
   };
 }
 
@@ -93,68 +114,131 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
 
     const client = new SurfChatsClient(pi, ctx.cwd);
     const state = createInitialState();
+    const resolved = client.getResolvedPaths();
+    state.resolvedCliPath = resolved.cliPath;
+    state.resolvedFormatterPath = resolved.formatterPath;
+    state.resolvedProfile = resolved.profile;
 
-    // Kick off initial load
-    state.phase = "loading_list";
-    state.statusMessage = "Loading recent conversations…";
+    // Initial load (background if we already have cached items, visible otherwise)
 
     let overlay: SurfChatsOverlay | null = null;
     let requestId = 0;
+    let closed = false;
+    let activeAbort: AbortController | null = null;
 
     // Action handler — bridges overlay events to async operations
     async function handleAction(action: OverlayAction, done: (result?: string) => void): Promise<void> {
+      if (closed) return;
+      activeAbort?.abort();
+      const abort = new AbortController();
+      activeAbort = abort;
       const myRequestId = ++requestId;
+      const isStale = () => closed || requestId !== myRequestId || abort.signal.aborted;
 
       switch (action.action) {
-        case "load_list":
-          state.phase = "loading_list";
-          state.statusMessage = "Loading recent conversations…";
+        case "load_list": {
+          const hasCachedItems = state.items.length > 0;
+          const cacheAge = persistentListCache ? Date.now() - persistentListCache.loadedAt : Infinity;
+          const silentRefresh = hasCachedItems && cacheAge < LIST_CACHE_TTL_MS;
+
+          if (!silentRefresh) {
+            state.phase = "loading_list";
+            state.statusMessage = "Loading recent conversations…";
+          } else {
+            state.statusMessage = "Refreshing…";
+          }
           state.searchEditActive = false;
           state.mode = "recent";
           state.activeQuery = "";
           state.lastError = null;
+          state.currentLimit = INITIAL_LIMIT;
           overlay?.updateState(state);
 
           try {
-            const result = await client.listRecent({ limit: 30 });
-            if (requestId !== myRequestId) return; // stale
+            const result = await client.listRecent({ limit: INITIAL_LIMIT, signal: abort.signal });
+            if (isStale()) return;
             state.items = result.items;
             state.selectedIndex = 0;
             state.phase = "idle";
             state.statusMessage = "";
+            state.hasMore = result.items.length >= INITIAL_LIMIT;
+            persistentListCache = { mode: "recent", query: "", items: result.items, loadedAt: Date.now() };
           } catch (err) {
-            if (requestId !== myRequestId) return;
-            state.phase = "error";
-            state.lastError = err as SurfChatsError;
-            state.statusMessage = (err as SurfChatsError).message ?? "Failed to load conversations";
+            if (isStale()) return;
+            // Keep existing items visible on background-refresh failure
+            if (hasCachedItems) {
+              state.phase = "idle";
+              state.statusMessage = "";
+            } else {
+              state.phase = "error";
+              state.lastError = err as SurfChatsError;
+              state.statusMessage = (err as SurfChatsError).message ?? "Failed to load conversations";
+            }
           }
-          overlay?.updateState(state);
+          if (!closed) overlay?.updateState(state);
           break;
+        }
 
-        case "search":
+        case "search": {
           state.phase = "searching";
           state.statusMessage = `Searching "${action.query}"…`;
           state.mode = "search";
           state.activeQuery = action.query;
           state.searchEditActive = false;
           state.lastError = null;
+          state.currentLimit = INITIAL_LIMIT;
           overlay?.updateState(state);
 
           try {
-            const result = await client.search({ query: action.query, limit: 30 });
-            if (requestId !== myRequestId) return;
+            const result = await client.search({ query: action.query, limit: INITIAL_LIMIT, signal: abort.signal });
+            if (isStale()) return;
             state.items = result.items;
             state.selectedIndex = 0;
             state.phase = "idle";
             state.statusMessage = result.partial ? `Partial results (${result.fallbackScanned}/${result.fallbackTotal} scanned)` : "";
+            state.hasMore = result.items.length >= INITIAL_LIMIT;
           } catch (err) {
-            if (requestId !== myRequestId) return;
+            if (isStale()) return;
             state.phase = "error";
             state.lastError = err as SurfChatsError;
             state.statusMessage = (err as SurfChatsError).message ?? "Search failed";
           }
-          overlay?.updateState(state);
+          if (!closed) overlay?.updateState(state);
           break;
+        }
+
+        case "load_more": {
+          if (state.mode === "search") break; // no pagination for search results
+          const prevItems = state.items;
+          const newLimit = state.currentLimit + PAGE_SIZE;
+          state.phase = "loading_list";
+          state.statusMessage = `Loading more… (${newLimit} total)`;
+          overlay?.updateState(state);
+
+          try {
+            const result = await client.listRecent({ limit: newLimit, signal: abort.signal });
+            if (isStale()) return;
+            const prevLen = prevItems.length;
+            state.items = result.items;
+            state.currentLimit = newLimit;
+            state.hasMore = result.items.length >= newLimit;
+            // Advance cursor to first new item
+            if (result.items.length > prevLen) {
+              state.selectedIndex = prevLen;
+            }
+            state.phase = "idle";
+            state.statusMessage = "";
+            persistentListCache = { mode: "recent", query: "", items: result.items, loadedAt: Date.now() };
+          } catch (err) {
+            if (isStale()) return;
+            state.items = prevItems; // restore on failure
+            state.phase = "error";
+            state.lastError = err as SurfChatsError;
+            state.statusMessage = (err as SurfChatsError).message ?? "Failed to load more";
+          }
+          if (!closed) overlay?.updateState(state);
+          break;
+        }
 
         case "load_detail": {
           state.phase = "loading_detail";
@@ -164,19 +248,20 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
           overlay?.updateState(state);
 
           try {
-            const detail = await client.getConversation(action.conversationId);
-            if (requestId !== myRequestId) return;
+            const detail = await client.getConversation(action.conversationId, abort.signal);
+            if (isStale()) return;
             state.detailCache.set(action.conversationId, detail);
+            // persistentDetailCache is the same Map reference — already updated
             state.phase = "idle";
             state.statusMessage = "";
           } catch (err) {
-            if (requestId !== myRequestId) return;
+            if (isStale()) return;
             state.phase = "error";
             state.lastError = err as SurfChatsError;
             state.statusMessage = (err as SurfChatsError).message ?? "Failed to load conversation";
             state.loadedConversationId = null;
           }
-          overlay?.updateState(state);
+          if (!closed) overlay?.updateState(state);
           break;
         }
 
@@ -199,6 +284,11 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
           if (ctx.hasUI) {
             ctx.ui.notify(`Injected: ${action.title}`, "info");
           }
+          closed = true;
+          requestId += 1;
+          activeAbort?.abort();
+          activeAbort = null;
+          overlay = null;
           done("injected");
           break;
         }
@@ -221,20 +311,20 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
               state.lastExportPath = exportPath;
             } else {
               // Use surf CLI to export
-              const result = await client.exportConversation(action.conversationId, exportPath);
-              if (requestId !== myRequestId) return;
+              const result = await client.exportConversation(action.conversationId, exportPath, abort.signal);
+              if (isStale()) return;
               state.lastExportPath = result;
             }
 
             state.phase = "idle";
             state.statusMessage = "";
           } catch (err) {
-            if (requestId !== myRequestId) return;
+            if (isStale()) return;
             state.phase = "error";
             state.lastError = err as SurfChatsError;
             state.statusMessage = (err as SurfChatsError).message ?? "Export failed";
           }
-          overlay?.updateState(state);
+          if (!closed) overlay?.updateState(state);
           break;
         }
       }
@@ -243,7 +333,16 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
     // Open the overlay
     await ctx.ui.custom<string | undefined>(
       (tui, theme, _keybindings, done) => {
+        const closeOverlay = () => {
+          closed = true;
+          requestId += 1;
+          activeAbort?.abort();
+          activeAbort = null;
+          overlay = null;
+        };
+
         const handleError = (err: unknown) => {
+          if (closed) return;
           state.phase = "error";
           state.lastError = {
             code: "command_failed",
@@ -262,10 +361,11 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
             onAction: (action) => {
               handleAction(action, done).catch(handleError);
             },
+            onClose: closeOverlay,
           },
         });
 
-        // Trigger initial load after overlay is constructed
+        // Trigger initial list load (silent if cached, visible if first open)
         handleAction({ action: "load_list" }, done).catch(handleError);
 
         return overlay;

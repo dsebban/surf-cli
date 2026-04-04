@@ -6,7 +6,10 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { ConversationItem, ConversationSummary, DetailRecord, ListResult, SurfChatsError } from "./types.js";
 
 // Formatter reuse: resolve relative to surf-cli repo root
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
 let formatter: {
@@ -14,22 +17,43 @@ let formatter: {
   summarizeConversation: (conv: unknown, opts?: { messageLimit?: number }) => ConversationSummary;
   formatConversationMarkdown: (opts: { conversation: unknown; messageLimit?: number }) => string;
 } | null = null;
+let resolvedFormatterPath: string | null = null;
 
-function loadFormatter(cwd: string): typeof formatter {
-  if (formatter) return formatter;
+function getRepoRootFromExtension(): string {
+  const extensionDir = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(extensionDir, "../../..");
+}
+
+function resolveLocalCliPath(): string | null {
+  const require = createRequire(import.meta.url);
+  const repoRoot = getRepoRootFromExtension();
+  const repoCli = path.join(repoRoot, "native/cli.cjs");
+  if (fs.existsSync(repoCli)) return repoCli;
+
   try {
-    // Try loading from the surf-cli native directory
-    const require = createRequire(import.meta.url);
-    const formatterPath = path.resolve(cwd, "native/chatgpt-chats-formatter.cjs");
-    formatter = require(formatterPath);
+    return require.resolve("surf-cli/native/cli.cjs");
+  } catch {
+    return null;
+  }
+}
+
+function loadFormatter(): typeof formatter {
+  if (formatter) return formatter;
+  const require = createRequire(import.meta.url);
+
+  try {
+    resolvedFormatterPath = require.resolve("surf-cli/native/chatgpt-chats-formatter.cjs");
+    formatter = require(resolvedFormatterPath);
     return formatter;
   } catch {
-    // Fallback: try global surf install
     try {
-      const require = createRequire(import.meta.url);
-      formatter = require("surf-cli/native/chatgpt-chats-formatter.cjs");
+      const repoRoot = getRepoRootFromExtension();
+      const formatterPath = path.join(repoRoot, "native/chatgpt-chats-formatter.cjs");
+      resolvedFormatterPath = formatterPath;
+      formatter = require(formatterPath);
       return formatter;
     } catch {
+      resolvedFormatterPath = null;
       return null;
     }
   }
@@ -55,6 +79,8 @@ function fallbackNormalize(raw: unknown): ConversationItem[] {
 }
 
 const DEFAULT_TIMEOUT = 120_000; // 120s
+const DEFAULT_CHATGPT_PROFILE = process.platform === "darwin" ? "dsebban883@gmail.com" : null;
+const DEBUG_DIR = path.join(os.tmpdir(), "pi-surf-chats-debug");
 
 function classifyError(code: number, stdout: string, stderr: string): SurfChatsError {
   const combined = `${stderr}\n${stdout}`.toLowerCase();
@@ -62,92 +88,236 @@ function classifyError(code: number, stdout: string, stderr: string): SurfChatsE
   if (combined.includes("command not found") || combined.includes("not found: surf") || combined.includes("enoent")) {
     return { code: "surf_missing", message: "surf CLI not found. Install: npm i -g surf-cli" };
   }
-  if (combined.includes("unknown tool") || combined.includes("cloak")) {
-    return { code: "setup", message: "Cloak mode required. Set SURF_USE_CLOAK_CHATGPT=1" };
-  }
   if (combined.includes("login_required") || combined.includes("log in") || combined.includes("401")) {
     return { code: "auth", message: "ChatGPT login required. Run: surf chatgpt.chats --continue" };
   }
   if (combined.includes("timeout") || combined.includes("timed out")) {
     return { code: "timeout", message: "Request timed out" };
   }
+  if (combined.includes("cloakbrowser not installed") || combined.includes("npm install -g cloakbrowser")) {
+    return { code: "setup", message: "CloakBrowser not installed. Run: npm install -g cloakbrowser" };
+  }
   if (combined.includes("processsingleton") || combined.includes("profile directory")) {
     return { code: "setup", message: "CloakBrowser profile locked. Close other surf instances first." };
+  }
+  if (combined.includes("unknown tool: chatgpt.chats")) {
+    return { code: "setup", message: "Installed surf CLI is too old for chatgpt.chats. Upgrade/reinstall surf-cli." };
+  }
+  if (combined.includes("requires cloakbrowser mode")) {
+    return { code: "setup", message: "Cloak mode required. Set SURF_USE_CLOAK_CHATGPT=1" };
   }
 
   return { code: "command_failed", message: `surf exited with code ${code}`, stderr: stderr.slice(0, 500) };
 }
 
+function compactSnippet(text: string, max = 240): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "(empty)";
+  return cleaned.length <= max ? cleaned : `${cleaned.slice(0, max - 1)}…`;
+}
+
+function extractJsonCandidate(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
+
+  const starts = [trimmed.indexOf("{"), trimmed.indexOf("[")].filter((idx) => idx >= 0).sort((a, b) => a - b);
+  for (const start of starts) {
+    const chunk = trimmed.slice(start);
+    const endObject = chunk.lastIndexOf("}");
+    const endArray = chunk.lastIndexOf("]");
+    const end = Math.max(endObject, endArray);
+    if (end >= 0) return chunk.slice(0, end + 1).trim();
+  }
+  return null;
+}
+
+function tryParseJsonOutput(stdout: string, stderr: string): { ok: true; value: unknown } | { ok: false; reason: string } {
+  const candidates = [stdout, `${stdout}\n${stderr}`, stderr]
+    .map((text) => extractJsonCandidate(text))
+    .filter((text): text is string => !!text);
+
+  let lastError = "No JSON candidate found";
+  for (const candidate of candidates) {
+    try {
+      return { ok: true, value: JSON.parse(candidate) };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return { ok: false, reason: lastError };
+}
+
+function writeDebugDump(kind: string, stdout: string, stderr: string): string | null {
+  try {
+    fs.mkdirSync(DEBUG_DIR, { recursive: true });
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const base = path.join(DEBUG_DIR, `${kind}-${stamp}`);
+    fs.writeFileSync(`${base}.stdout.log`, stdout, "utf8");
+    fs.writeFileSync(`${base}.stderr.log`, stderr, "utf8");
+    return base;
+  } catch {
+    return null;
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function buildParseError(kind: string, stdout: string, stderr: string, reason: string): SurfChatsError {
+  const dumpBase = writeDebugDump(kind, stdout, stderr);
+  const debugHint = dumpBase ? ` Debug: ${dumpBase}.{stdout,stderr}.log` : "";
+  return {
+    code: "parse",
+    message: `Failed to parse surf output as JSON.${debugHint}`,
+    stderr: [
+      `parse: ${reason}`,
+      `stdout: ${compactSnippet(stdout)}`,
+      `stderr: ${compactSnippet(stderr)}`,
+    ].join("\n"),
+  };
+}
+
 export class SurfChatsClient {
   private execFn: ExtensionAPI["exec"];
-  private cwd: string;
+  private cliPath: string | null;
+  private profile: string | null;
 
-  constructor(pi: ExtensionAPI, cwd: string) {
+  constructor(pi: ExtensionAPI, _cwd: string) {
     this.execFn = pi.exec.bind(pi);
-    this.cwd = cwd;
-    loadFormatter(cwd);
+    this.cliPath = resolveLocalCliPath();
+    this.profile = DEFAULT_CHATGPT_PROFILE;
+    loadFormatter();
   }
 
-  private async runSurf(args: string[]): Promise<{ stdout: string; stderr: string }> {
-    // Use bash -c to pass env var since pi.exec doesn't support env option
-    const cmd = `SURF_USE_CLOAK_CHATGPT=1 surf ${args.map(a => `'${a.replace(/'/g, "'\\''")}' `).join("").trim()}`;
-    const result = await this.execFn("bash", ["-c", cmd], { timeout: DEFAULT_TIMEOUT });
-    if (result.code !== 0) throw classifyError(result.code, result.stdout ?? "", result.stderr ?? "");
-    return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  private withProfile(args: string[]): string[] {
+    return this.profile ? [...args, "--profile", this.profile] : args;
   }
 
-  async listRecent(opts?: { limit?: number }): Promise<ListResult> {
+  private async runSurf(args: string[], signal?: AbortSignal): Promise<{ stdout: string; stderr: string }> {
+    fs.mkdirSync(DEBUG_DIR, { recursive: true });
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const stdoutPath = path.join(DEBUG_DIR, `${stamp}.stdout.tmp`);
+    const stderrPath = path.join(DEBUG_DIR, `${stamp}.stderr.tmp`);
+
+    const commandParts = this.cliPath
+      ? ["node", this.cliPath, ...this.withProfile(args)]
+      : ["surf", ...this.withProfile(args)];
+    const script = `export SURF_USE_CLOAK_CHATGPT=1; ${commandParts.map(shellQuote).join(" ")} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}`;
+
+    try {
+      const result = await this.execFn("bash", ["-lc", script], {
+        timeout: DEFAULT_TIMEOUT,
+        signal,
+      });
+      const stdout = fs.existsSync(stdoutPath) ? fs.readFileSync(stdoutPath, "utf8") : (result.stdout ?? "");
+      const stderr = fs.existsSync(stderrPath) ? fs.readFileSync(stderrPath, "utf8") : (result.stderr ?? "");
+
+      if (signal?.aborted || result.killed) {
+        throw { code: "aborted", message: "Request cancelled" } as SurfChatsError;
+      }
+      if (result.code !== 0) throw classifyError(result.code, stdout, stderr);
+      return { stdout, stderr };
+    } finally {
+      try {
+        if (fs.existsSync(stdoutPath)) fs.unlinkSync(stdoutPath);
+        if (fs.existsSync(stderrPath)) fs.unlinkSync(stderrPath);
+      } catch {
+        // ignore temp cleanup failure
+      }
+    }
+  }
+
+  private async runSurfJson(args: string[], kind: string, signal?: AbortSignal): Promise<{ parsed: unknown; stdout: string; stderr: string; attempts: number }> {
+    let lastStdout = "";
+    let lastStderr = "";
+    let lastReason = "No JSON candidate found";
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const { stdout, stderr } = await this.runSurf(args, signal);
+      lastStdout = stdout;
+      lastStderr = stderr;
+
+      const parsed = tryParseJsonOutput(stdout, stderr);
+      if (parsed.ok) {
+        return { parsed: parsed.value, stdout, stderr, attempts: attempt };
+      }
+
+      lastReason = parsed.reason;
+      if (signal?.aborted || attempt === 2) break;
+    }
+
+    throw buildParseError(kind, lastStdout, lastStderr, lastReason);
+  }
+
+  getResolvedPaths(): { cliPath: string | null; formatterPath: string | null; profile: string | null } {
+    return {
+      cliPath: this.cliPath,
+      formatterPath: resolvedFormatterPath,
+      profile: this.profile,
+    };
+  }
+
+  async listRecent(opts?: { limit?: number; signal?: AbortSignal }): Promise<ListResult> {
     const limit = opts?.limit ?? 30;
-    const { stdout } = await this.runSurf(["chatgpt.chats", "--json", "--limit", String(limit)]);
-
-    return this.parseListResult(stdout);
+    const { parsed } = await this.runSurfJson(["chatgpt.chats", "--json", "--limit", String(limit)], "list", opts?.signal);
+    return this.parseListResult(parsed);
   }
 
-  async search(opts: { query: string; limit?: number }): Promise<ListResult> {
+  async search(opts: { query: string; limit?: number; signal?: AbortSignal }): Promise<ListResult> {
     const limit = opts.limit ?? 30;
-    const { stdout } = await this.runSurf(["chatgpt.chats", "--json", "--search", opts.query, "--limit", String(limit)]);
-    return this.parseListResult(stdout, "search");
+    const { parsed } = await this.runSurfJson(["chatgpt.chats", "--json", "--search", opts.query, "--limit", String(limit)], "search", opts.signal);
+    return this.parseListResult(parsed, "search");
   }
 
-  async getConversation(conversationId: string): Promise<DetailRecord> {
-    const { stdout } = await this.runSurf(["chatgpt.chats", conversationId, "--json"]);
-    return this.parseGetResult(conversationId, stdout);
+  async getConversation(conversationId: string, signal?: AbortSignal): Promise<DetailRecord> {
+    const { parsed } = await this.runSurfJson(["chatgpt.chats", conversationId, "--json"], `get-${conversationId}`, signal);
+    const detail = this.parseGetResult(conversationId, parsed);
+
+    if (!formatter && !signal?.aborted) {
+      const tempPath = path.join(os.tmpdir(), `pi-surf-chat-${conversationId}-${Date.now()}.md`);
+      try {
+        await this.exportConversation(conversationId, tempPath, signal);
+        detail.markdown = fs.readFileSync(tempPath, "utf8");
+      } catch {
+        // keep synthetic fallback markdown
+      } finally {
+        try {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch {
+          // ignore temp cleanup failure
+        }
+      }
+    }
+
+    return detail;
   }
 
-  async exportConversation(conversationId: string, exportPath: string): Promise<string> {
-    await this.runSurf(["chatgpt.chats", conversationId, "--export", exportPath, "--format", "markdown"]);
+  async exportConversation(conversationId: string, exportPath: string, signal?: AbortSignal): Promise<string> {
+    await this.runSurf(["chatgpt.chats", conversationId, "--export", exportPath, "--format", "markdown"], signal);
     return exportPath;
   }
 
-  private parseListResult(stdout: string, action: "list" | "search" = "list"): ListResult {
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(stdout.trim());
-    } catch {
-      throw { code: "parse", message: "Failed to parse surf output as JSON" } as SurfChatsError;
-    }
+  private parseListResult(parsed: unknown, action: "list" | "search" = "list"): ListResult {
+    const record = typeof parsed === "object" && parsed ? parsed as Record<string, unknown> : {};
 
     const items = formatter
-      ? formatter.normalizeConversationItems(parsed.items ?? parsed)
-      : fallbackNormalize(parsed.items ?? parsed);
+      ? formatter.normalizeConversationItems(record.items ?? record)
+      : fallbackNormalize(record.items ?? record);
 
     return {
       action,
       items,
-      total: typeof parsed.total === "number" ? parsed.total : items.length,
-      partial: parsed.partial === true,
-      fallbackScanned: typeof parsed.fallbackScanned === "number" ? parsed.fallbackScanned : undefined,
-      fallbackTotal: typeof parsed.fallbackTotal === "number" ? parsed.fallbackTotal : undefined,
+      total: typeof record.total === "number" ? record.total : items.length,
+      partial: record.partial === true,
+      fallbackScanned: typeof record.fallbackScanned === "number" ? record.fallbackScanned : undefined,
+      fallbackTotal: typeof record.fallbackTotal === "number" ? record.fallbackTotal : undefined,
     };
   }
 
-  private parseGetResult(conversationId: string, stdout: string): DetailRecord {
-    let conversation: Record<string, unknown>;
-    try {
-      conversation = JSON.parse(stdout.trim());
-    } catch {
-      throw { code: "parse", message: "Failed to parse conversation JSON" } as SurfChatsError;
-    }
+  private parseGetResult(conversationId: string, parsed: unknown): DetailRecord {
+    const conversation = typeof parsed === "object" && parsed ? parsed as Record<string, unknown> : {};
 
     let summary: ConversationSummary;
     let markdown: string;
@@ -156,16 +326,15 @@ export class SurfChatsClient {
       summary = formatter.summarizeConversation(conversation);
       markdown = formatter.formatConversationMarkdown({ conversation });
     } else {
-      // Minimal fallback
       summary = {
         title: String(conversation.title || "(untitled)"),
         create_time: (conversation.create_time as number) ?? null,
         current_node: (conversation.current_node as string) ?? null,
         messages: [],
-        totalMessages: 0,
+        totalMessages: typeof conversation.mapping === "object" && conversation.mapping ? Object.keys(conversation.mapping as Record<string, unknown>).length : 0,
         model: null,
       };
-      markdown = `# ${summary.title}\n\n_Raw conversation data (formatter unavailable)_\n`;
+      markdown = `# ${summary.title}\n\n_Formatter unavailable. Showing exported markdown fallback when possible._\n`;
     }
 
     return {
