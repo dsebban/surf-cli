@@ -96,6 +96,8 @@ function createInitialState(): ControllerState {
     resolvedCliPath: null,
     resolvedFormatterPath: null,
     resolvedProfile: null,
+    pendingDeleteId: null,
+    pendingDeleteTitle: null,
     currentLimit: INITIAL_LIMIT,
     hasMore: cachedItems.length >= INITIAL_LIMIT,
   };
@@ -323,6 +325,64 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
             state.phase = "error";
             state.lastError = err as SurfChatsError;
             state.statusMessage = (err as SurfChatsError).message ?? "Export failed";
+          }
+          if (!closed) overlay?.updateState(state);
+          break;
+        }
+
+        case "delete": {
+          // Enter confirmation mode — don't delete yet
+          state.phase = "confirm_delete";
+          state.pendingDeleteId = action.conversationId;
+          state.pendingDeleteTitle = action.title;
+          state.lastError = null;
+          state.statusMessage = "";
+          overlay?.updateState(state);
+          break;
+        }
+
+        case "cancel_delete": {
+          state.phase = "idle";
+          state.pendingDeleteId = null;
+          state.pendingDeleteTitle = null;
+          state.statusMessage = "";
+          overlay?.updateState(state);
+          break;
+        }
+
+        case "confirm_delete": {
+          state.phase = "deleting";
+          state.statusMessage = `Deleting "${action.title}"…`;
+          state.pendingDeleteId = null;
+          state.pendingDeleteTitle = null;
+          state.lastError = null;
+          overlay?.updateState(state);
+
+          try {
+            await client.deleteConversation(action.conversationId, abort.signal);
+            if (isStale()) return;
+
+            // Remove from list + caches
+            state.items = state.items.filter((item) => item.id !== action.conversationId);
+            state.detailCache.delete(action.conversationId);
+            if (persistentListCache) {
+              persistentListCache.items = persistentListCache.items.filter((item) => item.id !== action.conversationId);
+            }
+            // Clamp selection
+            if (state.selectedIndex >= state.items.length) {
+              state.selectedIndex = Math.max(0, state.items.length - 1);
+            }
+            state.phase = "idle";
+            state.statusMessage = "";
+
+            if (ctx.hasUI) {
+              ctx.ui.notify(`Deleted: ${action.title}`, "info");
+            }
+          } catch (err) {
+            if (isStale()) return;
+            state.phase = "error";
+            state.lastError = err as SurfChatsError;
+            state.statusMessage = (err as SurfChatsError).message ?? "Delete failed";
           }
           if (!closed) overlay?.updateState(state);
           break;

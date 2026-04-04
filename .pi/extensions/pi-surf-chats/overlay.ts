@@ -92,6 +92,9 @@ function wrapText(text: string, width: number): string[] {
 export type OverlayAction =
   | { action: "inject"; conversationId: string; markdown: string; title: string }
   | { action: "export"; conversationId: string; title: string }
+  | { action: "delete"; conversationId: string; title: string }
+  | { action: "confirm_delete"; conversationId: string; title: string }
+  | { action: "cancel_delete" }
   | { action: "load_list" }
   | { action: "load_more" }
   | { action: "search"; query: string }
@@ -149,6 +152,21 @@ export class SurfChatsOverlay implements Component, Focusable {
 
   handleInput(data: string): void {
     const s = this.state;
+
+    // ── Delete confirmation mode ──
+    if (s.phase === "confirm_delete" && s.pendingDeleteId) {
+      if (data === "y" || data === "Y") {
+        this.callbacks.onAction({
+          action: "confirm_delete",
+          conversationId: s.pendingDeleteId,
+          title: s.pendingDeleteTitle ?? "(untitled)",
+        });
+        return;
+      }
+      // Any other key cancels
+      this.callbacks.onAction({ action: "cancel_delete" });
+      return;
+    }
 
     // Escape: exit search mode or close overlay
     if (matchesKey(data, "escape")) {
@@ -303,6 +321,18 @@ export class SurfChatsOverlay implements Component, Focusable {
       this.callbacks.onAction({ action: "load_list" });
       return;
     }
+
+    // Delete / d → delete conversation (with confirmation)
+    if (matchesKey(data, "delete") || data === "d") {
+      const selected = s.items[s.selectedIndex];
+      if (!selected) return;
+      this.callbacks.onAction({
+        action: "delete",
+        conversationId: selected.id,
+        title: selected.title,
+      });
+      return;
+    }
   }
 
   // ─── Rendering ────────────────────────────────────────────────────────────
@@ -335,8 +365,15 @@ export class SurfChatsOverlay implements Component, Focusable {
       lines.push(this.frameLine(prompt + draft, innerW, border));
     }
 
+    // ── Delete confirmation banner ──
+    if (this.state.phase === "confirm_delete" && this.state.pendingDeleteTitle) {
+      const confirmMsg = th.fg("error", ` ⚠ Delete "${truncateVisible(this.state.pendingDeleteTitle, Math.max(1, innerW - 22))}"? `) +
+        th.fg("warning", "y") + th.fg("dim", "/") + th.fg("text", "n");
+      lines.push(this.frameLine(confirmMsg, innerW, border));
+    }
+
     // ── Status line ──
-    if (this.state.phase !== "idle") {
+    if (this.state.phase !== "idle" && this.state.phase !== "confirm_delete") {
       const statusIcon = this.state.phase === "error" ? "✗" : "⟳";
       const statusColor = this.state.phase === "error" ? "error" : "warning";
       const statusLine = th.fg(statusColor, ` ${statusIcon} ${this.state.statusMessage}`);
@@ -376,7 +413,9 @@ export class SurfChatsOverlay implements Component, Focusable {
     const moreHint = !this.state.searchEditActive && this.state.hasMore ? " • j/↓ more" : "";
     const hints = this.state.searchEditActive
       ? "Enter submit • Esc cancel"
-      : `j/k list • ↑↓ scroll detail • Enter inject • / search • e export • r refresh • Esc close${moreHint}`;
+      : this.state.phase === "confirm_delete"
+        ? "y confirm delete • any other key cancel"
+        : `j/k list • ↑↓ scroll • Enter inject • / search • e export • d del • r refresh • Esc close${moreHint}`;
     const debugCli = ` CLI: ${compactPath(this.state.resolvedCliPath, Math.max(8, innerW - 6))}`;
     const debugFmt = ` Formatter: ${compactPath(this.state.resolvedFormatterPath, Math.max(8, innerW - 12))}`;
     const debugProfile = ` Profile: ${this.state.resolvedProfile ?? "none"}`;

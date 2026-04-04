@@ -299,6 +299,10 @@ export class SurfChatsClient {
     return exportPath;
   }
 
+  async deleteConversation(conversationId: string, signal?: AbortSignal): Promise<void> {
+    await this.runSurfJson(["chatgpt.chats", conversationId, "--delete", "--json"], `delete-${conversationId}`, signal);
+  }
+
   private parseListResult(parsed: unknown, action: "list" | "search" = "list"): ListResult {
     const record = typeof parsed === "object" && parsed ? parsed as Record<string, unknown> : {};
 

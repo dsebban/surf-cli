@@ -71,7 +71,7 @@ export interface ControllerState {
   items: ConversationItem[];
   selectedIndex: number;
   detailCache: Map<string, DetailRecord>;
-  phase: "idle" | "loading_list" | "loading_detail" | "searching" | "exporting" | "error";
+  phase: "idle" | "loading_list" | "loading_detail" | "searching" | "exporting" | "deleting" | "confirm_delete" | "error";
   statusMessage: string;
   loadedConversationId: string | null;
   lastError: SurfChatsError | null;
@@ -80,6 +80,9 @@ export interface ControllerState {
   resolvedCliPath: string | null;
   resolvedFormatterPath: string | null;
   resolvedProfile: string | null;
+  /** Conversation pending delete confirmation (id + title) */
+  pendingDeleteId: string | null;
+  pendingDeleteTitle: string | null;
   /** Current fetch limit; grows as user loads more */
   currentLimit: number;
   /** True when items.length === currentLimit (more may be available) */
