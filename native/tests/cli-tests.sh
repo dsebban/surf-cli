@@ -106,7 +106,7 @@ echo "-- ChatGPT Chats Validation --"
 test_output "chatgpt.chats cloak hint" "node cli.cjs chatgpt.chats" "requires CloakBrowser mode"
 test_output "chatgpt.chats invalid combo" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --search test" "cannot use conversation ID with --search"
 test_output "chatgpt.chats all+limit invalid" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats --all --limit 5" "cannot be combined with --limit"
-test_output "chatgpt.chats advanced conflict" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --rename 'New Title' --delete" "use only one of --rename, --delete, or --download-file"
+test_output "chatgpt.chats advanced conflict" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --rename 'New Title' --delete" "use only one of --rename, --delete, --delete-ids, or --download-file"
 test_output "chatgpt.chats download requires output" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --download-file file-123" "requires --output"
 test_output "chatgpt.reply usage" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.reply" "Usage: surf chatgpt.reply"
 

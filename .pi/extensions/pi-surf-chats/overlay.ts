@@ -92,9 +92,10 @@ function wrapText(text: string, width: number): string[] {
 export type OverlayAction =
   | { action: "inject"; conversationId: string; markdown: string; title: string }
   | { action: "export"; conversationId: string; title: string }
-  | { action: "delete"; conversationId: string; title: string }
-  | { action: "confirm_delete"; conversationId: string; title: string }
+  | { action: "delete"; conversationIds: string[]; titles: string[] }
+  | { action: "confirm_delete"; conversationIds: string[]; titles: string[] }
   | { action: "cancel_delete" }
+  | { action: "toggle_mark"; conversationId: string }
   | { action: "load_list" }
   | { action: "load_more" }
   | { action: "search"; query: string }
@@ -156,11 +157,10 @@ export class SurfChatsOverlay implements Component, Focusable {
     // ── Delete confirmation mode ──
     if (s.phase === "confirm_delete" && s.pendingDeleteId) {
       if (data === "y" || data === "Y") {
-        this.callbacks.onAction({
-          action: "confirm_delete",
-          conversationId: s.pendingDeleteId,
-          title: s.pendingDeleteTitle ?? "(untitled)",
-        });
+        // pendingDeleteId stores comma-joined IDs for batch
+        const ids = s.pendingDeleteId.split(",");
+        const titles = (s.pendingDeleteTitle ?? "").split("\n");
+        this.callbacks.onAction({ action: "confirm_delete", conversationIds: ids, titles });
         return;
       }
       // Any other key cancels
@@ -322,15 +322,34 @@ export class SurfChatsOverlay implements Component, Focusable {
       return;
     }
 
-    // Delete / d → delete conversation (with confirmation)
-    if (matchesKey(data, "delete") || data === "d") {
+    // Space → toggle mark for batch operations
+    if (data === " ") {
       const selected = s.items[s.selectedIndex];
       if (!selected) return;
-      this.callbacks.onAction({
-        action: "delete",
-        conversationId: selected.id,
-        title: selected.title,
-      });
+      this.callbacks.onAction({ action: "toggle_mark", conversationId: selected.id });
+      // Auto-advance to next item
+      if (s.selectedIndex < s.items.length - 1) {
+        s.selectedIndex++;
+        this.detailScrollOffset = 0;
+      }
+      this.tui.requestRender();
+      return;
+    }
+
+    // Delete / d → delete marked conversations (or current if none marked)
+    if (matchesKey(data, "delete") || data === "d") {
+      const markedCount = s.markedIds.size;
+      if (markedCount > 0) {
+        // Batch delete all marked
+        const ids = Array.from(s.markedIds);
+        const titles = ids.map(id => s.items.find(it => it.id === id)?.title ?? "(untitled)");
+        this.callbacks.onAction({ action: "delete", conversationIds: ids, titles });
+      } else {
+        // Single delete
+        const selected = s.items[s.selectedIndex];
+        if (!selected) return;
+        this.callbacks.onAction({ action: "delete", conversationIds: [selected.id], titles: [selected.title] });
+      }
       return;
     }
   }
@@ -366,8 +385,12 @@ export class SurfChatsOverlay implements Component, Focusable {
     }
 
     // ── Delete confirmation banner ──
-    if (this.state.phase === "confirm_delete" && this.state.pendingDeleteTitle) {
-      const confirmMsg = th.fg("error", ` ⚠ Delete "${truncateVisible(this.state.pendingDeleteTitle, Math.max(1, innerW - 22))}"? `) +
+    if (this.state.phase === "confirm_delete" && this.state.pendingDeleteId) {
+      const count = this.state.pendingDeleteId.split(",").length;
+      const label = count > 1
+        ? `${count} conversations`
+        : `"${truncateVisible(this.state.pendingDeleteTitle ?? "(untitled)", Math.max(1, innerW - 24))}"`;
+      const confirmMsg = th.fg("error", ` ⚠ Delete ${label}? `) +
         th.fg("warning", "y") + th.fg("dim", "/") + th.fg("text", "n");
       lines.push(this.frameLine(confirmMsg, innerW, border));
     }
@@ -415,7 +438,7 @@ export class SurfChatsOverlay implements Component, Focusable {
       ? "Enter submit • Esc cancel"
       : this.state.phase === "confirm_delete"
         ? "y confirm delete • any other key cancel"
-        : `j/k list • ↑↓ scroll • Enter inject • / search • e export • d del • r refresh • Esc close${moreHint}`;
+        : `j/k list • ↑↓ scroll • Space mark • Enter inject • / search • e export • d del • r refresh • Esc${moreHint}`;
     const debugCli = ` CLI: ${compactPath(this.state.resolvedCliPath, Math.max(8, innerW - 6))}`;
     const debugFmt = ` Formatter: ${compactPath(this.state.resolvedFormatterPath, Math.max(8, innerW - 12))}`;
     const debugProfile = ` Profile: ${this.state.resolvedProfile ?? "none"}`;
@@ -486,10 +509,11 @@ export class SurfChatsOverlay implements Component, Focusable {
       const item = visibleItems[vi]!;
       const isSelected = i === s.selectedIndex;
       const isCached = s.detailCache.has(item.id);
+      const isMarked = s.markedIds.has(item.id);
       const prefix = isSelected ? th.fg("accent", "→") : " ";
       const time = formatRelativeTime(item.update_time);
       const title = truncateVisible(item.title, titleW);
-      const cachedMark = isCached ? th.fg("success", "•") : " ";
+      const cachedMark = isMarked ? th.fg("warning", "●") : isCached ? th.fg("success", "•") : " ";
 
       const line = `${prefix}${cachedMark}` +
         th.fg(isSelected ? "accent" : "text", padEndVisible(title, titleW)) +

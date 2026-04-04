@@ -80,7 +80,9 @@ export interface ControllerState {
   resolvedCliPath: string | null;
   resolvedFormatterPath: string | null;
   resolvedProfile: string | null;
-  /** Conversation pending delete confirmation (id + title) */
+  /** Multi-select for batch operations */
+  markedIds: Set<string>;
+  /** Conversation(s) pending delete confirmation */
   pendingDeleteId: string | null;
   pendingDeleteTitle: string | null;
   /** Current fetch limit; grows as user loads more */

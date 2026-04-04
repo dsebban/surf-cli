@@ -96,6 +96,7 @@ function createInitialState(): ControllerState {
     resolvedCliPath: null,
     resolvedFormatterPath: null,
     resolvedProfile: null,
+    markedIds: new Set(),
     pendingDeleteId: null,
     pendingDeleteTitle: null,
     currentLimit: INITIAL_LIMIT,
@@ -330,11 +331,21 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
           break;
         }
 
+        case "toggle_mark": {
+          if (state.markedIds.has(action.conversationId)) {
+            state.markedIds.delete(action.conversationId);
+          } else {
+            state.markedIds.add(action.conversationId);
+          }
+          overlay?.updateState(state);
+          break;
+        }
+
         case "delete": {
           // Enter confirmation mode — don't delete yet
           state.phase = "confirm_delete";
-          state.pendingDeleteId = action.conversationId;
-          state.pendingDeleteTitle = action.title;
+          state.pendingDeleteId = action.conversationIds.join(",");
+          state.pendingDeleteTitle = action.titles[0] ?? "(untitled)";
           state.lastError = null;
           state.statusMessage = "";
           overlay?.updateState(state);
@@ -351,22 +362,28 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
         }
 
         case "confirm_delete": {
+          const ids = action.conversationIds;
+          const count = ids.length;
           state.phase = "deleting";
-          state.statusMessage = `Deleting "${action.title}"…`;
+          state.statusMessage = count > 1 ? `Deleting ${count} conversations…` : `Deleting "${action.titles[0]}"…`;
           state.pendingDeleteId = null;
           state.pendingDeleteTitle = null;
           state.lastError = null;
           overlay?.updateState(state);
 
           try {
-            await client.deleteConversation(action.conversationId, abort.signal);
+            await client.bulkDeleteConversations(ids, abort.signal);
             if (isStale()) return;
 
             // Remove from list + caches
-            state.items = state.items.filter((item) => item.id !== action.conversationId);
-            state.detailCache.delete(action.conversationId);
+            const deleteSet = new Set(ids);
+            state.items = state.items.filter((item) => !deleteSet.has(item.id));
+            for (const id of ids) {
+              state.detailCache.delete(id);
+              state.markedIds.delete(id);
+            }
             if (persistentListCache) {
-              persistentListCache.items = persistentListCache.items.filter((item) => item.id !== action.conversationId);
+              persistentListCache.items = persistentListCache.items.filter((item) => !deleteSet.has(item.id));
             }
             // Clamp selection
             if (state.selectedIndex >= state.items.length) {
@@ -376,7 +393,8 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
             state.statusMessage = "";
 
             if (ctx.hasUI) {
-              ctx.ui.notify(`Deleted: ${action.title}`, "info");
+              const label = count > 1 ? `${count} conversations` : action.titles[0] ?? "conversation";
+              ctx.ui.notify(`Deleted: ${label}`, "info");
             }
           } catch (err) {
             if (isStale()) return;

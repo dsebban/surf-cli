@@ -303,6 +303,16 @@ export class SurfChatsClient {
     await this.runSurfJson(["chatgpt.chats", conversationId, "--delete", "--json"], `delete-${conversationId}`, signal);
   }
 
+  async bulkDeleteConversations(conversationIds: string[], signal?: AbortSignal): Promise<void> {
+    if (conversationIds.length === 0) return;
+    if (conversationIds.length === 1) return this.deleteConversation(conversationIds[0]!, signal);
+    await this.runSurfJson(
+      ["chatgpt.chats", "--delete-ids", conversationIds.join(","), "--json"],
+      `bulk-delete-${conversationIds.length}`,
+      signal,
+    );
+  }
+
   private parseListResult(parsed: unknown, action: "list" | "search" = "list"): ListResult {
     const record = typeof parsed === "object" && parsed ? parsed as Record<string, unknown> : {};
 

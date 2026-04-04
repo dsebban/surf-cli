@@ -206,6 +206,7 @@ async function manageChatsWithCloakBrowser(opts, onProgress = () => {}) {
       type: "chats",
       action: opts.action,
       conversationId: opts.conversationId,
+      conversationIds: opts.conversationIds,
       query: opts.query,
       limit: opts.limit,
       all: opts.all,

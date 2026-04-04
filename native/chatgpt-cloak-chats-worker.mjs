@@ -471,7 +471,242 @@ async function callBackend(page, request) {
   return result.data;
 }
 
-async function runAction({ action, conversationId, query, limit, all, profile, timeout = 120, title, fileId, outputPath }) {
+// ---------------------------------------------------------------------------
+// API-direct helpers (no page.goto / no readiness polling)
+// Uses context.request (Playwright HTTP API) with the context's cookie jar.
+// ---------------------------------------------------------------------------
+
+const CHATGPT_BASE = 'https://chatgpt.com';
+
+async function fetchAccessToken(context) {
+  const resp = await context.request.get(`${CHATGPT_BASE}/api/auth/session`);
+  if (!resp.ok()) {
+    throw Object.assign(new Error('Session unavailable — missing access token'), {
+      code: 'login_required', status: resp.status(),
+    });
+  }
+  const data = await resp.json();
+  if (!data?.accessToken) {
+    throw Object.assign(new Error('Session response missing accessToken'), {
+      code: 'login_required',
+    });
+  }
+  return data.accessToken;
+}
+
+function apiHeaders(accessToken) {
+  return {
+    'Authorization': `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'Oai-Device-Id': crypto.randomUUID(),
+    'Oai-Language': 'en-US',
+  };
+}
+
+async function apiRequest(context, { pathname, method = 'GET', body, accessToken }) {
+  const headers = apiHeaders(accessToken);
+  const url = `${CHATGPT_BASE}${pathname}`;
+  const opts = { headers };
+  let resp;
+  switch (method) {
+    case 'POST':
+      resp = await context.request.post(url, { ...opts, data: body }); break;
+    case 'PATCH':
+      resp = await context.request.patch(url, { ...opts, data: body }); break;
+    case 'DELETE':
+      resp = await context.request.delete(url, { ...opts }); break;
+    default:
+      resp = await context.request.get(url, { ...opts }); break;
+  }
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  if (!resp.ok()) {
+    const mapped = buildBackendError({
+      status: resp.status(),
+      body: text,
+      message: json?.detail || json?.message || json?.error || `HTTP ${resp.status()}`,
+    });
+    throw Object.assign(new Error(mapped.message), mapped);
+  }
+  return json;
+}
+
+// ---------------------------------------------------------------------------
+// API-direct action runners (fast path — no page navigation)
+// ---------------------------------------------------------------------------
+
+async function apiListConversations(context, accessToken, { limit, all }) {
+  const requestedLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.trunc(Number(limit))) : 20;
+  const items = [];
+  let offset = 0;
+  let total = 0;
+  while (true) {
+    const remaining = all ? 100 : Math.max(1, Math.min(100, requestedLimit - items.length));
+    const data = await apiRequest(context, {
+      pathname: `/backend-api/conversations?offset=${offset}&limit=${remaining}`,
+      accessToken,
+    });
+    const batch = Array.isArray(data?.items) ? data.items : [];
+    items.push(...batch);
+    total = Number.isFinite(Number(data?.total)) ? Number(data.total) : Math.max(total, items.length);
+    if (!all && items.length >= requestedLimit) break;
+    if (batch.length === 0 || items.length >= total) break;
+    offset += batch.length;
+  }
+  return { action: 'list', items, total, offset: 0, limit: all ? items.length : requestedLimit, all: !!all };
+}
+
+async function apiSearchConversations(context, accessToken, { query, limit }) {
+  const requestedLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.trunc(Number(limit))) : 20;
+  let backendItems = [];
+  let backendTotal = 0;
+  let backendSearchFailed = false;
+  try {
+    const data = await apiRequest(context, {
+      pathname: `/backend-api/conversations/search?query=${encodeURIComponent(query)}`,
+      accessToken,
+    });
+    backendItems = normalizeConversationSearchItems(data);
+    backendTotal = Number.isFinite(Number(data?.total)) ? Number(data.total) : backendItems.length;
+  } catch (err) {
+    log('warn', 'Backend search failed, falling back to local scan', { error: err.message });
+    backendSearchFailed = true;
+  }
+  let mergedItems = mergeConversationSearchItems(backendItems);
+  let fallbackScanned = 0, fallbackTotal = 0, partial = false;
+  if (mergedItems.length < requestedLimit) {
+    let offset = 0, totalEst = 0, pagesFetched = 0;
+    const maxPages = Math.max(3, Math.ceil(requestedLimit / 100));
+    while (pagesFetched < maxPages) {
+      const data = await apiRequest(context, {
+        pathname: `/backend-api/conversations?offset=${offset}&limit=100`,
+        accessToken,
+      });
+      const batch = Array.isArray(data?.items) ? data.items : [];
+      mergedItems = mergeConversationSearchItems(mergedItems, filterConversationSearchItems(batch, query));
+      totalEst = Number.isFinite(Number(data?.total)) ? Number(data.total) : Math.max(totalEst, offset + batch.length);
+      fallbackScanned += batch.length;
+      fallbackTotal = totalEst;
+      pagesFetched++;
+      if (mergedItems.length >= requestedLimit || batch.length === 0 || offset + batch.length >= totalEst) break;
+      offset += batch.length;
+    }
+    partial = fallbackTotal > 0 && fallbackScanned < fallbackTotal && mergedItems.length < requestedLimit;
+  }
+  return {
+    action: 'search', query,
+    items: mergedItems.slice(0, requestedLimit),
+    total: Math.max(backendTotal, mergedItems.length),
+    limit: requestedLimit, partial, backendSearchFailed, fallbackScanned, fallbackTotal,
+  };
+}
+
+async function apiGetConversation(context, accessToken, conversationId) {
+  const data = await apiRequest(context, {
+    pathname: `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+    accessToken,
+  });
+  return { action: 'get', conversationId, conversation: data };
+}
+
+async function apiDeleteConversation(context, accessToken, conversationId) {
+  try {
+    const data = await apiRequest(context, {
+      pathname: `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+      method: 'PATCH',
+      body: { is_visible: false },
+      accessToken,
+    });
+    return { action: 'delete', conversationId, deleteMethod: 'hide', result: data };
+  } catch (err) {
+    if (![404, 405].includes(err.status)) throw err;
+  }
+  const data = await apiRequest(context, {
+    pathname: '/backend-api/conversations/delete',
+    method: 'POST',
+    body: { conversation_ids: [conversationId] },
+    accessToken,
+  });
+  return { action: 'delete', conversationId, deleteMethod: 'bulk', result: data };
+}
+
+async function apiBulkDelete(context, accessToken, conversationIds) {
+  const results = [];
+  // Use bulk endpoint for efficiency when multiple IDs
+  if (conversationIds.length > 1) {
+    try {
+      const data = await apiRequest(context, {
+        pathname: '/backend-api/conversations/delete',
+        method: 'POST',
+        body: { conversation_ids: conversationIds },
+        accessToken,
+      });
+      return conversationIds.map(id => ({ action: 'delete', conversationId: id, deleteMethod: 'bulk', result: data }));
+    } catch (err) {
+      log('warn', 'Bulk delete failed, falling back to individual deletes', { error: err.message });
+    }
+  }
+  // Fallback: individual deletes (parallel, bounded)
+  const CONCURRENCY = 4;
+  for (let i = 0; i < conversationIds.length; i += CONCURRENCY) {
+    const batch = conversationIds.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(id => apiDeleteConversation(context, accessToken, id).catch(err => ({
+        action: 'delete', conversationId: id, deleteMethod: 'error', error: err.message,
+      })))
+    );
+    results.push(...batchResults);
+    progress(3, 4, `Deleted ${Math.min(i + CONCURRENCY, conversationIds.length)}/${conversationIds.length}`);
+  }
+  return results;
+}
+
+async function apiRenameConversation(context, accessToken, conversationId, title) {
+  const data = await apiRequest(context, {
+    pathname: `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+    method: 'PATCH',
+    body: { title },
+    accessToken,
+  });
+  return { action: 'rename', conversationId, title, result: data };
+}
+
+async function apiDownloadFile(context, accessToken, fileId, outputPath) {
+  const meta = await apiRequest(context, {
+    pathname: `/backend-api/files/download/${encodeURIComponent(fileId)}`,
+    accessToken,
+  });
+  const downloadUrl = meta?.download_url;
+  const result = { action: 'download', fileId, result: meta, file: null, outputPath: outputPath || null };
+  if (outputPath && downloadUrl) {
+    const resolvedPath = pathResolve(outputPath);
+    const outDir = dirname(resolvedPath);
+    if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+    const downloadResp = await context.request.fetch(downloadUrl);
+    if (!downloadResp.ok()) {
+      throw Object.assign(new Error(`Download failed: HTTP ${downloadResp.status()}`), { code: 'download_failed' });
+    }
+    const body = await downloadResp.body();
+    writeFileSync(resolvedPath, body);
+    const disposition = downloadResp.headers()['content-disposition'] || '';
+    const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
+    result.file = {
+      savedPath: resolvedPath,
+      mimeType: downloadResp.headers()['content-type'] || null,
+      fileName: decodeURIComponent(match?.[1] || match?.[2] || ''),
+      size: body.byteLength,
+    };
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Main action runner (uses API-direct fast path — no page navigation)
+// ---------------------------------------------------------------------------
+
+async function runAction({ action, conversationId, conversationIds, query, limit, all, profile, timeout = 120, title, fileId, outputPath }) {
   let context = null;
   let tempDir = null;
   try {
@@ -488,50 +723,35 @@ async function runAction({ action, conversationId, query, limit, all, profile, t
       });
     }
 
-    const page = context.pages()[0] || await context.newPage();
-    progress(2, 4, 'Loading ChatGPT');
-    await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    progress(2, 4, 'Authenticating');
+    const accessToken = await fetchAccessToken(context);
 
-    const ready = await waitForReady(page, 45_000);
-    if (!ready.ready) {
-      fail('ui_timeout', 'Timed out waiting for ChatGPT');
-      return;
-    }
-    if (!ready.loggedIn) {
-      fail('login_required', 'ChatGPT is not logged in');
-      return;
-    }
+    progress(3, 4, action === 'search' ? 'Searching' : action === 'bulk_delete' ? 'Deleting conversations' : 'Fetching');
 
-    progress(3, 4, 'Fetching conversations');
-    const result = action === 'search'
-      ? await searchConversations(page, { query, limit })
-      : await callBackend(page, { action, conversationId, query, limit, all, title, fileId, includeBytes: false, outputPath });
-
-    // Stream file download Node-side (no size cap, no base64 overhead)
-    if (action === 'download' && outputPath && result.result?.download_url) {
-      const resolvedPath = pathResolve(outputPath);
-      const outDir = dirname(resolvedPath);
-      if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-
-      progress(4, 4, 'Downloading file to disk');
-      const downloadResp = await page.request.fetch(result.result.download_url);
-      if (!downloadResp.ok()) {
-        fail('download_failed', `Download failed: HTTP ${downloadResp.status()}`);
+    let result;
+    switch (action) {
+      case 'list':
+        result = await apiListConversations(context, accessToken, { limit, all }); break;
+      case 'search':
+        result = await apiSearchConversations(context, accessToken, { query, limit }); break;
+      case 'get':
+        result = await apiGetConversation(context, accessToken, conversationId); break;
+      case 'delete':
+        result = await apiDeleteConversation(context, accessToken, conversationId); break;
+      case 'bulk_delete':
+        result = await apiBulkDelete(context, accessToken, conversationIds || [conversationId]); break;
+      case 'rename':
+        result = await apiRenameConversation(context, accessToken, conversationId, title); break;
+      case 'download':
+        result = await apiDownloadFile(context, accessToken, fileId, outputPath); break;
+      default:
+        fail('invalid_action', `Unsupported action: ${action}`);
         return;
-      }
-      const body = await downloadResp.body();
-      writeFileSync(resolvedPath, body);
-
-      const disposition = downloadResp.headers()['content-disposition'] || '';
-      const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
-      result.file = {
-        savedPath: resolvedPath,
-        mimeType: downloadResp.headers()['content-type'] || null,
-        fileName: decodeURIComponent(match?.[1] || match?.[2] || ''),
-        size: body.byteLength,
-      };
     }
-    success({ ...result, backend: 'cloak' });
+
+    success(Array.isArray(result)
+      ? { action: 'bulk_delete', results: result, backend: 'cloak' }
+      : { ...result, backend: 'cloak' });
   } catch (error) {
     log('error', 'Chats worker failed', { error: error.message, code: error.code, status: error.status });
     fail(error.code || 'query_failed', error.message, {

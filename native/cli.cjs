@@ -379,6 +379,7 @@ const TOOLS = {
           format: "Export format: markdown|json",
           rename: "Rename a conversation by ID",
           delete: "Delete a conversation by ID",
+          "delete-ids": "Bulk-delete conversations by comma-separated IDs",
           "download-file": "Download attached file by file ID (use with --output)",
           continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
           "no-cache": "Bypass local chats cache",
@@ -3131,6 +3132,16 @@ const printChatGptChatsResult = (result, opts = {}) => {
     else console.log(`Deleted conversation: ${result.conversationId}`);
     return;
   }
+  if (result.action === "bulk_delete") {
+    if (wantJson) console.log(JSON.stringify(result ?? null, null, 2));
+    else {
+      const results = result.results || [];
+      const ok = results.filter(r => r.deleteMethod !== "error").length;
+      const failed = results.filter(r => r.deleteMethod === "error").length;
+      console.log(`Deleted ${ok} conversation${ok !== 1 ? 's' : ''}${failed ? ` (${failed} failed)` : ''}`);
+    }
+    return;
+  }
   if (result.action === "download") {
     if (wantJson) console.log(JSON.stringify(result ?? null, null, 2));
     else if (result.file?.savedPath) console.log(`Downloaded file to: ${result.file.savedPath}`);
@@ -3303,7 +3314,7 @@ const runChatGptChatsDirect = async (chatArgs, renderOpts = {}) => {
     }));
 
     if (cacheable) chatgptChatsCache.setCachedChats(chatArgs, result);
-    if (["rename", "delete"].includes(chatArgs.action)) chatgptChatsCache.invalidateCachedChats();
+    if (["rename", "delete", "bulk_delete"].includes(chatArgs.action)) chatgptChatsCache.invalidateCachedChats();
 
     const durationMs = Date.now() - startMs;
     const preview = result.action === "get"
@@ -3397,6 +3408,9 @@ if (tool === "chatgpt.chats") {
   const fileId = typeof toolArgs["download-file"] === "string" ? toolArgs["download-file"].trim() : "";
   const limit = toolArgs.limit === undefined ? undefined : parseInt(String(toolArgs.limit), 10);
   const wantsDelete = toolArgs.delete === true;
+  const bulkDeleteIds = typeof toolArgs["delete-ids"] === "string"
+    ? toolArgs["delete-ids"].split(",").map(s => s.trim()).filter(Boolean)
+    : [];
   const continueInBrowser = toolArgs.continue === true;
   const useCache = toolArgs["no-cache"] !== true;
 
@@ -3425,13 +3439,17 @@ if (tool === "chatgpt.chats") {
     process.exit(1);
   }
 
-  const advancedCount = [renameTitle ? 1 : 0, wantsDelete ? 1 : 0, fileId ? 1 : 0].reduce((sum, n) => sum + n, 0);
+  const advancedCount = [renameTitle ? 1 : 0, wantsDelete ? 1 : 0, bulkDeleteIds.length > 0 ? 1 : 0, fileId ? 1 : 0].reduce((sum, n) => sum + n, 0);
   if (advancedCount > 1) {
-    console.error("Error: use only one of --rename, --delete, or --download-file");
+    console.error("Error: use only one of --rename, --delete, --delete-ids, or --download-file");
     process.exit(1);
   }
   if ((renameTitle || wantsDelete || fileId) && !conversationId) {
     console.error("Error: conversation ID required for this action");
+    process.exit(1);
+  }
+  if (bulkDeleteIds.length > 0 && conversationId) {
+    console.error("Error: --delete-ids cannot be used with a conversation ID positional arg");
     process.exit(1);
   }
   if (fileId && !outputPath) {
@@ -3451,17 +3469,20 @@ if (tool === "chatgpt.chats") {
     ? "rename"
     : wantsDelete
       ? "delete"
-      : fileId
-        ? "download"
-        : conversationId
-          ? "get"
-          : searchQuery
-            ? "search"
-            : "list";
+      : bulkDeleteIds.length > 0
+        ? "bulk_delete"
+        : fileId
+          ? "download"
+          : conversationId
+            ? "get"
+            : searchQuery
+              ? "search"
+              : "list";
   (async () => {
     const chatArgs = {
       action,
       conversationId: conversationId || undefined,
+      conversationIds: bulkDeleteIds.length > 0 ? bulkDeleteIds : undefined,
       query: searchQuery || undefined,
       limit,
       all: toolArgs.all === true,
