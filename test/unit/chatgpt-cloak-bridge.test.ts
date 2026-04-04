@@ -146,6 +146,52 @@ describe("chatgpt-cloak-bridge", () => {
     bridge.__resetBridgeRuntimeForTests();
   });
 
+  it("forwards rich thinking trace progress payload", async () => {
+    const worker = createWorker();
+    const spawn = vi.fn().mockReturnValue(worker);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+    const progress = vi.fn();
+
+    const promise = bridge.queryWithCloakBrowser({ query: "think", timeout: 5 }, progress);
+
+    worker.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "trace",
+        traceType: "thinking_text",
+        phase: "Thinking",
+        isThinking: true,
+        thoughtText: "Plan\nFirst, inspect the inputs.",
+        thoughtDelta: "Plan\nFirst, inspect the inputs.",
+        thoughtCount: 1,
+        durationSec: 4,
+      }) + "\n"
+    );
+
+    worker.stdout.emit(
+      "data",
+      JSON.stringify({ type: "success", response: "done", model: "gpt-5-4-pro", tookMs: 1000 }) + "\n"
+    );
+
+    await promise;
+
+    expect(progress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "trace",
+        traceType: "thinking_text",
+        phase: "Thinking",
+        isThinking: true,
+        thoughtText: "Plan\nFirst, inspect the inputs.",
+        thoughtDelta: "Plan\nFirst, inspect the inputs.",
+        thoughtCount: 1,
+        durationSec: 4,
+      })
+    );
+
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
   it("times out workers", async () => {
     vi.useFakeTimers();
     const worker = createWorker();

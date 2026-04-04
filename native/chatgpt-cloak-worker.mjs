@@ -415,9 +415,16 @@ const makeExtractThinkingTraceJS = (rawTurnId) => {
             if (typeof t === 'string') {
               thoughts.push({ summary: '', content: t.slice(0, MAX_CONTENT) });
             } else if (t && typeof t === 'object') {
+              var chunkText = Array.isArray(t.chunks)
+                ? t.chunks.filter(function(c) { return typeof c === 'string'; }).join('')
+                : '';
+              var contentText = '';
+              if (typeof t.content === 'string' && t.content) contentText = t.content;
+              else if (chunkText) contentText = chunkText;
               thoughts.push({
                 summary: (t.summary || '').slice(0, 200),
-                content: (t.content || '').slice(0, MAX_CONTENT),
+                content: contentText.slice(0, MAX_CONTENT),
+                finished: t.finished === true,
               });
             }
           }
@@ -456,6 +463,31 @@ async function extractThinkingTrace(page, turnId) {
     log('warn', 'Thinking trace extraction failed', { error: e.message });
     return null;
   }
+}
+
+// Format thinking trace for live streaming to CLI
+function formatThinkingTraceText(trace) {
+  if (!trace || !Array.isArray(trace.thoughts)) return '';
+  return trace.thoughts
+    .map((t) => {
+      const summary = (t.summary || '').trim();
+      const content = (t.content || '').trim();
+      if (summary && content) return `${summary}\n${content}`;
+      return summary || content;
+    })
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+}
+
+function buildThinkingProgressPayload(previousText, trace) {
+  const fullText = formatThinkingTraceText(trace);
+  if (!fullText) return null;
+  const delta = previousText && fullText.startsWith(previousText)
+    ? fullText.slice(previousText.length).replace(/^\n+/, '')
+    : fullText;
+  if (!delta.trim()) return null;
+  return { fullText, delta };
 }
 
 // ============================================================================
@@ -691,6 +723,9 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     let lastPhase = '';
     let imagePath = null;
     let responseTurnId = null;
+    let liveThinkingTrace = null;
+    let lastThinkingSignature = '';
+    let lastThinkingText = '';
 
     while (Date.now() < deadline) {
       await sleep(500);
@@ -732,6 +767,41 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       }
       if (!sawActivity) continue;
 
+      // 5b. Live thinking trace — poll React fiber for rich thought text
+      const isThinkingPhase = isStreaming && phaseResult && phaseResult.isThinking;
+      if (isThinkingPhase) {
+        try {
+          const nextTrace = await extractThinkingTrace(page, responseTurnId || null);
+          if (nextTrace) {
+            liveThinkingTrace = nextTrace;
+            const signature = JSON.stringify({
+              thoughts: (nextTrace.thoughts || []).map(t => [(t.summary || ''), (t.content || '').slice(0, 200), !!t.finished]),
+              recapText: nextTrace.recapText || null,
+            });
+            if (signature !== lastThinkingSignature) {
+              const payload = buildThinkingProgressPayload(lastThinkingText, nextTrace);
+              if (payload) {
+                emit({
+                  type: 'trace',
+                  traceType: 'thinking_text',
+                  phase: phase || nextTrace.recapText || 'Thinking',
+                  isThinking: true,
+                  thoughtText: payload.fullText,
+                  thoughtDelta: payload.delta,
+                  thoughtCount: nextTrace.thoughts?.length || 0,
+                  durationSec: nextTrace.durationSec || null,
+                  recapText: nextTrace.recapText || null,
+                });
+                lastThinkingText = payload.fullText;
+              }
+              lastThinkingSignature = signature;
+            }
+          }
+        } catch (e) {
+          log('warn', 'Live thinking trace poll failed', { error: e.message });
+        }
+      }
+
       // 6. Completion: stream.done with stream text = authoritative
       if (stream.done && stream.text && stream.text.length > 0) {
         responseText = currentText || sanitizedDom || stream.text;
@@ -741,7 +811,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       // 7. DOM stability fallback (requiredStableCycles=4, minStableMs=2500)
       // While model is still in thinking phase (stop button visible + thinking label),
       // treat as streaming to prevent premature completion on thinking-phase text.
-      const isThinkingPhase = isStreaming && phaseResult && phaseResult.isThinking;
+      // (isThinkingPhase already computed in step 5b above)
       const stability = advanceTextStability({
         text: currentText,
         previousText: lastText,
@@ -766,14 +836,20 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     }
 
     // Thinking trace extraction (post-response, from React fiber state)
-    let thinkingTrace = null;
+    // Fall back to live-captured trace if final extraction fails
+    let thinkingTrace = liveThinkingTrace;
     try {
-      thinkingTrace = await extractThinkingTrace(page, responseTurnId);
-      if (thinkingTrace) {
+      const finalTrace = await extractThinkingTrace(page, responseTurnId);
+      if (finalTrace) {
+        thinkingTrace = finalTrace;
         log('info', 'Thinking trace captured', {
-          thoughtCount: thinkingTrace.thoughts?.length || 0,
-          durationSec: thinkingTrace.durationSec,
-          recapText: thinkingTrace.recapText,
+          thoughtCount: finalTrace.thoughts?.length || 0,
+          durationSec: finalTrace.durationSec,
+          recapText: finalTrace.recapText,
+        });
+      } else if (liveThinkingTrace) {
+        log('info', 'Using live-captured thinking trace (final extraction empty)', {
+          thoughtCount: liveThinkingTrace.thoughts?.length || 0,
         });
       }
     } catch (e) {

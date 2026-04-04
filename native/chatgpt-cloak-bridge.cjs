@@ -98,7 +98,17 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
               settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
               break;
             case "trace":
-              onProgress({ type: "trace", phase: msg.phase, isThinking: msg.isThinking });
+              onProgress({
+                type: "trace",
+                phase: msg.phase,
+                isThinking: msg.isThinking,
+                traceType: msg.traceType,
+                thoughtText: msg.thoughtText,
+                thoughtDelta: msg.thoughtDelta,
+                thoughtCount: msg.thoughtCount,
+                durationSec: msg.durationSec,
+                recapText: msg.recapText,
+              });
               break;
             case "log":
               if (process.env.SURF_DEBUG) {
@@ -134,7 +144,17 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
             settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
             return true;
           case "trace":
-            onProgress({ type: "trace", phase: msg.phase, isThinking: msg.isThinking });
+            onProgress({
+              type: "trace",
+              phase: msg.phase,
+              isThinking: msg.isThinking,
+              traceType: msg.traceType,
+              thoughtText: msg.thoughtText,
+              thoughtDelta: msg.thoughtDelta,
+              thoughtCount: msg.thoughtCount,
+              durationSec: msg.durationSec,
+              recapText: msg.recapText,
+            });
             return false;
           case "log":
             if (process.env.SURF_DEBUG) process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);

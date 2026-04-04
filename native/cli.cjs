@@ -3214,6 +3214,18 @@ const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
   try {
     const result = await withOptionalHeadedCloak(queryArgs.continueInBrowser === true, () => queryWithCloakBrowser(queryArgs, (progress) => {
       if (progress.type === "trace") {
+        // Rich thinking text — print deltas as they arrive
+        if (progress.traceType === "thinking_text") {
+          const chunk = String(progress.thoughtDelta || progress.thoughtText || "").trim();
+          if (chunk) {
+            const lines = chunk.split("\n");
+            process.stderr.write(`[cloak-${sessionTool}] 🧠 ${lines[0]}\n`);
+            for (const line of lines.slice(1)) {
+              process.stderr.write(`[cloak-${sessionTool}]    ${line}\n`);
+            }
+          }
+          return;
+        }
         const msg = `[cloak-${sessionTool}] ⏳ ${progress.phase}`;
         if (msg !== lastProgress) {
           process.stderr.write(msg + "\n");
