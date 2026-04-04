@@ -162,8 +162,11 @@ function classifyError(code: number, stdout: string, stderr: string): SurfChatsE
   if (combined.includes("cloakbrowser not installed") || combined.includes("npm install -g cloakbrowser")) {
     return { code: "setup", message: "CloakBrowser not installed. Run: npm install -g cloakbrowser" };
   }
-  if (combined.includes("processsingleton") || combined.includes("profile directory")) {
-    return { code: "setup", message: "CloakBrowser profile locked. Close other surf instances first." };
+  if (combined.includes("processsingleton") || combined.includes("profile directory") || combined.includes("singletonlock")) {
+    return { code: "setup", message: "CloakBrowser profile locked. Close other surf instances or remove ~/.surf/cloak-profile/SingletonLock" };
+  }
+  if (combined.includes("worker exited") && combined.includes("without result")) {
+    return { code: "crash", message: "CloakBrowser worker crashed. Retry or check ~/.surf/sessions/ for details" };
   }
   if (combined.includes("unknown tool: chatgpt.chats")) {
     return { code: "setup", message: "Installed surf CLI is too old for chatgpt.chats. Upgrade/reinstall surf-cli." };

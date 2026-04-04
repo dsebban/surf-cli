@@ -6,7 +6,7 @@
  */
 
 import { launchPersistentContext } from 'cloakbrowser';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join, dirname, resolve as pathResolve } from 'path';
 import { loadAndInjectChatgptCookies } from './chatgpt-cloak-profile-auth.mjs';
@@ -27,6 +27,25 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function sharedProfileDir() {
   const dir = join(homedir(), '.surf', 'cloak-profile');
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Clean stale SingletonLock from crashed sessions
+  const lockPath = join(dir, 'SingletonLock');
+  if (existsSync(lockPath)) {
+    try {
+      const target = readlinkSync(lockPath);
+      // Format: hostname-pid — check if PID is still alive
+      const pidMatch = target.match(/-(\d+)$/);
+      if (pidMatch) {
+        try { process.kill(Number(pidMatch[1]), 0); } catch {
+          // PID not running → stale lock
+          unlinkSync(lockPath);
+          log('info', 'Cleaned stale SingletonLock', { target });
+        }
+      }
+    } catch {
+      // readlink failed (not a symlink) or unlink failed — try removing anyway
+      try { unlinkSync(lockPath); } catch {}
+    }
+  }
   return dir;
 }
 
