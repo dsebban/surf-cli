@@ -283,7 +283,7 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
 
     // ─── Detail runner ────────────────────────────────────────────────
 
-    const detailRunner = createQueueRunner<{ conversationId: string }>(
+    const detailRunner = createQueueRunner<{ conversationId: string; updateTime?: string | number | null }>(
       async (item, signal) => {
         const { conversationId } = item;
         // Remove from queued tracking
@@ -301,7 +301,7 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
         overlay?.updateState(state);
 
         try {
-          const detail = await client.getConversation(conversationId, signal);
+          const detail = await client.getConversation(conversationId, signal, item.updateTime);
           if (closed) return;
           state.detailCache.set(conversationId, detail);
         } catch (err) {
@@ -576,7 +576,8 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
           state.loadedConversationId = id;
           recomputeStatusBar(state);
           overlay?.updateState(state);
-          detailRunner.enqueue({ conversationId: id });
+          const listItem = state.items.find(it => it.id === id);
+          detailRunner.enqueue({ conversationId: id, updateTime: listItem?.update_time });
           break;
         }
 

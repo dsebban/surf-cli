@@ -582,6 +582,10 @@ export class SurfChatsOverlay implements Component, Focusable {
     const s = this.state;
     const lines: string[] = [];
 
+    // Clear message tracking — only re-populated when actively showing detail
+    this.messageLineOffsets = [];
+    this.messageCount = 0;
+
     const selected = s.items[s.selectedIndex];
     if (!selected) {
       lines.push(th.fg("muted", " Select a conversation"));
@@ -616,10 +620,6 @@ export class SurfChatsOverlay implements Component, Focusable {
     // Cached detail available — only show when actively viewing (loadedConversationId)
     const cached = s.loadedConversationId === selected.id ? s.detailCache.get(selected.id) : null;
     if (cached) {
-      // Reset message tracking
-      this.messageLineOffsets = [];
-      this.messageCount = 0;
-
       lines.push(th.fg("accent", ` ${truncateVisible(cached.summary.title, Math.max(1, width - 1))}`));
       const meta = [
         cached.summary.model,

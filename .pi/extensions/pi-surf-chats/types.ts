@@ -52,6 +52,8 @@ export interface DetailRecord {
   summary: ConversationSummary;
   markdown: string;
   loadedAt: number;
+  /** Conversation update_time from list item (for disk cache staleness) */
+  updateTime?: string | number | null;
 }
 
 /** Progress event parsed from stderr */

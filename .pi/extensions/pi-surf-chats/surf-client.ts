@@ -92,11 +92,23 @@ function diskCachePathFor(conversationId: string): { md: string; meta: string } 
   };
 }
 
-function readDiskCache(conversationId: string): DetailRecord | null {
+function readDiskCache(conversationId: string, knownUpdateTime?: string | number | null): DetailRecord | null {
   const paths = diskCachePathFor(conversationId);
   try {
     if (!fs.existsSync(paths.md) || !fs.existsSync(paths.meta)) return null;
     const meta = JSON.parse(fs.readFileSync(paths.meta, "utf8"));
+
+    // Staleness check: if the list item's update_time is newer than cached, skip cache
+    if (knownUpdateTime != null && meta.updateTime != null) {
+      const cachedMs = typeof meta.updateTime === "number"
+        ? (meta.updateTime > 1e12 ? meta.updateTime : meta.updateTime * 1000)
+        : Date.parse(String(meta.updateTime)) || 0;
+      const knownMs = typeof knownUpdateTime === "number"
+        ? (knownUpdateTime > 1e12 ? knownUpdateTime : knownUpdateTime * 1000)
+        : Date.parse(String(knownUpdateTime)) || 0;
+      if (knownMs > cachedMs) return null; // conversation updated since cache
+    }
+
     const markdown = fs.readFileSync(paths.md, "utf8");
     return {
       conversationId,
@@ -120,6 +132,7 @@ function writeDiskCache(record: DetailRecord): void {
     fs.writeFileSync(tmpMeta, JSON.stringify({
       summary: record.summary,
       loadedAt: record.loadedAt,
+      updateTime: record.updateTime ?? record.summary.create_time,
     }, null, 2), "utf8");
     fs.renameSync(tmpMd, paths.md);
     fs.renameSync(tmpMeta, paths.meta);
@@ -323,9 +336,9 @@ export class SurfChatsClient {
     return this.parseListResult(parsed, "search");
   }
 
-  async getConversation(conversationId: string, signal?: AbortSignal): Promise<DetailRecord> {
-    // 1. Check disk cache first (instant)
-    const diskCached = readDiskCache(conversationId);
+  async getConversation(conversationId: string, signal?: AbortSignal, knownUpdateTime?: string | number | null): Promise<DetailRecord> {
+    // 1. Check disk cache first (instant) — skipped if conversation updated since cache
+    const diskCached = readDiskCache(conversationId, knownUpdateTime);
     if (diskCached) {
       diskCached.loadedAt = Date.now();
       return diskCached;
@@ -421,6 +434,7 @@ export class SurfChatsClient {
       summary,
       markdown,
       loadedAt: Date.now(),
+      updateTime: (conversation.update_time as string | number) ?? (conversation.create_time as string | number) ?? null,
     };
   }
 }
