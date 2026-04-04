@@ -82,6 +82,58 @@ const DEFAULT_TIMEOUT = 120_000; // 120s
 const DEFAULT_CHATGPT_PROFILE = process.platform === "darwin" ? "dsebban883@gmail.com" : null;
 const DEBUG_DIR = path.join(os.tmpdir(), "pi-surf-chats-debug");
 
+// ── Disk cache for conversation details ──────────────────────────────────────
+const DISK_CACHE_DIR = path.join(os.homedir(), ".surf", "cache", "chatgpt-md");
+
+function diskCachePathFor(conversationId: string): { md: string; meta: string } {
+  return {
+    md: path.join(DISK_CACHE_DIR, `${conversationId}.md`),
+    meta: path.join(DISK_CACHE_DIR, `${conversationId}.meta.json`),
+  };
+}
+
+function readDiskCache(conversationId: string): DetailRecord | null {
+  const paths = diskCachePathFor(conversationId);
+  try {
+    if (!fs.existsSync(paths.md) || !fs.existsSync(paths.meta)) return null;
+    const meta = JSON.parse(fs.readFileSync(paths.meta, "utf8"));
+    const markdown = fs.readFileSync(paths.md, "utf8");
+    return {
+      conversationId,
+      summary: meta.summary,
+      markdown,
+      loadedAt: meta.loadedAt ?? Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeDiskCache(record: DetailRecord): void {
+  try {
+    fs.mkdirSync(DISK_CACHE_DIR, { recursive: true });
+    const paths = diskCachePathFor(record.conversationId);
+    // Atomic writes
+    const tmpMd = paths.md + `.${process.pid}.tmp`;
+    const tmpMeta = paths.meta + `.${process.pid}.tmp`;
+    fs.writeFileSync(tmpMd, record.markdown, "utf8");
+    fs.writeFileSync(tmpMeta, JSON.stringify({
+      summary: record.summary,
+      loadedAt: record.loadedAt,
+    }, null, 2), "utf8");
+    fs.renameSync(tmpMd, paths.md);
+    fs.renameSync(tmpMeta, paths.meta);
+  } catch {
+    // non-fatal — in-memory cache still works
+  }
+}
+
+function deleteDiskCache(conversationId: string): void {
+  const paths = diskCachePathFor(conversationId);
+  try { fs.unlinkSync(paths.md); } catch {}
+  try { fs.unlinkSync(paths.meta); } catch {}
+}
+
 function classifyError(code: number, stdout: string, stderr: string): SurfChatsError {
   const combined = `${stderr}\n${stdout}`.toLowerCase();
 
@@ -272,6 +324,14 @@ export class SurfChatsClient {
   }
 
   async getConversation(conversationId: string, signal?: AbortSignal): Promise<DetailRecord> {
+    // 1. Check disk cache first (instant)
+    const diskCached = readDiskCache(conversationId);
+    if (diskCached) {
+      diskCached.loadedAt = Date.now();
+      return diskCached;
+    }
+
+    // 2. Fetch from network
     const { parsed } = await this.runSurfJson(["chatgpt.chats", conversationId, "--json"], `get-${conversationId}`, signal);
     const detail = this.parseGetResult(conversationId, parsed);
 
@@ -291,6 +351,9 @@ export class SurfChatsClient {
       }
     }
 
+    // 3. Write to disk cache for next time
+    writeDiskCache(detail);
+
     return detail;
   }
 
@@ -301,6 +364,7 @@ export class SurfChatsClient {
 
   async deleteConversation(conversationId: string, signal?: AbortSignal): Promise<void> {
     await this.runSurfJson(["chatgpt.chats", conversationId, "--delete", "--json"], `delete-${conversationId}`, signal);
+    deleteDiskCache(conversationId);
   }
 
   async bulkDeleteConversations(conversationIds: string[], signal?: AbortSignal): Promise<void> {
@@ -311,6 +375,7 @@ export class SurfChatsClient {
       `bulk-delete-${conversationIds.length}`,
       signal,
     );
+    for (const id of conversationIds) deleteDiskCache(id);
   }
 
   private parseListResult(parsed: unknown, action: "list" | "search" = "list"): ListResult {

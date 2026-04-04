@@ -122,6 +122,10 @@ export class SurfChatsOverlay implements Component, Focusable {
   // Scroll state for detail pane
   private detailScrollOffset = 0;
   private detailTotalLines = 0;
+  /** Line offsets where each message starts (for n/p jumping) */
+  private messageLineOffsets: number[] = [];
+  /** Total message count in current detail view */
+  private messageCount = 0;
 
   focused = true;
 
@@ -289,6 +293,28 @@ export class SurfChatsOverlay implements Component, Focusable {
       return;
     }
 
+    // n / p → jump to next/prev message in detail pane
+    if (data === "n" && this.messageLineOffsets.length > 0) {
+      const next = this.messageLineOffsets.find(off => off > this.detailScrollOffset + 1);
+      if (next !== undefined) {
+        const maxScroll = Math.max(0, this.detailTotalLines - this.detailViewHeight());
+        this.detailScrollOffset = Math.min(next, maxScroll);
+        this.tui.requestRender();
+      }
+      return;
+    }
+    if (data === "p" && this.messageLineOffsets.length > 0) {
+      // Find the last offset before current scroll position
+      let prev = 0;
+      for (const off of this.messageLineOffsets) {
+        if (off >= this.detailScrollOffset) break;
+        prev = off;
+      }
+      this.detailScrollOffset = Math.max(prev, 0);
+      this.tui.requestRender();
+      return;
+    }
+
     // Enter → load detail or inject if already cached
     if (matchesKey(data, "return")) {
       const selected = s.items[s.selectedIndex];
@@ -380,9 +406,23 @@ export class SurfChatsOverlay implements Component, Focusable {
     const modeText = this.state.mode === "search"
       ? th.fg("warning", ` Search: "${this.state.activeQuery}" `)
       : th.fg("dim", " Recent ");
+    // Scroll position indicator (shown when viewing a detail with messages)
+    let scrollIndicator = "";
+    if (this.state.loadedConversationId && this.messageCount > 0) {
+      // Find which message is currently visible
+      let currentMsg = 0;
+      for (let i = 0; i < this.messageLineOffsets.length; i++) {
+        if (this.messageLineOffsets[i]! <= this.detailScrollOffset + 2) currentMsg = i;
+      }
+      const pct = this.detailTotalLines > 0
+        ? Math.round((this.detailScrollOffset / Math.max(1, this.detailTotalLines - this.detailViewHeight())) * 100)
+        : 0;
+      const clampedPct = Math.min(100, Math.max(0, pct));
+      scrollIndicator = th.fg("dim", ` msg ${currentMsg + 1}/${this.messageCount} · ${clampedPct}% `);
+    }
     lines.push(
       border("┌") +
-      truncateToWidth(padEndVisible(titleText + modeText, innerW), innerW) +
+      truncateToWidth(padEndVisible(titleText + modeText + scrollIndicator, innerW), innerW) +
       border("┐")
     );
 
@@ -442,11 +482,14 @@ export class SurfChatsOverlay implements Component, Focusable {
 
     // ── Footer hints + debug ──
     const moreHint = !this.state.searchEditActive && this.state.hasMore && this.state.mode === "recent" ? " • j/↓ more" : "";
+    const viewingDetail = this.state.loadedConversationId && this.messageCount > 0;
     const hints = this.state.searchEditActive
       ? "Enter submit • Esc cancel"
       : this.state.deletePrompt
         ? "y confirm delete • any other key cancel"
-        : `j/k list • ↑↓ scroll • Space mark • Enter inject • / search • e export • d del • r refresh • Esc${moreHint}`;
+        : viewingDetail
+          ? `↑↓ scroll • n/p next/prev msg • J/K page • Enter inject • Esc back${moreHint}`
+          : `j/k list • ↑↓ scroll • Space mark • Enter load • / search • e export • d del • r refresh • Esc${moreHint}`;
     const debugCli = ` CLI: ${compactPath(this.state.resolvedCliPath, Math.max(8, innerW - 6))}`;
     const debugFmt = ` Formatter: ${compactPath(this.state.resolvedFormatterPath, Math.max(8, innerW - 12))}`;
     const debugProfile = ` Profile: ${this.state.resolvedProfile ?? "none"}`;
@@ -573,6 +616,10 @@ export class SurfChatsOverlay implements Component, Focusable {
     // Cached detail available — only show when actively viewing (loadedConversationId)
     const cached = s.loadedConversationId === selected.id ? s.detailCache.get(selected.id) : null;
     if (cached) {
+      // Reset message tracking
+      this.messageLineOffsets = [];
+      this.messageCount = 0;
+
       lines.push(th.fg("accent", ` ${truncateVisible(cached.summary.title, Math.max(1, width - 1))}`));
       const meta = [
         cached.summary.model,
@@ -589,8 +636,12 @@ export class SurfChatsOverlay implements Component, Focusable {
           lines.push(th.fg("dim", ` ${truncateToWidth(tl, maxTextW)}`));
         }
       } else {
-        for (const msg of cached.summary.messages) {
+        this.messageCount = cached.summary.messages.length;
+        for (let mi = 0; mi < cached.summary.messages.length; mi++) {
+          const msg = cached.summary.messages[mi]!;
           const who = msg.role === "user" ? th.fg("accent", "You") : th.fg("text", "ChatGPT");
+          // Record line offset for this message (the blank line before it)
+          this.messageLineOffsets.push(lines.length);
           lines.push("");
           lines.push(` ${who}`);
 
