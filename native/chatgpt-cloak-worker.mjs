@@ -243,7 +243,10 @@ const DETECT_PHASE_JS = `(() => {
   clone.querySelectorAll('.sr-only, .markdown, button, nav, form, script, style').forEach(function(el) { el.remove(); });
   var raw = (clone.textContent || '').trim();
   var label = raw.split('\\n')[0].trim().slice(0, 80) || 'Thinking';
-  return { phase: label, isThinking: true, thinkingText: raw.slice(0, 8000) };
+  var body = raw;
+  var timerMatch = raw.match(/^(Thought|Thinking)\\s+(for\\s+)?\\d+\\s*s(econds?)?\\n?/);
+  if (timerMatch) body = raw.slice(timerMatch[0].length);
+  return { phase: label, isThinking: true, thinkingText: body };
 })()`;
 
 // ============================================================================
@@ -466,31 +469,6 @@ async function extractThinkingTrace(page, turnId) {
     log('warn', 'Thinking trace extraction failed', { error: e.message });
     return null;
   }
-}
-
-// Format thinking trace for live streaming to CLI
-function formatThinkingTraceText(trace) {
-  if (!trace || !Array.isArray(trace.thoughts)) return '';
-  return trace.thoughts
-    .map((t) => {
-      const summary = (t.summary || '').trim();
-      const content = (t.content || '').trim();
-      if (summary && content) return `${summary}\n${content}`;
-      return summary || content;
-    })
-    .filter(Boolean)
-    .join('\n\n')
-    .trim();
-}
-
-function buildThinkingProgressPayload(previousText, trace) {
-  const fullText = formatThinkingTraceText(trace);
-  if (!fullText) return null;
-  const delta = previousText && fullText.startsWith(previousText)
-    ? fullText.slice(previousText.length).replace(/^\n+/, '')
-    : fullText;
-  if (!delta.trim()) return null;
-  return { fullText, delta };
 }
 
 // ============================================================================
@@ -771,25 +749,30 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
 
       // 5b. Live thinking trace — emit DOM thinking text as deltas
       const isThinkingPhase = isStreaming && phaseResult && phaseResult.isThinking;
-      if (isThinkingPhase && phaseResult.thinkingText) {
-        const fullText = phaseResult.thinkingText;
-        if (fullText !== lastThinkingText) {
-          const delta = lastThinkingText && fullText.startsWith(lastThinkingText)
-            ? fullText.slice(lastThinkingText.length).replace(/^\n+/, '')
-            : fullText;
+      if (isThinkingPhase) {
+        // DOM-based delta emission (timer line already stripped in DETECT_PHASE_JS)
+        const fullText = (phaseResult.thinkingText || '').trim();
+        if (fullText && fullText !== lastThinkingText) {
+          let delta;
+          if (lastThinkingText && fullText.startsWith(lastThinkingText)) {
+            delta = fullText.slice(lastThinkingText.length).replace(/^\n+/, '');
+          } else {
+            delta = fullText;
+          }
+          // Cap emitted delta to 4k to avoid flooding CLI; source state is uncapped
           if (delta.trim()) {
             emit({
               type: 'trace',
               traceType: 'thinking_text',
               phase: phase || 'Thinking',
               isThinking: true,
-              thoughtText: fullText,
-              thoughtDelta: delta,
+              thoughtText: fullText.slice(0, 8000),
+              thoughtDelta: delta.slice(0, 4000),
             });
           }
           lastThinkingText = fullText;
         }
-        // Also try fiber extraction for structured data (may work later in thinking)
+        // Fiber extraction (independent of DOM text — may populate later in thinking)
         try {
           const nextTrace = await extractThinkingTrace(page, responseTurnId || null);
           if (nextTrace) liveThinkingTrace = nextTrace;
