@@ -4,6 +4,8 @@
  * Left pane: conversation list with search
  * Right pane: conversation detail / status
  * Follows pi-tui Component + Focusable pattern (à la pi-side-chat, pi-messenger)
+ *
+ * Consumes lane-based ControllerState — no single `phase` field.
  */
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
@@ -155,12 +157,13 @@ export class SurfChatsOverlay implements Component, Focusable {
     const s = this.state;
 
     // ── Delete confirmation mode ──
-    if (s.phase === "confirm_delete" && s.pendingDeleteId) {
+    if (s.deletePrompt) {
       if (data === "y" || data === "Y") {
-        // pendingDeleteId stores comma-joined IDs for batch
-        const ids = s.pendingDeleteId.split(",");
-        const titles = (s.pendingDeleteTitle ?? "").split("\n");
-        this.callbacks.onAction({ action: "confirm_delete", conversationIds: ids, titles });
+        this.callbacks.onAction({
+          action: "confirm_delete",
+          conversationIds: s.deletePrompt.conversationIds,
+          titles: s.deletePrompt.titles,
+        });
         return;
       }
       // Any other key cancels
@@ -171,7 +174,7 @@ export class SurfChatsOverlay implements Component, Focusable {
     // Escape: exit search mode or close overlay
     if (matchesKey(data, "escape")) {
       if (s.searchEditActive) {
-        this.callbacks.onAction({ action: "load_list" }); // exit search, reload recent
+        this.callbacks.onAction({ action: "load_list" });
         return;
       }
       this.callbacks.onClose();
@@ -182,7 +185,6 @@ export class SurfChatsOverlay implements Component, Focusable {
     // Search edit mode: handle text input
     if (s.searchEditActive) {
       if (matchesKey(data, "return")) {
-        // Submit search (or reload recent if empty)
         const q = s.searchDraft.trim();
         if (q) {
           this.callbacks.onAction({ action: "search", query: q });
@@ -196,7 +198,6 @@ export class SurfChatsOverlay implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      // Printable character
       if (data.length === 1 && data.charCodeAt(0) >= 32) {
         s.searchDraft += data;
         this.tui.requestRender();
@@ -205,7 +206,7 @@ export class SurfChatsOverlay implements Component, Focusable {
       return;
     }
 
-    // Normal mode keybindings
+    // ── Normal mode keybindings ──
 
     // / → enter search mode
     if (data === "/") {
@@ -218,7 +219,7 @@ export class SurfChatsOverlay implements Component, Focusable {
     // j / k → always navigate list; trigger load_more at end
     if (data === "j") {
       if (s.items.length === 0) return;
-      if (s.selectedIndex === s.items.length - 1 && s.hasMore && s.phase === "idle") {
+      if (s.selectedIndex === s.items.length - 1 && s.hasMore && !s.listLane.isRunning) {
         this.callbacks.onAction({ action: "load_more" });
         return;
       }
@@ -244,9 +245,8 @@ export class SurfChatsOverlay implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      // No detail loaded — fall back to list navigation
       if (s.items.length === 0) return;
-      if (s.selectedIndex === s.items.length - 1 && s.hasMore && s.phase === "idle") {
+      if (s.selectedIndex === s.items.length - 1 && s.hasMore && !s.listLane.isRunning) {
         this.callbacks.onAction({ action: "load_more" });
         return;
       }
@@ -262,7 +262,6 @@ export class SurfChatsOverlay implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      // No detail loaded — fall back to list navigation
       if (s.items.length === 0) return;
       s.selectedIndex = Math.max(0, s.selectedIndex - 1);
       this.detailScrollOffset = 0;
@@ -290,7 +289,6 @@ export class SurfChatsOverlay implements Component, Focusable {
 
       const cached = s.detailCache.get(selected.id);
       if (cached) {
-        // Already loaded → inject into pi context
         this.callbacks.onAction({
           action: "inject",
           conversationId: selected.id,
@@ -298,7 +296,6 @@ export class SurfChatsOverlay implements Component, Focusable {
           title: cached.summary.title,
         });
       } else {
-        // Load detail first
         this.callbacks.onAction({ action: "load_detail", conversationId: selected.id });
       }
       return;
@@ -327,7 +324,6 @@ export class SurfChatsOverlay implements Component, Focusable {
       const selected = s.items[s.selectedIndex];
       if (!selected) return;
       this.callbacks.onAction({ action: "toggle_mark", conversationId: selected.id });
-      // Auto-advance to next item
       if (s.selectedIndex < s.items.length - 1) {
         s.selectedIndex++;
         this.detailScrollOffset = 0;
@@ -338,14 +334,11 @@ export class SurfChatsOverlay implements Component, Focusable {
 
     // Delete / d → delete marked conversations (or current if none marked)
     if (matchesKey(data, "delete") || data === "d") {
-      const markedCount = s.markedIds.size;
-      if (markedCount > 0) {
-        // Batch delete all marked
+      if (s.markedIds.size > 0) {
         const ids = Array.from(s.markedIds);
         const titles = ids.map(id => s.items.find(it => it.id === id)?.title ?? "(untitled)");
         this.callbacks.onAction({ action: "delete", conversationIds: ids, titles });
       } else {
-        // Single delete
         const selected = s.items[s.selectedIndex];
         if (!selected) return;
         this.callbacks.onAction({ action: "delete", conversationIds: [selected.id], titles: [selected.title] });
@@ -385,37 +378,36 @@ export class SurfChatsOverlay implements Component, Focusable {
     }
 
     // ── Delete confirmation banner ──
-    if (this.state.phase === "confirm_delete" && this.state.pendingDeleteId) {
-      const count = this.state.pendingDeleteId.split(",").length;
+    if (this.state.deletePrompt) {
+      const count = this.state.deletePrompt.conversationIds.length;
       const label = count > 1
         ? `${count} conversations`
-        : `"${truncateVisible(this.state.pendingDeleteTitle ?? "(untitled)", Math.max(1, innerW - 24))}"`;
+        : `"${truncateVisible(this.state.deletePrompt.titles[0] ?? "(untitled)", Math.max(1, innerW - 24))}"`;
       const confirmMsg = th.fg("error", ` ⚠ Delete ${label}? `) +
         th.fg("warning", "y") + th.fg("dim", "/") + th.fg("text", "n");
       lines.push(this.frameLine(confirmMsg, innerW, border));
     }
 
-    // ── Status line ──
-    if (this.state.phase !== "idle" && this.state.phase !== "confirm_delete") {
-      const statusIcon = this.state.phase === "error" ? "✗" : "⟳";
-      const statusColor = this.state.phase === "error" ? "error" : "warning";
-      const statusLine = th.fg(statusColor, ` ${statusIcon} ${this.state.statusMessage}`);
+    // ── Status bar (derived from lane states) ──
+    if (this.state.statusBar) {
+      const sb = this.state.statusBar;
+      const icon = sb.level === "error" ? "✗" : sb.level === "progress" ? "⟳" : "ℹ";
+      const color = sb.level === "error" ? "error" : sb.level === "progress" ? "warning" : "dim";
+      const statusLine = th.fg(color, ` ${icon} ${sb.message}`);
       lines.push(this.frameLine(statusLine, innerW, border));
     }
 
-    // ── Split area: list (left 45%) + detail (right 55%) ──
+    // ── Split area: list (left 42%) + detail (right 58%) ──
     const availableRows = this.availableRows(lines.length);
     const leftW = Math.floor(innerW * 0.42);
-    const rightW = innerW - leftW - 1; // -1 for separator
+    const rightW = innerW - leftW - 1;
     const sep = th.fg("borderMuted", "│");
 
     const leftLines = this.renderList(leftW);
     const rightLines = this.renderDetail(rightW);
 
-    // Track for scroll calculations
     this.detailTotalLines = rightLines.length;
 
-    // Slice detail for scrolling
     const detailViewH = availableRows;
     const visibleRight = rightLines.slice(this.detailScrollOffset, this.detailScrollOffset + detailViewH);
 
@@ -433,10 +425,10 @@ export class SurfChatsOverlay implements Component, Focusable {
     }
 
     // ── Footer hints + debug ──
-    const moreHint = !this.state.searchEditActive && this.state.hasMore ? " • j/↓ more" : "";
+    const moreHint = !this.state.searchEditActive && this.state.hasMore && this.state.mode === "recent" ? " • j/↓ more" : "";
     const hints = this.state.searchEditActive
       ? "Enter submit • Esc cancel"
-      : this.state.phase === "confirm_delete"
+      : this.state.deletePrompt
         ? "y confirm delete • any other key cancel"
         : `j/k list • ↑↓ scroll • Space mark • Enter inject • / search • e export • d del • r refresh • Esc${moreHint}`;
     const debugCli = ` CLI: ${compactPath(this.state.resolvedCliPath, Math.max(8, innerW - 6))}`;
@@ -449,8 +441,8 @@ export class SurfChatsOverlay implements Component, Focusable {
     lines.push(this.frameLine(th.fg("muted", debugProfile), innerW, border));
 
     // ── Export notification ──
-    if (this.state.lastExportPath) {
-      lines.push(this.frameLine(th.fg("success", ` ✓ Exported: ${this.state.lastExportPath}`), innerW, border));
+    if (this.state.exportLane.lastExportPath) {
+      lines.push(this.frameLine(th.fg("success", ` ✓ Exported: ${this.state.exportLane.lastExportPath}`), innerW, border));
     }
 
     lines.push(border("└") + border("─".repeat(innerW)) + border("┘"));
@@ -458,12 +450,9 @@ export class SurfChatsOverlay implements Component, Focusable {
     return lines;
   }
 
-  invalidate(): void {
-    // No cached rendering state to clear
-  }
+  invalidate(): void {}
 
   dispose(): void {
-    // Cleanup on overlay close
     this.focused = false;
   }
 
@@ -476,12 +465,11 @@ export class SurfChatsOverlay implements Component, Focusable {
   private availableRows(headerLines: number): number {
     const termRows = this.tui.terminal.rows || 24;
     const maxOverlay = Math.floor(termRows * 0.7);
-    // Reserve: header lines already rendered + footer/debug (6 lines) + border (1)
     return Math.max(5, maxOverlay - headerLines - 7);
   }
 
   private detailViewHeight(): number {
-    return this.availableRows(3); // rough estimate
+    return this.availableRows(3);
   }
 
   private renderList(width: number): string[] {
@@ -489,18 +477,16 @@ export class SurfChatsOverlay implements Component, Focusable {
     const s = this.state;
     const lines: string[] = [];
 
-    if (s.items.length === 0 && s.phase === "idle") {
+    if (s.items.length === 0 && !s.listLane.isRunning) {
       lines.push(th.fg("muted", " No conversations"));
       return lines;
     }
     if (s.items.length === 0) return lines;
 
-    // Scroll list so selected item is always visible
     const listViewH = this.availableRows(3);
     const listScrollOffset = Math.max(0, s.selectedIndex - listViewH + 3);
     const visibleItems = s.items.slice(listScrollOffset, listScrollOffset + listViewH);
 
-    // Column widths
     const timeW = Math.min(5, Math.max(3, Math.floor(width * 0.22)));
     const titleW = Math.max(1, width - timeW - 2);
 
@@ -522,10 +508,10 @@ export class SurfChatsOverlay implements Component, Focusable {
       lines.push(truncateToWidth(line, width));
     }
 
-    // Load-more hint at the bottom when more pages available
-    if (s.hasMore && s.phase === "idle") {
+    // Footer
+    if (s.hasMore && !s.listLane.isRunning && s.mode === "recent") {
       lines.push(th.fg("dim", truncateToWidth(" ↓ more (press j)", width)));
-    } else if (s.phase === "loading_list") {
+    } else if (s.listLane.isRunning) {
       lines.push(th.fg("warning", truncateToWidth(" ⟳ loading…", width)));
     }
 
@@ -537,35 +523,40 @@ export class SurfChatsOverlay implements Component, Focusable {
     const s = this.state;
     const lines: string[] = [];
 
-    // Error state
-    if (s.lastError) {
-      lines.push(th.fg("error", ` Error: ${s.lastError.message}`));
-      if (s.lastError.stderr) {
-        for (const l of s.lastError.stderr.split("\n").slice(0, 5)) {
-          lines.push(th.fg("dim", ` ${l}`));
-        }
-      }
-      return lines;
-    }
-
-    // Loading detail
-    if (s.phase === "loading_detail") {
-      lines.push(th.fg("warning", " ⟳ Loading conversation..."));
-      lines.push(th.fg("dim", " (CloakBrowser may take 10-30s)"));
-      return lines;
-    }
-
-    // No selection
     const selected = s.items[s.selectedIndex];
     if (!selected) {
       lines.push(th.fg("muted", " Select a conversation"));
       return lines;
     }
 
+    // Per-conversation error from detail lane
+    const detailError = s.detailLane.errorsByConversationId.get(selected.id);
+    if (detailError) {
+      lines.push(th.fg("error", ` Error: ${detailError.message}`));
+      if (detailError.stderr) {
+        for (const l of detailError.stderr.split("\n").slice(0, 5)) {
+          lines.push(th.fg("dim", ` ${l}`));
+        }
+      }
+      lines.push("");
+      lines.push(th.fg("muted", " Press Enter to retry"));
+      return lines;
+    }
+
+    // Loading detail (active or queued)
+    if (s.detailLane.activeConversationId === selected.id) {
+      lines.push(th.fg("warning", " ⟳ Loading conversation..."));
+      lines.push(th.fg("dim", " (CloakBrowser may take 10-30s)"));
+      return lines;
+    }
+    if (s.detailLane.queuedConversationIds.includes(selected.id)) {
+      lines.push(th.fg("warning", " ⟳ Queued…"));
+      return lines;
+    }
+
     // Cached detail available
     const cached = s.detailCache.get(selected.id);
     if (cached) {
-      // Header
       lines.push(th.fg("accent", ` ${truncateVisible(cached.summary.title, Math.max(1, width - 1))}`));
       const meta = [
         cached.summary.model,

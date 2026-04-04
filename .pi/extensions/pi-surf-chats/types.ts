@@ -1,6 +1,11 @@
 /**
  * types.ts — Shared types for pi-surf-chats extension
+ *
+ * State is modeled with per-lane state objects so concurrent operations
+ * (e.g. list refresh + detail load + delete) don't clobber each other.
  */
+
+// ─── Domain types ────────────────────────────────────────────────────────────
 
 /** Normalized conversation list item (matches chatgpt-chats-formatter.cjs normalizeConversationItems) */
 export interface ConversationItem {
@@ -63,32 +68,91 @@ export interface SurfChatsError {
   stderr?: string;
 }
 
-/** Controller state */
+// ─── Lane state types ────────────────────────────────────────────────────────
+
+/** Derived single-line status for the overlay status bar */
+export interface StatusBarState {
+  level: "progress" | "error" | "info";
+  message: string;
+}
+
+/** Delete confirmation prompt (typed — no string-encoding hacks) */
+export interface DeletePromptState {
+  conversationIds: string[];
+  titles: string[];
+}
+
+/** LIST lane: load_list / search / load_more — mutually exclusive, last wins */
+export interface ListLaneState {
+  activeAction: "load_list" | "search" | "load_more" | null;
+  isRunning: boolean;
+  /** null = silent refresh (cached items visible) */
+  progressMessage: string | null;
+  error: SurfChatsError | null;
+  /** e.g. partial search notice */
+  infoMessage: string | null;
+}
+
+/** BACKGROUND: detail loader — per-conversation status */
+export interface DetailLaneState {
+  activeConversationId: string | null;
+  queuedConversationIds: string[];
+  errorsByConversationId: Map<string, SurfChatsError>;
+}
+
+/** BACKGROUND: export runner */
+export interface ExportLaneState {
+  activeConversationId: string | null;
+  queuedConversationIds: string[];
+  error: SurfChatsError | null;
+  lastExportPath: string | null;
+}
+
+/** Typed delete request */
+export interface DeleteRequest {
+  conversationIds: string[];
+  titles: string[];
+}
+
+/** BACKGROUND: delete runner */
+export interface DeleteLaneState {
+  activeRequest: DeleteRequest | null;
+  queuedRequests: DeleteRequest[];
+  error: SurfChatsError | null;
+}
+
+// ─── Controller state ────────────────────────────────────────────────────────
+
 export interface ControllerState {
+  // ── List / navigation ──
   mode: "recent" | "search";
   searchDraft: string;
   activeQuery: string;
   items: ConversationItem[];
   selectedIndex: number;
-  detailCache: Map<string, DetailRecord>;
-  phase: "idle" | "loading_list" | "loading_detail" | "searching" | "exporting" | "deleting" | "confirm_delete" | "error";
-  statusMessage: string;
-  loadedConversationId: string | null;
-  lastError: SurfChatsError | null;
-  lastExportPath: string | null;
   searchEditActive: boolean;
+  currentLimit: number;
+  hasMore: boolean;
+
+  // ── Caches ──
+  detailCache: Map<string, DetailRecord>;
+  loadedConversationId: string | null;
+
+  // ── UI-only ──
+  markedIds: Set<string>;
+  deletePrompt: DeletePromptState | null;
+  statusBar: StatusBarState | null;
+
+  // ── Lane states ──
+  listLane: ListLaneState;
+  detailLane: DetailLaneState;
+  exportLane: ExportLaneState;
+  deleteLane: DeleteLaneState;
+
+  // ── Resolved paths (set once) ──
   resolvedCliPath: string | null;
   resolvedFormatterPath: string | null;
   resolvedProfile: string | null;
-  /** Multi-select for batch operations */
-  markedIds: Set<string>;
-  /** Conversation(s) pending delete confirmation */
-  pendingDeleteId: string | null;
-  pendingDeleteTitle: string | null;
-  /** Current fetch limit; grows as user loads more */
-  currentLimit: number;
-  /** True when items.length === currentLimit (more may be available) */
-  hasMore: boolean;
 }
 
 /** Cached list result (for instant display on re-open) */

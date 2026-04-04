@@ -1,12 +1,10 @@
 /**
  * pi-surf-chats — Pi extension for browsing ChatGPT conversations via surf-cli
  *
- * Provides:
- * - /surf-chats command to open conversation browser overlay
- * - Ctrl+Shift+G shortcut
- * - Two-pane TUI: list/search ↔ detail viewer
- * - Inject conversation into pi context
- * - Export to markdown
+ * Architecture: lane-based operation model
+ *   LIST lane   — load_list / search / load_more (mutually exclusive, last wins)
+ *   BACKGROUND  — detail / export / delete runners (independent FIFO queues)
+ *   SYNC        — toggle_mark / inject / delete prompt / cancel_delete (immediate)
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -16,7 +14,10 @@ import os from "node:os";
 import fs from "node:fs";
 import { SurfChatsClient } from "./surf-client.js";
 import { SurfChatsOverlay, type OverlayAction } from "./overlay.js";
-import type { ControllerState, DetailRecord, ListCacheEntry, SurfChatsError } from "./types.js";
+import type {
+  ControllerState, DeleteRequest, DetailRecord, ListCacheEntry,
+  StatusBarState, SurfChatsError,
+} from "./types.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module-level persistent cache (survives overlay close/reopen within pi session)
@@ -25,7 +26,7 @@ import type { ControllerState, DetailRecord, ListCacheEntry, SurfChatsError } fr
 const persistentDetailCache = new Map<string, DetailRecord>();
 let persistentListCache: ListCacheEntry | null = null;
 
-const LIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min before a stale list triggers visible refresh
+const LIST_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Export path helpers
@@ -58,25 +59,22 @@ function buildExportPath(title: string, conversationId: string): string {
   const shortId = conversationId.slice(0, 8);
   let candidate = path.join(dir, `${ts}-${slug}-${shortId}.md`);
 
-  // Collision avoidance
   let i = 2;
   while (fs.existsSync(candidate)) {
     candidate = path.join(dir, `${ts}-${slug}-${shortId}-${i}.md`);
     i++;
   }
-
   return candidate;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Controller
+// State factory
 // ─────────────────────────────────────────────────────────────────────────────
 
 const INITIAL_LIMIT = 30;
 const PAGE_SIZE = 30;
 
 function createInitialState(): ControllerState {
-  // Hydrate from persistent caches for instant display
   const cachedItems = persistentListCache?.mode === "recent" ? persistentListCache.items : [];
   const hasCache = cachedItems.length > 0;
 
@@ -86,22 +84,101 @@ function createInitialState(): ControllerState {
     activeQuery: "",
     items: cachedItems,
     selectedIndex: 0,
-    detailCache: persistentDetailCache, // shared reference — survives across sessions
-    phase: hasCache ? "idle" : "loading_list",
-    statusMessage: hasCache ? "" : "Loading recent conversations…",
-    loadedConversationId: null,
-    lastError: null,
-    lastExportPath: null,
     searchEditActive: false,
+    currentLimit: INITIAL_LIMIT,
+    hasMore: cachedItems.length >= INITIAL_LIMIT,
+
+    detailCache: persistentDetailCache,
+    loadedConversationId: null,
+
+    markedIds: new Set(),
+    deletePrompt: null,
+    statusBar: null,
+
+    listLane: {
+      activeAction: hasCache ? null : "load_list",
+      isRunning: !hasCache,
+      progressMessage: hasCache ? null : "Loading recent conversations…",
+      error: null,
+      infoMessage: null,
+    },
+    detailLane: {
+      activeConversationId: null,
+      queuedConversationIds: [],
+      errorsByConversationId: new Map(),
+    },
+    exportLane: {
+      activeConversationId: null,
+      queuedConversationIds: [],
+      error: null,
+      lastExportPath: null,
+    },
+    deleteLane: {
+      activeRequest: null,
+      queuedRequests: [],
+      error: null,
+    },
+
     resolvedCliPath: null,
     resolvedFormatterPath: null,
     resolvedProfile: null,
-    markedIds: new Set(),
-    pendingDeleteId: null,
-    pendingDeleteTitle: null,
-    currentLimit: INITIAL_LIMIT,
-    hasMore: cachedItems.length >= INITIAL_LIMIT,
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Derived status bar
+// ─────────────────────────────────────────────────────────────────────────────
+
+function recomputeStatusBar(state: ControllerState): void {
+  const segments: string[] = [];
+
+  // 1. Active work
+  if (state.listLane.isRunning && state.listLane.progressMessage) {
+    segments.push(state.listLane.progressMessage);
+  }
+  const sel = state.items[state.selectedIndex];
+  if (sel && state.detailLane.activeConversationId === sel.id) {
+    segments.push("Loading conversation…");
+  } else if (sel && state.detailLane.queuedConversationIds.includes(sel.id)) {
+    segments.push("Queued…");
+  }
+  if (state.exportLane.activeConversationId) {
+    segments.push("Exporting…");
+  }
+  if (state.deleteLane.activeRequest) {
+    const n = state.deleteLane.activeRequest.conversationIds.length;
+    const q = state.deleteLane.queuedRequests.length;
+    const label = n > 1 ? `Deleting ${n} conversations…` : `Deleting "${state.deleteLane.activeRequest.titles[0]}"…`;
+    segments.push(q > 0 ? `${label} (+${q} queued)` : label);
+  }
+
+  if (segments.length > 0) {
+    state.statusBar = { level: "progress", message: segments.join(" • ") };
+    return;
+  }
+
+  // 2. Errors
+  const errors: SurfChatsError[] = [];
+  if (state.listLane.error) errors.push(state.listLane.error);
+  if (sel) {
+    const detErr = state.detailLane.errorsByConversationId.get(sel.id);
+    if (detErr) errors.push(detErr);
+  }
+  if (state.exportLane.error) errors.push(state.exportLane.error);
+  if (state.deleteLane.error) errors.push(state.deleteLane.error);
+
+  if (errors.length > 0) {
+    state.statusBar = { level: "error", message: errors.map(e => e.message).join(" • ") };
+    return;
+  }
+
+  // 3. Informational
+  if (state.listLane.infoMessage) {
+    state.statusBar = { level: "info", message: state.listLane.infoMessage };
+    return;
+  }
+
+  state.statusBar = null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,9 +188,7 @@ function createInitialState(): ControllerState {
 export default function piSurfChatsExtension(pi: ExtensionAPI): void {
 
   async function openOverlay(ctx: ExtensionContext): Promise<void> {
-    if (!ctx.hasUI) {
-      return;
-    }
+    if (!ctx.hasUI) return;
 
     const client = new SurfChatsClient(pi, ctx.cwd);
     const state = createInitialState();
@@ -122,224 +197,438 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
     state.resolvedFormatterPath = resolved.formatterPath;
     state.resolvedProfile = resolved.profile;
 
-    // Initial load (background if we already have cached items, visible otherwise)
-
     let overlay: SurfChatsOverlay | null = null;
-    let requestId = 0;
     let closed = false;
-    let activeAbort: AbortController | null = null;
 
-    // ── Delete queue ─────────────────────────────────────────────────
-    // Deletes run independently from load/search/export so they don't
-    // cancel each other. Multiple deletes are queued and processed
-    // sequentially.
-    const deleteQueue: Array<{ ids: string[]; titles: string[] }> = [];
-    let deleteRunning = false;
-    let deleteAbort: AbortController | null = null;
+    // ─── LIST lane ────────────────────────────────────────────────────
+    let listAbort: AbortController | null = null;
+    let listGeneration = 0;
 
-    async function processDeleteQueue(done: (result?: string) => void): Promise<void> {
-      if (deleteRunning || closed) return;
-      deleteRunning = true;
-      while (deleteQueue.length > 0 && !closed) {
-        const batch = deleteQueue.shift()!;
-        const ids = batch.ids;
-        const count = ids.length;
-        state.phase = "deleting";
-        state.statusMessage = count > 1 ? `Deleting ${count} conversations…` : `Deleting "${batch.titles[0]}"…`;
-        state.pendingDeleteId = null;
-        state.pendingDeleteTitle = null;
-        state.lastError = null;
+    async function runListAction(
+      kind: "load_list" | "search" | "load_more",
+      setup: () => void,
+      run: (signal: AbortSignal) => Promise<void>,
+    ): Promise<void> {
+      listAbort?.abort();
+      const abort = new AbortController();
+      listAbort = abort;
+      const gen = ++listGeneration;
+
+      setup();
+      recomputeStatusBar(state);
+      overlay?.updateState(state);
+
+      try {
+        await run(abort.signal);
+      } catch (err) {
+        if (closed || gen !== listGeneration || abort.signal.aborted) return;
+        throw err;
+      }
+      // stale check
+      if (closed || gen !== listGeneration || abort.signal.aborted) return;
+    }
+
+    // ─── BACKGROUND queued runner factory ─────────────────────────────
+
+    type QueueRunner<T> = {
+      enqueue: (item: T) => void;
+      abort: () => void;
+      clear: () => void;
+    };
+
+    function createQueueRunner<T>(
+      process: (item: T, signal: AbortSignal) => Promise<void>,
+    ): QueueRunner<T> {
+      const pending: T[] = [];
+      let running = false;
+      let activeAbort: AbortController | null = null;
+
+      async function drain(): Promise<void> {
+        if (running || closed) return;
+        running = true;
+        while (pending.length > 0 && !closed) {
+          const item = pending.shift()!;
+          const abort = new AbortController();
+          activeAbort = abort;
+          try {
+            await process(item, abort.signal);
+          } catch {
+            // errors handled inside process()
+          }
+          activeAbort = null;
+        }
+        running = false;
+        if (!closed) {
+          recomputeStatusBar(state);
+          overlay?.updateState(state);
+        }
+      }
+
+      return {
+        enqueue(item: T) {
+          pending.push(item);
+          drain().catch(() => {});
+        },
+        abort() {
+          activeAbort?.abort();
+          activeAbort = null;
+        },
+        clear() {
+          pending.length = 0;
+          activeAbort?.abort();
+          activeAbort = null;
+        },
+      };
+    }
+
+    // ─── Detail runner ────────────────────────────────────────────────
+
+    const detailRunner = createQueueRunner<{ conversationId: string }>(
+      async (item, signal) => {
+        const { conversationId } = item;
+        // dedupe: already cached or already active
+        if (state.detailCache.has(conversationId)) return;
+        if (state.detailLane.activeConversationId === conversationId) return;
+
+        state.detailLane.activeConversationId = conversationId;
+        state.detailLane.errorsByConversationId.delete(conversationId);
+        state.loadedConversationId = conversationId;
+        recomputeStatusBar(state);
         overlay?.updateState(state);
 
-        const abort = new AbortController();
-        deleteAbort = abort;
         try {
-          await client.bulkDeleteConversations(ids, abort.signal);
-          if (closed) break;
+          const detail = await client.getConversation(conversationId, signal);
+          if (closed) return;
+          state.detailCache.set(conversationId, detail);
+        } catch (err) {
+          if (closed || signal.aborted) return;
+          state.detailLane.errorsByConversationId.set(conversationId, {
+            code: (err as SurfChatsError).code ?? "command_failed",
+            message: (err as SurfChatsError).message ?? "Failed to load conversation",
+          });
+        } finally {
+          if (state.detailLane.activeConversationId === conversationId) {
+            state.detailLane.activeConversationId = null;
+          }
+          if (!closed) {
+            recomputeStatusBar(state);
+            overlay?.updateState(state);
+          }
+        }
+      },
+    );
 
-          // Remove from list + caches
-          const deleteSet = new Set(ids);
-          state.items = state.items.filter((item) => !deleteSet.has(item.id));
-          for (const id of ids) {
+    // ─── Export runner ─────────────────────────────────────────────────
+
+    const exportRunner = createQueueRunner<{ conversationId: string; title: string }>(
+      async (item, signal) => {
+        const { conversationId, title } = item;
+        // dedupe
+        if (state.exportLane.activeConversationId === conversationId) return;
+        if (state.exportLane.queuedConversationIds.includes(conversationId)) return;
+
+        state.exportLane.activeConversationId = conversationId;
+        state.exportLane.error = null;
+        state.exportLane.lastExportPath = null;
+        recomputeStatusBar(state);
+        overlay?.updateState(state);
+
+        try {
+          const cached = state.detailCache.get(conversationId);
+          const exportPath = buildExportPath(title, conversationId);
+
+          if (cached) {
+            fs.writeFileSync(exportPath, cached.markdown, "utf8");
+            state.exportLane.lastExportPath = exportPath;
+          } else {
+            const result = await client.exportConversation(conversationId, exportPath, signal);
+            if (closed) return;
+            state.exportLane.lastExportPath = result;
+          }
+        } catch (err) {
+          if (closed || signal.aborted) return;
+          state.exportLane.error = {
+            code: (err as SurfChatsError).code ?? "command_failed",
+            message: (err as SurfChatsError).message ?? "Export failed",
+          };
+        } finally {
+          if (state.exportLane.activeConversationId === conversationId) {
+            state.exportLane.activeConversationId = null;
+          }
+          if (!closed) {
+            recomputeStatusBar(state);
+            overlay?.updateState(state);
+          }
+        }
+      },
+    );
+
+    // ─── Delete runner ────────────────────────────────────────────────
+
+    const deleteRunner = createQueueRunner<DeleteRequest>(
+      async (request, signal) => {
+        // Filter out ids already removed by earlier deletes
+        const liveIds = request.conversationIds.filter(id =>
+          state.items.some(it => it.id === id),
+        );
+        if (liveIds.length === 0) return;
+
+        const titles = liveIds.map(id => {
+          const idx = request.conversationIds.indexOf(id);
+          return request.titles[idx] ?? "(untitled)";
+        });
+
+        state.deleteLane.activeRequest = { conversationIds: liveIds, titles };
+        state.deleteLane.error = null;
+        recomputeStatusBar(state);
+        overlay?.updateState(state);
+
+        try {
+          await client.bulkDeleteConversations(liveIds, signal);
+          if (closed) return;
+
+          const deleteSet = new Set(liveIds);
+          state.items = state.items.filter(it => !deleteSet.has(it.id));
+          for (const id of liveIds) {
             state.detailCache.delete(id);
             state.markedIds.delete(id);
+            state.detailLane.errorsByConversationId.delete(id);
           }
           if (persistentListCache) {
-            persistentListCache.items = persistentListCache.items.filter((item) => !deleteSet.has(item.id));
+            persistentListCache.items = persistentListCache.items.filter(it => !deleteSet.has(it.id));
           }
           if (state.selectedIndex >= state.items.length) {
             state.selectedIndex = Math.max(0, state.items.length - 1);
           }
 
           if (ctx.hasUI) {
-            const label = count > 1 ? `${count} conversations` : batch.titles[0] ?? "conversation";
+            const label = liveIds.length > 1
+              ? `${liveIds.length} conversations`
+              : titles[0] ?? "conversation";
             ctx.ui.notify(`Deleted: ${label}`, "info");
           }
         } catch (err) {
-          if (closed) break;
+          if (closed || signal.aborted) return;
+          state.deleteLane.error = {
+            code: (err as SurfChatsError).code ?? "command_failed",
+            message: (err as SurfChatsError).message ?? "Delete failed",
+          };
           if (ctx.hasUI) {
             ctx.ui.notify(`Delete failed: ${(err as SurfChatsError).message ?? "unknown error"}`, "error");
           }
+        } finally {
+          state.deleteLane.activeRequest = null;
+          if (!closed) {
+            recomputeStatusBar(state);
+            overlay?.updateState(state);
+          }
         }
-        deleteAbort = null;
-      }
-      deleteRunning = false;
-      // Restore idle if no other operation is in progress
-      if (!closed && state.phase === "deleting") {
-        state.phase = "idle";
-        state.statusMessage = deleteQueue.length > 0 ? "" : "";
-        overlay?.updateState(state);
-      }
-    }
+      },
+    );
 
-    // Action handler — bridges overlay events to async operations
+    // ─── Action handler ───────────────────────────────────────────────
+
     async function handleAction(action: OverlayAction, done: (result?: string) => void): Promise<void> {
       if (closed) return;
 
-      // Non-exclusive actions: toggle_mark, delete flow, cancel
-      // These never cancel in-flight loads/exports.
-      if (action.action === "toggle_mark" || action.action === "delete" ||
-          action.action === "confirm_delete" || action.action === "cancel_delete") {
-        // handled below in switch — no abort
-      } else {
-        // Exclusive actions: load_list, search, load_more, load_detail, export, inject
-        activeAbort?.abort();
-        const newAbort = new AbortController();
-        activeAbort = newAbort;
-      }
-      const abort = activeAbort ?? new AbortController();
-      const myRequestId = ++requestId;
-      const isStale = () => closed || requestId !== myRequestId || abort.signal.aborted;
-
       switch (action.action) {
+
+        // ── LIST lane (mutually exclusive, last wins) ──
+
         case "load_list": {
           const hasCachedItems = state.items.length > 0;
           const cacheAge = persistentListCache ? Date.now() - persistentListCache.loadedAt : Infinity;
           const silentRefresh = hasCachedItems && cacheAge < LIST_CACHE_TTL_MS;
 
-          if (!silentRefresh) {
-            state.phase = "loading_list";
-            state.statusMessage = "Loading recent conversations…";
-          } else {
-            state.statusMessage = "Refreshing…";
-          }
-          state.searchEditActive = false;
-          state.mode = "recent";
-          state.activeQuery = "";
-          state.lastError = null;
-          state.currentLimit = INITIAL_LIMIT;
-          overlay?.updateState(state);
-
           try {
-            const result = await client.listRecent({ limit: INITIAL_LIMIT, signal: abort.signal });
-            if (isStale()) return;
-            state.items = result.items;
-            state.selectedIndex = 0;
-            state.phase = "idle";
-            state.statusMessage = "";
-            state.hasMore = result.items.length >= INITIAL_LIMIT;
-            persistentListCache = { mode: "recent", query: "", items: result.items, loadedAt: Date.now() };
+            await runListAction("load_list", () => {
+              state.listLane.activeAction = "load_list";
+              state.listLane.isRunning = true;
+              state.listLane.progressMessage = silentRefresh ? null : "Loading recent conversations…";
+              state.listLane.error = null;
+              state.listLane.infoMessage = null;
+              state.searchEditActive = false;
+              state.mode = "recent";
+              state.activeQuery = "";
+              state.currentLimit = INITIAL_LIMIT;
+            }, async (signal) => {
+              const result = await client.listRecent({ limit: INITIAL_LIMIT, signal });
+              state.items = result.items;
+              state.selectedIndex = 0;
+              state.hasMore = result.items.length >= INITIAL_LIMIT;
+              persistentListCache = { mode: "recent", query: "", items: result.items, loadedAt: Date.now() };
+            });
           } catch (err) {
-            if (isStale()) return;
-            // Keep existing items visible on background-refresh failure
+            if (closed) return;
             if (hasCachedItems) {
-              state.phase = "idle";
-              state.statusMessage = "";
+              // Keep visible items on silent-refresh failure
             } else {
-              state.phase = "error";
-              state.lastError = err as SurfChatsError;
-              state.statusMessage = (err as SurfChatsError).message ?? "Failed to load conversations";
+              state.listLane.error = err as SurfChatsError;
+            }
+          } finally {
+            if (!closed) {
+              state.listLane.isRunning = false;
+              state.listLane.activeAction = null;
+              state.listLane.progressMessage = null;
+              recomputeStatusBar(state);
+              overlay?.updateState(state);
             }
           }
-          if (!closed) overlay?.updateState(state);
           break;
         }
 
         case "search": {
-          state.phase = "searching";
-          state.statusMessage = `Searching "${action.query}"…`;
-          state.mode = "search";
-          state.activeQuery = action.query;
-          state.searchEditActive = false;
-          state.lastError = null;
-          state.currentLimit = INITIAL_LIMIT;
-          overlay?.updateState(state);
-
           try {
-            const result = await client.search({ query: action.query, limit: INITIAL_LIMIT, signal: abort.signal });
-            if (isStale()) return;
-            state.items = result.items;
-            state.selectedIndex = 0;
-            state.phase = "idle";
-            state.statusMessage = result.partial ? `Partial results (${result.fallbackScanned}/${result.fallbackTotal} scanned)` : "";
-            state.hasMore = result.items.length >= INITIAL_LIMIT;
+            await runListAction("search", () => {
+              state.listLane.activeAction = "search";
+              state.listLane.isRunning = true;
+              state.listLane.progressMessage = `Searching "${action.query}"…`;
+              state.listLane.error = null;
+              state.listLane.infoMessage = null;
+              state.searchEditActive = false;
+              state.mode = "search";
+              state.activeQuery = action.query;
+              state.currentLimit = INITIAL_LIMIT;
+            }, async (signal) => {
+              const result = await client.search({ query: action.query, limit: INITIAL_LIMIT, signal });
+              state.items = result.items;
+              state.selectedIndex = 0;
+              state.hasMore = result.items.length >= INITIAL_LIMIT;
+              state.listLane.infoMessage = result.partial
+                ? `Partial results (${result.fallbackScanned}/${result.fallbackTotal} scanned)`
+                : null;
+            });
           } catch (err) {
-            if (isStale()) return;
-            state.phase = "error";
-            state.lastError = err as SurfChatsError;
-            state.statusMessage = (err as SurfChatsError).message ?? "Search failed";
+            if (closed) return;
+            state.listLane.error = err as SurfChatsError;
+          } finally {
+            if (!closed) {
+              state.listLane.isRunning = false;
+              state.listLane.activeAction = null;
+              state.listLane.progressMessage = null;
+              recomputeStatusBar(state);
+              overlay?.updateState(state);
+            }
           }
-          if (!closed) overlay?.updateState(state);
           break;
         }
 
         case "load_more": {
-          if (state.mode === "search") break; // no pagination for search results
+          if (state.mode === "search") break;
           const prevItems = state.items;
           const newLimit = state.currentLimit + PAGE_SIZE;
-          state.phase = "loading_list";
-          state.statusMessage = `Loading more… (${newLimit} total)`;
-          overlay?.updateState(state);
 
           try {
-            const result = await client.listRecent({ limit: newLimit, signal: abort.signal });
-            if (isStale()) return;
-            const prevLen = prevItems.length;
-            state.items = result.items;
-            state.currentLimit = newLimit;
-            state.hasMore = result.items.length >= newLimit;
-            // Advance cursor to first new item
-            if (result.items.length > prevLen) {
-              state.selectedIndex = prevLen;
-            }
-            state.phase = "idle";
-            state.statusMessage = "";
-            persistentListCache = { mode: "recent", query: "", items: result.items, loadedAt: Date.now() };
+            await runListAction("load_more", () => {
+              state.listLane.activeAction = "load_more";
+              state.listLane.isRunning = true;
+              state.listLane.progressMessage = `Loading more… (${newLimit} total)`;
+              state.listLane.error = null;
+            }, async (signal) => {
+              const result = await client.listRecent({ limit: newLimit, signal });
+              const prevLen = prevItems.length;
+              state.items = result.items;
+              state.currentLimit = newLimit;
+              state.hasMore = result.items.length >= newLimit;
+              if (result.items.length > prevLen) {
+                state.selectedIndex = prevLen;
+              }
+              persistentListCache = { mode: "recent", query: "", items: result.items, loadedAt: Date.now() };
+            });
           } catch (err) {
-            if (isStale()) return;
-            state.items = prevItems; // restore on failure
-            state.phase = "error";
-            state.lastError = err as SurfChatsError;
-            state.statusMessage = (err as SurfChatsError).message ?? "Failed to load more";
+            if (closed) return;
+            state.items = prevItems;
+            state.listLane.error = err as SurfChatsError;
+          } finally {
+            if (!closed) {
+              state.listLane.isRunning = false;
+              state.listLane.activeAction = null;
+              state.listLane.progressMessage = null;
+              recomputeStatusBar(state);
+              overlay?.updateState(state);
+            }
           }
-          if (!closed) overlay?.updateState(state);
           break;
         }
+
+        // ── BACKGROUND: detail ──
 
         case "load_detail": {
-          state.phase = "loading_detail";
-          state.statusMessage = "Loading conversation…";
-          state.lastError = null;
-          state.loadedConversationId = action.conversationId;
-          overlay?.updateState(state);
+          // Dedupe
+          const id = action.conversationId;
+          if (state.detailCache.has(id)) break;
+          if (state.detailLane.activeConversationId === id) break;
+          if (state.detailLane.queuedConversationIds.includes(id)) break;
 
-          try {
-            const detail = await client.getConversation(action.conversationId, abort.signal);
-            if (isStale()) return;
-            state.detailCache.set(action.conversationId, detail);
-            // persistentDetailCache is the same Map reference — already updated
-            state.phase = "idle";
-            state.statusMessage = "";
-          } catch (err) {
-            if (isStale()) return;
-            state.phase = "error";
-            state.lastError = err as SurfChatsError;
-            state.statusMessage = (err as SurfChatsError).message ?? "Failed to load conversation";
-            state.loadedConversationId = null;
-          }
-          if (!closed) overlay?.updateState(state);
+          state.detailLane.queuedConversationIds.push(id);
+          state.loadedConversationId = id;
+          recomputeStatusBar(state);
+          overlay?.updateState(state);
+          detailRunner.enqueue({ conversationId: id });
           break;
         }
+
+        // ── BACKGROUND: export ──
+
+        case "export": {
+          const id = action.conversationId;
+          if (state.exportLane.activeConversationId === id) break;
+          if (state.exportLane.queuedConversationIds.includes(id)) break;
+
+          state.exportLane.queuedConversationIds.push(id);
+          recomputeStatusBar(state);
+          overlay?.updateState(state);
+          exportRunner.enqueue({ conversationId: id, title: action.title });
+          break;
+        }
+
+        // ── SYNC: toggle mark ──
+
+        case "toggle_mark": {
+          if (state.markedIds.has(action.conversationId)) {
+            state.markedIds.delete(action.conversationId);
+          } else {
+            state.markedIds.add(action.conversationId);
+          }
+          overlay?.updateState(state);
+          break;
+        }
+
+        // ── SYNC: delete prompt ──
+
+        case "delete": {
+          state.deletePrompt = {
+            conversationIds: action.conversationIds,
+            titles: action.titles,
+          };
+          recomputeStatusBar(state);
+          overlay?.updateState(state);
+          break;
+        }
+
+        case "cancel_delete": {
+          state.deletePrompt = null;
+          recomputeStatusBar(state);
+          overlay?.updateState(state);
+          break;
+        }
+
+        // ── SYNC→BACKGROUND: confirm delete ──
+
+        case "confirm_delete": {
+          const request: DeleteRequest = {
+            conversationIds: action.conversationIds,
+            titles: action.titles,
+          };
+          state.deletePrompt = null;
+          state.deleteLane.queuedRequests.push(request);
+          recomputeStatusBar(state);
+          overlay?.updateState(state);
+          deleteRunner.enqueue(request);
+          break;
+        }
+
+        // ── SYNC: inject ──
 
         case "inject": {
           const content = [
@@ -360,115 +649,37 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
           if (ctx.hasUI) {
             ctx.ui.notify(`Injected: ${action.title}`, "info");
           }
-          closed = true;
-          requestId += 1;
-          activeAbort?.abort();
-          activeAbort = null;
-          overlay = null;
+
+          closeOverlay();
           done("injected");
-          break;
-        }
-
-        case "export": {
-          state.phase = "exporting";
-          state.statusMessage = "Exporting…";
-          state.lastError = null;
-          state.lastExportPath = null;
-          overlay?.updateState(state);
-
-          try {
-            // If we have cached detail, use the formatter markdown
-            const cached = state.detailCache.get(action.conversationId);
-            const exportPath = buildExportPath(action.title, action.conversationId);
-
-            if (cached) {
-              // Write markdown directly from cache (faster, no CloakBrowser needed)
-              fs.writeFileSync(exportPath, cached.markdown, "utf8");
-              state.lastExportPath = exportPath;
-            } else {
-              // Use surf CLI to export
-              const result = await client.exportConversation(action.conversationId, exportPath, abort.signal);
-              if (isStale()) return;
-              state.lastExportPath = result;
-            }
-
-            state.phase = "idle";
-            state.statusMessage = "";
-          } catch (err) {
-            if (isStale()) return;
-            state.phase = "error";
-            state.lastError = err as SurfChatsError;
-            state.statusMessage = (err as SurfChatsError).message ?? "Export failed";
-          }
-          if (!closed) overlay?.updateState(state);
-          break;
-        }
-
-        case "toggle_mark": {
-          if (state.markedIds.has(action.conversationId)) {
-            state.markedIds.delete(action.conversationId);
-          } else {
-            state.markedIds.add(action.conversationId);
-          }
-          overlay?.updateState(state);
-          break;
-        }
-
-        case "delete": {
-          // Enter confirmation mode — don't delete yet
-          state.phase = "confirm_delete";
-          state.pendingDeleteId = action.conversationIds.join(",");
-          state.pendingDeleteTitle = action.titles[0] ?? "(untitled)";
-          state.lastError = null;
-          state.statusMessage = "";
-          overlay?.updateState(state);
-          break;
-        }
-
-        case "cancel_delete": {
-          state.phase = "idle";
-          state.pendingDeleteId = null;
-          state.pendingDeleteTitle = null;
-          state.statusMessage = "";
-          overlay?.updateState(state);
-          break;
-        }
-
-        case "confirm_delete": {
-          // Queue and process — does not block other actions
-          deleteQueue.push({ ids: action.conversationIds, titles: action.titles });
-          processDeleteQueue(done).catch((err) => {
-            if (!closed && ctx.hasUI) {
-              ctx.ui.notify(`Delete error: ${(err as Error).message}`, "error");
-            }
-          });
           break;
         }
       }
     }
 
-    // Open the overlay
+    // ─── Lifecycle ────────────────────────────────────────────────────
+
+    function closeOverlay(): void {
+      closed = true;
+      listAbort?.abort();
+      listAbort = null;
+      detailRunner.clear();
+      exportRunner.clear();
+      deleteRunner.clear();
+      overlay = null;
+    }
+
+    // ─── Open overlay ─────────────────────────────────────────────────
+
     await ctx.ui.custom<string | undefined>(
       (tui, theme, _keybindings, done) => {
-        const closeOverlay = () => {
-          closed = true;
-          requestId += 1;
-          activeAbort?.abort();
-          activeAbort = null;
-          deleteAbort?.abort();
-          deleteAbort = null;
-          deleteQueue.length = 0;
-          overlay = null;
-        };
-
         const handleError = (err: unknown) => {
           if (closed) return;
-          state.phase = "error";
-          state.lastError = {
+          state.listLane.error = {
             code: "command_failed",
             message: String((err as Error)?.message ?? err),
           };
-          state.statusMessage = state.lastError.message;
+          recomputeStatusBar(state);
           overlay?.updateState(state);
         };
 
@@ -481,11 +692,13 @@ export default function piSurfChatsExtension(pi: ExtensionAPI): void {
             onAction: (action) => {
               handleAction(action, done).catch(handleError);
             },
-            onClose: closeOverlay,
+            onClose: () => {
+              closeOverlay();
+            },
           },
         });
 
-        // Trigger initial list load (silent if cached, visible if first open)
+        // Trigger initial list load
         handleAction({ action: "load_list" }, done).catch(handleError);
 
         return overlay;
