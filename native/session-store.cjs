@@ -147,10 +147,8 @@ class Session {
 
   _writeMeta() {
     try {
-      fs.writeFileSync(
-        path.join(this.dir, "meta.json"),
-        JSON.stringify(this._meta, null, 2),
-      );
+      const metaPath = path.join(this.dir, "meta.json");
+      fs.writeFileSync(metaPath, JSON.stringify(this._meta, null, 2), { mode: 0o600 });
     } catch {}
   }
 }
@@ -160,13 +158,14 @@ class Session {
 // ============================================================================
 
 function createSession(tool, args = {}, env = {}) {
+  const sessionsDir = getSessionsDir();
   try {
-    fs.mkdirSync(getSessionsDir(), { recursive: true });
+    fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
   } catch {}
 
   const id  = makeSessionId(tool, args);
-  const dir = path.join(getSessionsDir(), id);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const dir = path.join(sessionsDir, id);
+  try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch {}
 
   // Capture relevant env flags
   const envFlags = {};
@@ -352,7 +351,7 @@ function updateSession(id, patch = {}) {
   try {
     const meta    = JSON.parse(fs.readFileSync(metaPath, "utf8"));
     const updated = Object.assign({}, meta, patch);
-    fs.writeFileSync(metaPath, JSON.stringify(updated, null, 2));
+    fs.writeFileSync(metaPath, JSON.stringify(updated, null, 2), { mode: 0o600 });
     return updated;
   } catch {
     return null;

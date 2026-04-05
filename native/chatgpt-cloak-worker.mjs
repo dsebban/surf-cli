@@ -683,9 +683,11 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     await sleep(300);
 
     // Capture baseline before send (detect stale assistant turns)
+    // Use data-message-id (backend message UUID) not data-testid (DOM turn id)
     const baseline = await page.evaluate(EXTRACT_TEXT_JS);
-    const baselineTurnId = baseline.turnId || null;
-    log('info', 'Baseline captured', { turnId: baselineTurnId });
+    const baselineTurnId = baseline.turnId || null; // For DOM change detection
+    const baselineMessageId = baseline.messageId || null; // For reconcile API comparison
+    log('info', 'Baseline captured', { turnId: baselineTurnId, messageId: baselineMessageId });
 
     // Send
     const sendBtn = page.locator('button[data-testid="send-button"]').first();
@@ -695,8 +697,8 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     if (conversationId) {
       emit({ type: 'meta_update', conversationId, source: 'request', t: Date.now() });
     }
-    if (baselineTurnId) {
-      emit({ type: 'meta_update', baselineAssistantMessageId: baselineTurnId, source: 'baseline', t: Date.now() });
+    if (baselineMessageId) {
+      emit({ type: 'meta_update', baselineAssistantMessageId: baselineMessageId, source: 'baseline', t: Date.now() });
     }
 
     // ── Phase 6: Wait for response (hybrid stream + DOM) ────────────

@@ -1896,20 +1896,23 @@ if (args[0] === "session" || args[0] === "sessions") {
     const hours      = (Number.isFinite(rawHours) && rawHours > 0) ? rawHours : 72;
 
     let manageChats = null;
+    let skipNetworkReason = null;
     if (networkFlag) {
-      try {
-        const bridge = require("./chatgpt-cloak-bridge.cjs");
-        manageChats  = bridge.manageChatsWithCloakBrowser;
-      } catch {
-        console.error("Warning: CloakBrowser not available — skipping network poll");
+      if (!isCloakBrowserAvailable()) {
+        skipNetworkReason = "CloakBrowser not installed";
+      } else {
+        manageChats = manageChatsWithCloakBrowser;
       }
+    }
+    if (skipNetworkReason) {
+      console.error(`Warning: ${skipNetworkReason} — skipping network poll`);
     }
 
     (async () => {
       const { reconciled, sessions } = await sessionReconciler.reconcileSessions({
         hours,
         all: allFlag,
-        pollNetwork: networkFlag,
+        pollNetwork: networkFlag && !skipNetworkReason,
         manageChats,
       });
 
@@ -1918,15 +1921,15 @@ if (args[0] === "session" || args[0] === "sessions") {
         process.exit(0);
       }
 
-      const actionLabel = { none: "alive", orphaned: "orphaned", recovered: "recovered", unresolved: "unresolved" };
+      const actionLabel = { none: "alive", stale: "stale", orphaned: "orphaned", recovered: "recovered", unresolved: "unresolved" };
       for (const r of sessions) {
-        const icon = r.action === "none" ? "~" : r.action === "recovered" ? "✓" : r.action === "unresolved" ? "?" : "✗";
-        const extra = r.conversationId ? ` (conv: ${r.conversationId.slice(0, 8)}…)` : "";
+        const icon = r.action === "none" ? "~" : r.action === "recovered" ? "✓" : r.action === "unresolved" ? "?" : r.action === "stale" ? "!" : "✗";
+        const extra = r.conversationId ? ` (conv: ${r.conversationId.slice(0,  8)}…)` : "";
         const pid   = r.meta.pid ? ` pid:${r.meta.pid}` : "";
         const age   = r.meta.reconcile ? ` age:${Math.round(r.meta.reconcile.ageSec / 60)}min` : "";
         console.log(`  ${icon} ${r.meta.id.slice(0, 52)}  → ${actionLabel[r.action] || r.action}${pid}${age}${extra}`);
       }
-      console.log(`\nReconciled ${reconciled} session(s).${networkFlag ? " (with network poll)" : ""}`);
+      console.log(`\nReconciled ${reconciled} session(s).${networkFlag && !skipNetworkReason ? " (with network poll)" : ""}`);
       process.exit(0);
     })();
     return;

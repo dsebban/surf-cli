@@ -159,19 +159,34 @@ async function reconcileSessions(opts = {}) {
     const pidAlive  = defaultPidIsAlive(meta.pid);
     const tooOld    = age > MAX_RUNNING_AGE_MS;
 
-    if (pidAlive && !tooOld) {
-      // Looks genuinely alive — don't touch it
-      results.push({ meta, action: "none", reason: "pid_alive" });
+    // ── PID still alive → annotate but never mutate status ──────────────────
+    // (even if very old — could be a legitimate long-running session)
+    if (pidAlive) {
+      if (tooOld) {
+        // Annotate as "stale" but keep running — active worker may still complete
+        const reconcile = {
+          reconciledAt: new Date().toISOString(),
+          pidAlive:     true,
+          ageSec:       Math.round(age / 1000),
+          state:        "stale",
+          remote:       null,
+        };
+        updateSession(meta.id, { reconcile });
+        results.push({ meta, action: "stale", reason: "old_but_pid_alive" });
+      } else {
+        results.push({ meta, action: "none", reason: "pid_alive" });
+      }
       continue;
     }
 
+    // PID is dead — proceed to orphan / network recovery
     // Build reconcile record (will be written regardless of network result)
     const reconcile = {
       reconciledAt: new Date().toISOString(),
-      pidAlive,
-      ageSec: Math.round(age / 1000),
-      state:  "orphaned",
-      remote: null,
+      pidAlive:     false,
+      ageSec:       Math.round(age / 1000),
+      state:        "orphaned",
+      remote:       null,
     };
 
     const conversationId = resolveConversationId(meta);

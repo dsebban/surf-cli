@@ -92,6 +92,26 @@ describe("inspectConversation", () => {
     expect(inspectConversation({ mapping: { n1: {} } })).toEqual({ outcome: "ambiguous", nodeId: null });
   });
 
+  // Regression: baseline comes from DOM data-message-id, not data-testid
+  // Realistic test where DOM baseline (msg-abc) differs from API current_node (msg-xyz)
+  it("returns completed when current_node differs from baseline (real-world scenario)", () => {
+    const conv = {
+      current_node: "msg-new-response",
+      mapping: {
+        "msg-old-assistant": {
+          message: { status: "finished_successfully", author: { role: "assistant" }, create_time: 1000 },
+        },
+        "msg-new-response": {
+          message: { status: "finished_successfully", author: { role: "assistant" }, create_time: 2000 },
+        },
+      },
+    };
+    // Baseline is the OLD assistant message from DOM
+    const result = inspectConversation(conv, { baselineAssistantMessageId: "msg-old-assistant" });
+    expect(result.outcome).toBe("completed"); // new response is completed
+    expect(result.nodeId).toBe("msg-new-response");
+  });
+
   it("returns completed when last node is finished_successfully assistant", () => {
     const conv = {
       current_node: "n1",
@@ -231,7 +251,7 @@ describe("reconcileSessions", () => {
     expect(meta.reconcile.state).toBe("orphaned");
   });
 
-  it("marks orphaned when session is too old even if pid somehow alive", async () => {
+  it("annotates as stale when session is old but pid still alive (never orphans)", async () => {
     const r = loadReconciler();
     const oldDate = new Date(Date.now() - r.MAX_RUNNING_AGE_MS - 60_000).toISOString();
     writeSessionMeta(tmpDir, {
@@ -242,12 +262,14 @@ describe("reconcileSessions", () => {
       pid: process.pid, // alive but too old
     });
 
-    const { reconciled } = await r.reconcileSessions({ all: true });
-    expect(reconciled).toBe(1);
+    const { reconciled, sessions } = await r.reconcileSessions({ all: true });
+    expect(reconciled).toBe(1); // stale is counted as reconciled
+    expect(sessions[0].action).toBe("stale");
 
     const meta = readSessionMeta(tmpDir, "chatgpt-old") as any;
-    expect(meta.status).toBe("error");
-    expect(meta.reconcile.state).toBe("orphaned");
+    expect(meta.status).toBe("running"); // NOT changed to error
+    expect(meta.reconcile.state).toBe("stale");
+    expect(meta.reconcile.pidAlive).toBe(true);
   });
 
   it("recovers session via network poll when conversation completed", async () => {

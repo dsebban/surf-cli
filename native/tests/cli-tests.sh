@@ -127,6 +127,14 @@ METAMETA
 test_output "session list shows orphaned" \
   "SURF_SESSIONS_DIR=$tmp_sessions node cli.cjs session --all" \
   "orphaned"
+# alive pid but very old → stale, NOT orphaned
+mkdir -p "$tmp_sessions/chatgpt-alive-but-old_2000-01-01_000000.000_0002"
+cat > "$tmp_sessions/chatgpt-alive-but-old_2000-01-01_000000.000_0002/meta.json" <<'METAMETA'
+{"id":"chatgpt-alive-but-old_2000-01-01_000000.000_0002","tool":"chatgpt","status":"running","createdAt":"2000-01-01T00:00:00.000Z","pid":$$,"conversationId":null,"reconcile":null}
+METAMETA
+test_output "session list shows stale not orphaned" \
+  "SURF_SESSIONS_DIR=$tmp_sessions node cli.cjs session --all" \
+  "stale"
 rm -rf "$tmp_sessions"
 
 echo ""
