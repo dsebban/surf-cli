@@ -8,7 +8,7 @@ description: Control Chrome browser via CLI for testing, automation, debugging, 
 Real Chrome-family browser control via CLI / native host / extension.
 Prefer real browser state over guessed APIs.
 
-Repo + local CLI verified against **surf-cli v2.8.0**.
+Repo + local CLI verified against **surf-cli v2.10.0**.
 
 ## Use when
 
@@ -114,6 +114,20 @@ Notes:
 - search may use a recent-history fallback; if JSON shows `partial: true`, misses are **not authoritative** for older chats
 - `--download-file` needs `--output`
 
+### ChatGPT thinking trace
+
+Pro/Thinking models stream live thinking content via `🧠` lines:
+
+```bash
+# Thinking trace shows during generation
+SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "complex problem" --model gpt-5.4-pro --profile dsebban883@gmail.com
+# Output:
+# [cloak-chatgpt] ⏳ Thinking
+# [cloak-chatgpt] 🧠 The user wants me to analyze the trade setup...
+# [cloak-chatgpt] 🧠 Looking at the volume profile and price action...
+# [cloak-chatgpt] ⏳ Responding
+```
+
 ### ChatGPT constraints
 
 - `--profile` macOS only
@@ -195,6 +209,43 @@ Preferred ids:
 - `gemini-3.1-flash-lite-preview`
 - `gemini-3.1-flash-image-preview`
 
+## Sessions & Reconciliation
+
+Every surf command creates a session in `~/.surf/sessions/`.
+
+```bash
+# List sessions
+surf session                    # last 72h
+surf session --hours 1          # last 1h
+surf session --all              # everything
+
+# View session detail
+surf session <session-id>
+
+# Reconcile orphaned sessions (auto-runs on list, or explicit)
+surf session --reconcile              # local PID check only
+surf session --reconcile --network    # + poll ChatGPT API for conversation status
+surf session --reconcile --all        # include old sessions
+
+# Clean up old sessions
+surf session --clear --hours 48       # delete sessions older than 48h
+surf session --clear --all            # delete all
+```
+
+### Session status labels
+
+| Label | Meaning |
+|-------|--------|
+| `✓ completed` | Finished successfully |
+| `✗ error` | Failed (timeout, crash, etc.) |
+| `✗ orphaned` | Worker died without completing — auto-detected by reconciler |
+| `! stale` | PID alive but session > 4h — annotated, not killed |
+| `◌ running` | Active session |
+| `? running` | Network poll says conversation still in progress |
+| `✓ recovered` | Reconciler confirmed conversation completed on ChatGPT side |
+
+Reconciler stores `pid` in session metadata. On list, auto-checks if PID is alive. Dead PID → orphaned. Alive PID → never mutated (even if old).
+
 ## Practical rules
 
 - prefer headless for ChatGPT and Gemini
@@ -203,3 +254,5 @@ Preferred ids:
 - use tmux for long jobs
 - treat browser-session AI as UI automation: poll logs, expect latency, verify outputs
 - for ChatGPT search, JSON `partial: true` means recent-window fallback only
+- use `surf session` to check status of long-running jobs
+- `surf session --reconcile` fixes orphaned sessions automatically
