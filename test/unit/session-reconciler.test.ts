@@ -7,10 +7,10 @@
  *  - reconcileSessions: pid-alive skip / orphan local / recovered (network) / unresolved / poll_failed
  */
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as fs from "node:fs";
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -18,14 +18,22 @@ type Reconciler = {
   defaultPidIsAlive: (pid: unknown) => boolean;
   isChatGptCloakSession: (meta: unknown) => boolean;
   resolveConversationId: (meta: unknown) => string | null;
-  inspectConversation: (conv: unknown, meta?: unknown) => { outcome: string; nodeId: string | null };
-  reconcileSessions: (opts?: Record<string, unknown>) => Promise<{ reconciled: number; sessions: Array<{ meta: unknown; action: string; conversationId?: string }> }>;
+  inspectConversation: (
+    conv: unknown,
+    meta?: unknown,
+  ) => { outcome: string; nodeId: string | null };
+  reconcileSessions: (opts?: Record<string, unknown>) => Promise<{
+    reconciled: number;
+    sessions: Array<{ meta: unknown; action: string; conversationId?: string }>;
+  }>;
   MAX_RUNNING_AGE_MS: number;
 };
 
 // Load once; all functions read SURF_SESSIONS_DIR lazily so env changes are picked up per call
 const reconciler = require("../../native/session-reconciler.cjs") as Reconciler;
-function loadReconciler(): Reconciler { return reconciler; }
+function loadReconciler(): Reconciler {
+  return reconciler;
+}
 
 function makeTmpSessionDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "surf-test-sessions-"));
@@ -85,11 +93,17 @@ describe("inspectConversation", () => {
   });
 
   it("returns ambiguous when mapping missing", () => {
-    expect(inspectConversation({ current_node: "n1" })).toEqual({ outcome: "ambiguous", nodeId: null });
+    expect(inspectConversation({ current_node: "n1" })).toEqual({
+      outcome: "ambiguous",
+      nodeId: null,
+    });
   });
 
   it("returns ambiguous when current_node missing", () => {
-    expect(inspectConversation({ mapping: { n1: {} } })).toEqual({ outcome: "ambiguous", nodeId: null });
+    expect(inspectConversation({ mapping: { n1: {} } })).toEqual({
+      outcome: "ambiguous",
+      nodeId: null,
+    });
   });
 
   // Regression: baseline comes from DOM data-message-id, not data-testid
@@ -99,10 +113,18 @@ describe("inspectConversation", () => {
       current_node: "msg-new-response",
       mapping: {
         "msg-old-assistant": {
-          message: { status: "finished_successfully", author: { role: "assistant" }, create_time: 1000 },
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+            create_time: 1000,
+          },
         },
         "msg-new-response": {
-          message: { status: "finished_successfully", author: { role: "assistant" }, create_time: 2000 },
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+            create_time: 2000,
+          },
         },
       },
     };
@@ -192,8 +214,11 @@ describe("reconcileSessions", () => {
   });
 
   afterEach(() => {
-    if (origEnv === undefined) delete process.env.SURF_SESSIONS_DIR;
-    else process.env.SURF_SESSIONS_DIR = origEnv;
+    if (origEnv === undefined) {
+      process.env.SURF_SESSIONS_DIR = undefined as unknown as string;
+    } else {
+      process.env.SURF_SESSIONS_DIR = origEnv;
+    }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -313,7 +338,7 @@ describe("reconcileSessions", () => {
     expect(meta.reconcile.state).toBe("recovered");
     expect(meta.result.reconciled).toBe(true);
     expect(mockManageChats).toHaveBeenCalledWith(
-      expect.objectContaining({ action: "get", conversationId: "conv-abc123" })
+      expect.objectContaining({ action: "get", conversationId: "conv-abc123" }),
     );
   });
 
