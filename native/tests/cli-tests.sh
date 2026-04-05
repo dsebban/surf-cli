@@ -111,6 +111,25 @@ test_output "chatgpt.chats download requires output" "SURF_USE_CLOAK_CHATGPT=1 n
 test_output "chatgpt.reply usage" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.reply" "Usage: surf chatgpt.reply"
 
 echo ""
+echo "-- Session Reconcile --"
+tmp_sessions=$(mktemp -d)
+test_output "session reconcile empty" \
+  "SURF_SESSIONS_DIR=$tmp_sessions node cli.cjs session --reconcile" \
+  "No running sessions"
+test_output "session clear+reconcile invalid" \
+  "node cli.cjs session --clear --reconcile" \
+  "cannot combine --clear with --reconcile"
+# stale session: dead pid, old createdAt
+mkdir -p "$tmp_sessions/chatgpt-stale_2000-01-01_000000.000_0001"
+cat > "$tmp_sessions/chatgpt-stale_2000-01-01_000000.000_0001/meta.json" <<'METAMETA'
+{"id":"chatgpt-stale_2000-01-01_000000.000_0001","tool":"chatgpt","status":"running","createdAt":"2000-01-01T00:00:00.000Z","pid":999999999,"conversationId":null,"reconcile":null}
+METAMETA
+test_output "session list shows orphaned" \
+  "SURF_SESSIONS_DIR=$tmp_sessions node cli.cjs session --all" \
+  "orphaned"
+rm -rf "$tmp_sessions"
+
+echo ""
 echo "-- List Command --"
 test_output "list shows new commands" "node cli.cjs --list" "back"
 test_output "list shows zoom" "node cli.cjs --list" "zoom"

@@ -110,6 +110,15 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
                 recapText: msg.recapText,
               });
               break;
+            case "meta_update":
+              onProgress({
+                type:                       "meta_update",
+                conversationId:             msg.conversationId || null,
+                baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
+                source:                     msg.source || null,
+                t:                          msg.t || Date.now(),
+              });
+              break;
             case "log":
               if (process.env.SURF_DEBUG) {
                 process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);
@@ -154,6 +163,15 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
               thoughtCount: msg.thoughtCount,
               durationSec: msg.durationSec,
               recapText: msg.recapText,
+            });
+            return false;
+          case "meta_update":
+            onProgress({
+              type:                       "meta_update",
+              conversationId:             msg.conversationId || null,
+              baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
+              source:                     msg.source || null,
+              t:                          msg.t || Date.now(),
             });
             return false;
           case "log":

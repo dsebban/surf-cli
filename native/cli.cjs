@@ -14,7 +14,8 @@ const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require(
 const { isCloakBrowserAvailable, queryWithCloakBrowser, manageChatsWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
 const chatgptChatsFormatter = require("./chatgpt-chats-formatter.cjs");
 const chatgptChatsCache = require("./chatgpt-chats-cache.cjs");
-const sessionStore = require("./session-store.cjs");
+const sessionStore     = require("./session-store.cjs");
+const sessionReconciler = require("./session-reconciler.cjs");
 const { version: VERSION } = require("../package.json");
 
 const IS_WIN = process.platform === "win32";
@@ -1880,6 +1881,57 @@ if (args[0] === "skills" || args[0] === "skill") {
 if (args[0] === "session" || args[0] === "sessions") {
   const sessionArgs = args.slice(1);
 
+  // Guard: --clear and --reconcile are mutually exclusive
+  if (sessionArgs.includes("--clear") && sessionArgs.includes("--reconcile")) {
+    console.error("Error: cannot combine --clear with --reconcile");
+    process.exit(1);
+  }
+
+  // surf session --reconcile [--hours N] [--all] [--network]
+  if (sessionArgs.includes("--reconcile")) {
+    const allFlag    = sessionArgs.includes("--all");
+    const networkFlag = sessionArgs.includes("--network");
+    const hoursIdx   = sessionArgs.indexOf("--hours");
+    const rawHours   = hoursIdx !== -1 ? Number(sessionArgs[hoursIdx + 1]) : 72;
+    const hours      = (Number.isFinite(rawHours) && rawHours > 0) ? rawHours : 72;
+
+    let manageChats = null;
+    if (networkFlag) {
+      try {
+        const bridge = require("./chatgpt-cloak-bridge.cjs");
+        manageChats  = bridge.manageChatsWithCloakBrowser;
+      } catch {
+        console.error("Warning: CloakBrowser not available — skipping network poll");
+      }
+    }
+
+    (async () => {
+      const { reconciled, sessions } = await sessionReconciler.reconcileSessions({
+        hours,
+        all: allFlag,
+        pollNetwork: networkFlag,
+        manageChats,
+      });
+
+      if (sessions.length === 0) {
+        console.log("No running sessions to reconcile.");
+        process.exit(0);
+      }
+
+      const actionLabel = { none: "alive", orphaned: "orphaned", recovered: "recovered", unresolved: "unresolved" };
+      for (const r of sessions) {
+        const icon = r.action === "none" ? "~" : r.action === "recovered" ? "✓" : r.action === "unresolved" ? "?" : "✗";
+        const extra = r.conversationId ? ` (conv: ${r.conversationId.slice(0, 8)}…)` : "";
+        const pid   = r.meta.pid ? ` pid:${r.meta.pid}` : "";
+        const age   = r.meta.reconcile ? ` age:${Math.round(r.meta.reconcile.ageSec / 60)}min` : "";
+        console.log(`  ${icon} ${r.meta.id.slice(0, 52)}  → ${actionLabel[r.action] || r.action}${pid}${age}${extra}`);
+      }
+      console.log(`\nReconciled ${reconciled} session(s).${networkFlag ? " (with network poll)" : ""}`);
+      process.exit(0);
+    })();
+    return;
+  }
+
   // surf session --clear [--hours N | --all]
   if (sessionArgs.includes("--clear")) {
     const allFlag  = sessionArgs.includes("--all");
@@ -1935,43 +1987,67 @@ if (args[0] === "session" || args[0] === "sessions") {
   const rawLimit = limitIdx !== -1 ? Number(sessionArgs[limitIdx + 1]) : 50;
   const limit    = (Number.isFinite(rawLimit) && rawLimit > 0) ? Math.floor(rawLimit) : 50;
 
-  const sessions = sessionStore.listSessions({ hours, all: allFlag, limit });
+  // Auto-reconcile (local PID check only — fast, no network) before displaying
+  (async () => {
+    await sessionReconciler.reconcileSessions({ hours, all: allFlag, limit, pollNetwork: false });
 
-  if (sessions.length === 0) {
-    console.log(`No sessions found in the last ${allFlag ? "" : hours + "h "}at ${sessionStore.SESSIONS_DIR}`);
-    console.log(`  surf session --all          Show all sessions`);
-    console.log(`  surf session --hours 72     Last 72 hours`);
+    const sessions = sessionStore.listSessions({ hours, all: allFlag, limit });
+
+    if (sessions.length === 0) {
+      console.log(`No sessions found in the last ${allFlag ? "" : hours + "h "}at ${sessionStore.SESSIONS_DIR}`);
+      console.log(`  surf session --all          Show all sessions`);
+      console.log(`  surf session --hours 72     Last 72 hours`);
+      process.exit(0);
+    }
+
+    // Header
+    console.log(`\nSurf sessions (${sessions.length}) — ${sessionStore.SESSIONS_DIR}\n`);
+    const pad = (s, n) => String(s ?? "").padEnd(n);
+
+    // Status label: show reconcile state for annotated running sessions
+    const statusLabel = (s) => {
+      if (s.status === "completed") return "✓ completed";
+      if (s.status === "error") {
+        if (s.reconcile) return "✗ orphaned";
+        return "✗ error";
+      }
+      if (s.status === "running") {
+        if (s.reconcile) {
+          const st = s.reconcile.state;
+          if (st === "stale" || st === "orphaned") return "! stale";
+          if (st === "unresolved") return "? running";
+          if (st === "recovered") return "✓ recovered";
+        }
+        return "◌ running";
+      }
+      return `· ${s.status}`;
+    };
+
+    // Column widths
+    const maxId  = Math.min(48, Math.max(20, ...sessions.map(s => s.id.length)));
+    const header = `  ${pad("STATUS",13)} ${pad("TOOL",10)} ${pad("ID", maxId)} ${pad("ELAPSED",8)} CREATED`;
+    console.log(header);
+    console.log("  " + "-".repeat(header.length - 2));
+
+    for (const s of sessions) {
+      const label   = statusLabel(s);
+      const elapsed = s.elapsedMs ? `${(s.elapsedMs / 1000).toFixed(1)}s` : "-";
+      const created = new Date(s.createdAt).toLocaleString("en-US", {
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+      });
+      console.log(`  ${pad(label,13)} ${pad(s.tool,10)} ${pad(s.id, maxId)} ${pad(elapsed,8)} ${created}`);
+    }
+
+    console.log(`\nUsage:`);
+    console.log(`  surf session <id>                View session log`);
+    console.log(`  surf session --reconcile         Fix orphaned sessions`);
+    console.log(`  surf session --reconcile --network  + poll ChatGPT API`);
+    console.log(`  surf session --hours 72          Last 72h`);
+    console.log(`  surf session --all               All sessions`);
+    console.log(`  surf session --clear             Delete all`);
+    console.log(`  surf session --clear --hours 24  Delete sessions older than 24h`);
     process.exit(0);
-  }
-
-  // Header
-  console.log(`\nSurf sessions (${sessions.length}) — ${sessionStore.SESSIONS_DIR}\n`);
-  const STATUS_ICON = { completed: "✓", error: "✗", running: "◌", pending: "·", cancelled: "⊘" };
-  const pad = (s, n) => String(s ?? "").padEnd(n);
-
-  // Column widths
-  const maxId    = Math.min(48, Math.max(20, ...sessions.map(s => s.id.length)));
-  const header   = `  ${pad("STATUS",8)} ${pad("TOOL",10)} ${pad("ID", maxId)} ${pad("ELAPSED",8)} CREATED`;
-  console.log(header);
-  console.log("  " + "-".repeat(header.length - 2));
-
-  for (const s of sessions) {
-    const icon    = STATUS_ICON[s.status] || "?";
-    const elapsed = s.elapsedMs ? `${(s.elapsedMs / 1000).toFixed(1)}s` : "-";
-    const created = new Date(s.createdAt).toLocaleString("en-US", {
-      month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
-    });
-    const statusLabel = `${icon} ${s.status}`;
-    console.log(`  ${pad(statusLabel,8)} ${pad(s.tool,10)} ${pad(s.id, maxId)} ${pad(elapsed,8)} ${created}`);
-  }
-
-  console.log(`\nUsage:`);
-  console.log(`  surf session <id>             View session log`);
-  console.log(`  surf session --hours 72       Last 72h`);
-  console.log(`  surf session --all            All sessions`);
-  console.log(`  surf session --clear          Delete all`);
-  console.log(`  surf session --clear --hours 24  Delete sessions older than 24h`);
-  process.exit(0);
+  })();
 }
 
 if (args[0] === "extension-path" || args[0] === "path") {
@@ -3213,6 +3289,13 @@ const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
   let lastProgress = "";
   try {
     const result = await withOptionalHeadedCloak(queryArgs.continueInBrowser === true, () => queryWithCloakBrowser(queryArgs, (progress) => {
+      if (progress.type === "meta_update") {
+        const patch = {};
+        if (progress.conversationId)             patch.conversationId             = progress.conversationId;
+        if (progress.baselineAssistantMessageId) patch.baselineAssistantMessageId = progress.baselineAssistantMessageId;
+        if (Object.keys(patch).length > 0)       sess.update(patch);
+        return;
+      }
       if (progress.type === "trace") {
         // Rich thinking text — print deltas as they arrive
         if (progress.traceType === "thinking_text") {

@@ -30,8 +30,11 @@ const VERSION = (() => {
   try { return require("../package.json").version; } catch { return "unknown"; }
 })();
 
-const SESSIONS_DIR = process.env.SURF_SESSIONS_DIR
-  || path.join(os.homedir(), ".surf", "sessions");
+// Read lazily so SURF_SESSIONS_DIR overrides work in tests without module reloading
+const getSessionsDir = () =>
+  process.env.SURF_SESSIONS_DIR || path.join(os.homedir(), ".surf", "sessions");
+
+
 
 const DEFAULT_TTL_HOURS = 72;
 const MAX_SESSIONS      = 500;
@@ -96,6 +99,14 @@ class Session {
 
   get logPath() { return this._logPath; }
 
+  // Merge a partial patch into meta (e.g. conversationId, baselineAssistantMessageId)
+  update(patch = {}) {
+    if (patch && typeof patch === "object") {
+      Object.assign(this._meta, patch);
+    }
+    this._writeMeta();
+  }
+
   // Append a line to output.log (structured for replay)
   step(msg) {
     const line = `${msg}\n`;
@@ -150,11 +161,11 @@ class Session {
 
 function createSession(tool, args = {}, env = {}) {
   try {
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+    fs.mkdirSync(getSessionsDir(), { recursive: true });
   } catch {}
 
   const id  = makeSessionId(tool, args);
-  const dir = path.join(SESSIONS_DIR, id);
+  const dir = path.join(getSessionsDir(), id);
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
 
   // Capture relevant env flags
@@ -172,6 +183,10 @@ function createSession(tool, args = {}, env = {}) {
     status:    "running",
     createdAt: new Date().toISOString(),
     _startMs:  Date.now(),
+    pid:       process.pid,
+    conversationId:             args.conversationId || null,
+    baselineAssistantMessageId: null,
+    reconcile:                  null,
   };
 
   const session = new Session(id, dir, meta);
@@ -199,11 +214,11 @@ function createSession(tool, args = {}, env = {}) {
 // ============================================================================
 
 function listSessions({ hours = DEFAULT_TTL_HOURS, all = false, limit = 50 } = {}) {
-  try { fs.mkdirSync(SESSIONS_DIR, { recursive: true }); } catch {}
+  try { fs.mkdirSync(getSessionsDir(), { recursive: true }); } catch {}
 
   let entries;
   try {
-    entries = fs.readdirSync(SESSIONS_DIR);
+    entries = fs.readdirSync(getSessionsDir());
   } catch {
     return [];
   }
@@ -212,7 +227,7 @@ function listSessions({ hours = DEFAULT_TTL_HOURS, all = false, limit = 50 } = {
 
   const sessions = [];
   for (const name of entries) {
-    const metaPath = path.join(SESSIONS_DIR, name, "meta.json");
+    const metaPath = path.join(getSessionsDir(), name, "meta.json");
     try {
       const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
       const ts   = new Date(meta.createdAt).getTime();
@@ -234,10 +249,10 @@ function listSessions({ hours = DEFAULT_TTL_HOURS, all = false, limit = 50 } = {
 // ============================================================================
 
 function loadSession(idOrPrefix) {
-  try { fs.mkdirSync(SESSIONS_DIR, { recursive: true }); } catch {}
+  try { fs.mkdirSync(getSessionsDir(), { recursive: true }); } catch {}
 
   // Exact match first
-  const exactDir = path.join(SESSIONS_DIR, idOrPrefix);
+  const exactDir = path.join(getSessionsDir(), idOrPrefix);
   if (fs.existsSync(exactDir)) {
     const metaPath = path.join(exactDir, "meta.json");
     const logPath  = path.join(exactDir, "output.log");
@@ -251,7 +266,7 @@ function loadSession(idOrPrefix) {
 
   // Prefix search
   let entries;
-  try { entries = fs.readdirSync(SESSIONS_DIR); } catch { return null; }
+  try { entries = fs.readdirSync(getSessionsDir()); } catch { return null; }
 
   const matches = entries.filter(e => e.startsWith(idOrPrefix));
   if (matches.length === 0) return null;
@@ -259,7 +274,7 @@ function loadSession(idOrPrefix) {
   // Sort by createdAt descending (parse each meta.json, fall back to dir name sort)
   const candidates = [];
   for (const name of matches) {
-    const mp = path.join(SESSIONS_DIR, name, "meta.json");
+    const mp = path.join(getSessionsDir(), name, "meta.json");
     try {
       const m = JSON.parse(fs.readFileSync(mp, "utf8"));
       candidates.push({ name, createdAt: m.createdAt || "" });
@@ -269,7 +284,7 @@ function loadSession(idOrPrefix) {
   }
   candidates.sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
 
-  const dir      = path.join(SESSIONS_DIR, candidates[0].name);
+  const dir      = path.join(getSessionsDir(), candidates[0].name);
   const metaPath = path.join(dir, "meta.json");
   const logPath  = path.join(dir, "output.log");
   try {
@@ -286,7 +301,7 @@ function loadSession(idOrPrefix) {
 
 function deleteSessions({ hours, all = false } = {}) {
   let entries;
-  try { entries = fs.readdirSync(SESSIONS_DIR); } catch { return { deleted: 0, remaining: 0 }; }
+  try { entries = fs.readdirSync(getSessionsDir()); } catch { return { deleted: 0, remaining: 0 }; }
 
   // Validate hours: must be a finite positive number; reject NaN/0/negative.
   // If hours is provided but invalid, refuse to run — do NOT silently delete-all.
@@ -302,7 +317,7 @@ function deleteSessions({ hours, all = false } = {}) {
 
   let deleted = 0;
   for (const name of entries) {
-    const dir      = path.join(SESSIONS_DIR, name);
+    const dir      = path.join(getSessionsDir(), name);
     const metaPath = path.join(dir, "meta.json");
     try {
       if (all) {
@@ -319,7 +334,7 @@ function deleteSessions({ hours, all = false } = {}) {
   }
 
   let remaining = 0;
-  try { remaining = fs.readdirSync(SESSIONS_DIR).length; } catch {}
+  try { remaining = fs.readdirSync(getSessionsDir()).length; } catch {}
   return { deleted, remaining };
 }
 
@@ -327,10 +342,37 @@ function deleteSessions({ hours, all = false } = {}) {
 // Exports
 // ============================================================================
 
-module.exports = {
+// ============================================================================
+// updateSession — patch meta.json for an existing session by id
+// ============================================================================
+
+function updateSession(id, patch = {}) {
+  const dir      = path.join(getSessionsDir(), id);
+  const metaPath = path.join(dir, "meta.json");
+  try {
+    const meta    = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+    const updated = Object.assign({}, meta, patch);
+    fs.writeFileSync(metaPath, JSON.stringify(updated, null, 2));
+    return updated;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================================
+// Exports
+// ============================================================================
+
+const exports_ = {
   createSession,
   listSessions,
   loadSession,
   deleteSessions,
-  SESSIONS_DIR,
+  updateSession,
 };
+// Dynamic getter so SURF_SESSIONS_DIR env changes are reflected immediately
+Object.defineProperty(exports_, "SESSIONS_DIR", {
+  get: getSessionsDir,
+  enumerable: true,
+});
+module.exports = exports_;

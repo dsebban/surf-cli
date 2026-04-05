@@ -1,0 +1,278 @@
+/**
+ * surf-cli session reconciler
+ *
+ * Detects orphaned / stale sessions whose worker died without calling
+ * session.finish() or session.fail(), and optionally polls the ChatGPT API
+ * to recover completed conversations.
+ *
+ * Public API:
+ *   defaultPidIsAlive(pid)           — liveness check for a stored pid
+ *   isChatGptCloakSession(meta)      — true when session used cloak
+ *   resolveConversationId(meta)      — extract conversationId from meta/args
+ *   inspectConversation(conv, meta)  — determine outcome from GET response
+ *   reconcileSessions(opts)          — main reconcile pass (local + optional network)
+ */
+
+"use strict";
+
+const { listSessions, updateSession } = require("./session-store.cjs");
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Sessions still "running" beyond this age are considered orphaned. */
+const MAX_RUNNING_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Check whether a PID is still alive using signal 0.
+ * Returns false for invalid / missing PIDs.
+ */
+function defaultPidIsAlive(pid) {
+  if (!pid || typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when the session was run via CloakBrowser (as opposed to Bun headless). */
+function isChatGptCloakSession(meta) {
+  return (
+    meta.tool === "chatgpt" &&
+    !!(meta.env && (meta.env.SURF_USE_CLOAK_CHATGPT === "1" || meta.env.SURF_USE_CLOAK_CHATGPT === true))
+  );
+}
+
+/** Pull the ChatGPT conversation ID out of wherever it may be stored. */
+function resolveConversationId(meta) {
+  return (
+    meta.conversationId ||
+    (meta.args && meta.args.conversationId) ||
+    null
+  );
+}
+
+// ============================================================================
+// inspectConversation
+// ============================================================================
+
+/**
+ * Analyse a GET /backend-api/conversation/{id} response to determine whether
+ * the conversation completed, is still in progress, or is ambiguous.
+ *
+ * @param {object}  conversation  Raw conversation object from the API.
+ * @param {object}  meta          Session meta (for baseline comparison).
+ * @returns {{ outcome: string, nodeId: string|null }}
+ *   outcome: 'completed' | 'no_new_assistant' | 'in_progress' | 'ambiguous'
+ */
+function inspectConversation(conversation, meta = {}) {
+  if (!conversation || typeof conversation !== "object") {
+    return { outcome: "ambiguous", nodeId: null };
+  }
+
+  const mapping       = conversation.mapping;
+  const currentNodeId = conversation.current_node;
+
+  if (!mapping || !currentNodeId || !mapping[currentNodeId]) {
+    return { outcome: "ambiguous", nodeId: null };
+  }
+
+  const node = mapping[currentNodeId];
+  const msg  = node.message;
+  if (!msg) return { outcome: "ambiguous", nodeId: currentNodeId };
+
+  const status = msg.status;
+  const role   = msg.author && msg.author.role;
+
+  // Current node must be an assistant turn for a completed response
+  if (role !== "assistant") {
+    return { outcome: "no_new_assistant", nodeId: currentNodeId };
+  }
+
+  if (status === "finished_successfully") {
+    // Check if this is just the pre-existing baseline (same turn, no new content)
+    const baseline = meta.baselineAssistantMessageId;
+    if (baseline && currentNodeId === baseline) {
+      return { outcome: "no_new_assistant", nodeId: currentNodeId };
+    }
+    return { outcome: "completed", nodeId: currentNodeId };
+  }
+
+  if (status === "in_progress") {
+    return { outcome: "in_progress", nodeId: currentNodeId };
+  }
+
+  return { outcome: "ambiguous", nodeId: currentNodeId };
+}
+
+// ============================================================================
+// reconcileSessions
+// ============================================================================
+
+/**
+ * Main reconcile pass.
+ *
+ * Local-only (fast, no network):
+ *   - Checks stored pid liveness
+ *   - Marks orphaned sessions as status "error" with code "session_orphaned"
+ *
+ * Network-enhanced (pollNetwork: true):
+ *   - For sessions with a known conversationId, calls manageChats({ action:'get' })
+ *   - Recovered sessions become status "completed"
+ *   - Unresolved (in_progress) sessions stay "running" with reconcile.state = 'unresolved'
+ *
+ * @param {object}  opts
+ * @param {number}  [opts.hours=72]        Look back window for listSessions.
+ * @param {boolean} [opts.all=false]       Pass through to listSessions.
+ * @param {number}  [opts.limit=200]       Pass through to listSessions.
+ * @param {boolean} [opts.pollNetwork]     Enable network polling.
+ * @param {Function}[opts.manageChats]     manageChatsWithCloakBrowser function ref.
+ * @returns {{ reconciled: number, sessions: Array }}
+ */
+async function reconcileSessions(opts = {}) {
+  const {
+    hours        = 72,
+    all          = false,
+    limit        = 200,
+    pollNetwork  = false,
+    manageChats  = null,
+  } = opts;
+
+  const sessions = listSessions({ hours, all, limit });
+  const running  = sessions.filter(s => s.status === "running");
+
+  if (running.length === 0) return { reconciled: 0, sessions: [] };
+
+  const results = [];
+  const now     = Date.now();
+
+  for (const meta of running) {
+    const createdMs = new Date(meta.createdAt).getTime();
+    const age       = now - createdMs;
+    const pidAlive  = defaultPidIsAlive(meta.pid);
+    const tooOld    = age > MAX_RUNNING_AGE_MS;
+
+    if (pidAlive && !tooOld) {
+      // Looks genuinely alive — don't touch it
+      results.push({ meta, action: "none", reason: "pid_alive" });
+      continue;
+    }
+
+    // Build reconcile record (will be written regardless of network result)
+    const reconcile = {
+      reconciledAt: new Date().toISOString(),
+      pidAlive,
+      ageSec: Math.round(age / 1000),
+      state:  "orphaned",
+      remote: null,
+    };
+
+    const conversationId = resolveConversationId(meta);
+    let   recovered      = false;
+
+    // ── Optional network poll ──────────────────────────────────────────────
+    if (pollNetwork && conversationId && typeof manageChats === "function") {
+      try {
+        const chatResult = await manageChats({
+          action:         "get",
+          conversationId,
+          profile:        meta.args && meta.args.profile,
+          timeout:        30,
+        });
+
+        // manageChatsWithCloakBrowser wraps the result — unwrap conversation
+        const convo = (
+          chatResult &&
+          (chatResult.conversation ||
+            (chatResult.data && chatResult.data.conversation))
+        ) || null;
+
+        const inspection = inspectConversation(convo, meta);
+        reconcile.remote = {
+          conversationId,
+          outcome: inspection.outcome,
+          nodeId:  inspection.nodeId || null,
+        };
+
+        if (inspection.outcome === "completed") {
+          reconcile.state = "recovered";
+          updateSession(meta.id, {
+            status:      "completed",
+            completedAt: new Date().toISOString(),
+            elapsedMs:   age,
+            reconcile,
+            result: {
+              ok:            true,
+              reconciled:    true,
+              conversationId,
+              nodeId:        inspection.nodeId,
+            },
+          });
+          results.push({ meta, action: "recovered", conversationId });
+          recovered = true;
+
+        } else if (inspection.outcome === "in_progress") {
+          // Still generating on ChatGPT side — leave running but annotate
+          reconcile.state = "unresolved";
+          updateSession(meta.id, { reconcile });
+          results.push({ meta, action: "unresolved", conversationId });
+          recovered = true; // don't mark error
+
+        } else {
+          // no_new_assistant / ambiguous → fall through to orphan
+          reconcile.state = "orphaned";
+          if (inspection.outcome === "no_new_assistant") {
+            reconcile.remote = { ...reconcile.remote, reason: "no_new_assistant" };
+          }
+        }
+      } catch (e) {
+        reconcile.remote = {
+          conversationId,
+          outcome: "poll_failed",
+          error:   e.message,
+        };
+        reconcile.state = "orphaned";
+      }
+    }
+
+    // ── Mark orphaned ──────────────────────────────────────────────────────
+    if (!recovered) {
+      updateSession(meta.id, {
+        status:      "error",
+        completedAt: new Date().toISOString(),
+        elapsedMs:   age,
+        reconcile,
+        error: {
+          message: "Session orphaned — process exited without completing",
+          code:    "session_orphaned",
+        },
+      });
+      results.push({ meta, action: "orphaned" });
+    }
+  }
+
+  return {
+    reconciled: results.filter(r => r.action !== "none").length,
+    sessions:   results,
+  };
+}
+
+// ============================================================================
+// Exports
+// ============================================================================
+
+module.exports = {
+  defaultPidIsAlive,
+  isChatGptCloakSession,
+  resolveConversationId,
+  inspectConversation,
+  reconcileSessions,
+  MAX_RUNNING_AGE_MS,
+};

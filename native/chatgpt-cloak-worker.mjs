@@ -691,6 +691,14 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     const sendBtn = page.locator('button[data-testid="send-button"]').first();
     await sendBtn.click({ timeout: 10_000 });
 
+    // Emit conversationId if already known (continuation), and baseline
+    if (conversationId) {
+      emit({ type: 'meta_update', conversationId, source: 'request', t: Date.now() });
+    }
+    if (baselineTurnId) {
+      emit({ type: 'meta_update', baselineAssistantMessageId: baselineTurnId, source: 'baseline', t: Date.now() });
+    }
+
     // ── Phase 6: Wait for response (hybrid stream + DOM) ────────────
     progress(6, 6, 'Waiting for response');
 
@@ -746,6 +754,17 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
         sawActivity = true;
       }
       if (!sawActivity) continue;
+
+      // Detect conversationId from URL for new conversations (URL becomes /c/{id} once activity starts)
+      if (!conversationId) {
+        try {
+          const urlMatch = page.url().match(/\/c\/([0-9a-f-]{36})/i);
+          if (urlMatch) {
+            conversationId = urlMatch[1];
+            emit({ type: 'meta_update', conversationId, source: 'url', t: Date.now() });
+          }
+        } catch {}
+      }
 
       // 5b. Live thinking trace — emit DOM thinking text as deltas
       const isThinkingPhase = isStreaming && phaseResult && phaseResult.isThinking;
