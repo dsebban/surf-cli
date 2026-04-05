@@ -9,3 +9,6 @@ dist/
 coverage/
 .playwright-mcp/
 FEATURE_COMPARISON.md
+
+# Surf exports (rp-oracle pipeline)
+.surf/

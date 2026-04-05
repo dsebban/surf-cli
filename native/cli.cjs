@@ -23,6 +23,36 @@ const SURF_TMP = IS_WIN ? path.join(os.tmpdir(), "surf") : "/tmp";
 const SOCKET_PATH = IS_WIN ? "//./pipe/surf" : "/tmp/surf.sock";
 if (IS_WIN) { try { fs.mkdirSync(SURF_TMP, { recursive: true }); } catch {} }
 
+/**
+ * Read a prompt file and return its content. Exits on error/empty.
+ * Logs file size to stderr.
+ * @param {string} rawPath - the --prompt-file argument value
+ * @returns {string} prompt content
+ */
+function loadPromptFile(rawPath) {
+  const resolved = path.resolve(rawPath);
+  let content;
+  try {
+    content = fs.readFileSync(resolved, "utf-8");
+  } catch (e) {
+    console.error(`Error: Failed to read prompt file: ${e.message}`);
+    process.exit(1);
+  }
+  if (!content.trim()) {
+    console.error(`Error: prompt file is empty: ${resolved}`);
+    process.exit(1);
+  }
+  const sizeKB = (Buffer.byteLength(content, "utf-8") / 1024).toFixed(1);
+  const lines = content.split("\n").length;
+  const estTokens = Math.ceil(content.length / 4);
+  const tokenKStr = (estTokens / 1000).toFixed(1) + "K";
+  console.error(`[prompt-file] Read ${sizeKB}KB (${lines} lines, ~${tokenKStr} tokens) from ${resolved}`);
+  if (estTokens > 120_000) {
+    console.error(`[prompt-file] ⚠ ~${tokenKStr} tokens — approaching GPT Pro 150K limit`);
+  }
+  return content;
+}
+
 // ============================================================================
 // Workflow Resolution and Management
 // ============================================================================
@@ -2960,20 +2990,8 @@ if (tool === "chatgpt") {
   }
   // --prompt-file: read file content as the prompt (for large exported prompts)
   if (toolArgs["prompt-file"] && typeof toolArgs["prompt-file"] === "string") {
-    const promptFilePath = path.resolve(toolArgs["prompt-file"]);
-    try {
-      const promptContent = fs.readFileSync(promptFilePath, "utf-8");
-      if (!promptContent.trim()) {
-        console.error(`Error: prompt file is empty: ${promptFilePath}`);
-        process.exit(1);
-      }
-      // Use file content as the query, overriding any positional prompt
-      toolArgs.query = promptContent;
-      delete toolArgs["prompt-file"];
-    } catch (e) {
-      console.error(`Error: Failed to read prompt file: ${e.message}`);
-      process.exit(1);
-    }
+    toolArgs.query = loadPromptFile(toolArgs["prompt-file"]);
+    delete toolArgs["prompt-file"];
   }
 }
 
@@ -3352,6 +3370,8 @@ const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
 
     const durationMs = result.tookMs || (Date.now() - startMs);
     if (sessionTool === "chatgpt.reply") chatgptChatsCache.invalidateCachedChats();
+    // Also invalidate after a new chatgpt query — a new conversation was created
+    if (sessionTool === "chatgpt" && result.conversationId) chatgptChatsCache.invalidateCachedChats();
     sess.finish({
       model: result.model || sessionTool,
       tookMs: durationMs,
@@ -3631,15 +3651,9 @@ if (tool === "chatgpt.reply") {
   const conversationId = typeof toolArgs.conversationId === "string" ? toolArgs.conversationId.trim() : "";
   // --prompt-file overrides positional prompt for chatgpt.reply too
   if (toolArgs["prompt-file"] && typeof toolArgs["prompt-file"] === "string") {
-    const pfPath = path.resolve(toolArgs["prompt-file"]);
-    try {
-      toolArgs.prompt = fs.readFileSync(pfPath, "utf-8");
-      toolArgs.query = toolArgs.prompt;
-      delete toolArgs["prompt-file"];
-    } catch (e) {
-      console.error(`Error: Failed to read prompt file: ${e.message}`);
-      process.exit(1);
-    }
+    toolArgs.prompt = loadPromptFile(toolArgs["prompt-file"]);
+    toolArgs.query = toolArgs.prompt;
+    delete toolArgs["prompt-file"];
   }
   const prompt = typeof toolArgs.prompt === "string" ? toolArgs.prompt.trim() : "";
   if (!conversationId || !prompt) {

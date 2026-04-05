@@ -207,6 +207,15 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
 async function queryWithCloakBrowser(opts, onProgress = () => {}) {
   const { model, file, profile, timeout = 120, conversationId } = opts;
   const prompt = opts.prompt || opts.query || "";
+  const promptKB = (Buffer.byteLength(prompt, "utf-8") / 1024).toFixed(1);
+  const estimatedTokens = Math.ceil(prompt.length / 4);
+  const tokenKStr = (estimatedTokens / 1000).toFixed(1) + "K";
+  if (Number(promptKB) > 10) {
+    console.error(`[cloak-bridge] Prompt: ${promptKB}KB (${prompt.split("\n").length} lines, ~${tokenKStr} tokens)`);
+  }
+  if (estimatedTokens > 120_000) {
+    console.error(`[cloak-bridge] ⚠ Prompt ~${tokenKStr} tokens — approaching GPT Pro 150K limit`);
+  }
   const generateImage = opts["generate-image"] || opts.generateImage || null;
 
   return runCloakWorker({

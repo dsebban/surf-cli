@@ -8,7 +8,7 @@ description: Control Chrome browser via CLI for testing, automation, debugging, 
 Real Chrome-family browser control via CLI / native host / extension.
 Prefer real browser state over guessed APIs.
 
-Repo + local CLI verified against **surf-cli v2.10.0**.
+Repo + local CLI verified against **surf-cli v2.11.1**.
 
 ## Use when
 

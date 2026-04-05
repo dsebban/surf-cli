@@ -237,11 +237,43 @@ const DETECT_PHASE_JS = `(() => {
   if (!stop) return { phase: '', isThinking: false, thinkingText: '' };
   ${FIND_LAST_ASSISTANT_JS}
   if (!lastAssistant) return { phase: 'Connecting', isThinking: true, thinkingText: '' };
+
+  // Check for thinking indicators (Pro model uses details/summary for thinking bubble)
+  // The thinking element can coexist with .markdown — check it FIRST
+  var thinkingEl = lastAssistant.querySelector('details') || lastAssistant.querySelector('[class*="think"]');
+  var isThinking = false;
+  var thinkingText = '';
+  if (thinkingEl) {
+    // Check if the thinking bubble is still "open" / actively being streamed
+    var summary = thinkingEl.querySelector('summary');
+    var summaryText = summary ? (summary.textContent || '').trim() : '';
+    // "Thinking" (active) vs "Thought for Ns" (completed)
+    var isActiveThinking = summaryText === 'Thinking' || summaryText.startsWith('Thinking');
+    if (isActiveThinking) {
+      isThinking = true;
+      // Get the thinking content (everything except the summary)
+      var thinkClone = thinkingEl.cloneNode(true);
+      var sumEl = thinkClone.querySelector('summary');
+      if (sumEl) sumEl.remove();
+      thinkingText = (thinkClone.textContent || '').trim();
+    }
+  }
+
   var md = lastAssistant.querySelector('.markdown');
-  if (md && (md.innerText || '').trim()) return { phase: 'Responding', isThinking: false, thinkingText: '' };
-  var clone = lastAssistant.cloneNode(true);
-  clone.querySelectorAll('.sr-only, .markdown, button, nav, form, script, style').forEach(function(el) { el.remove(); });
-  var raw = (clone.textContent || '').trim();
+  var hasResponse = md && (md.innerText || '').trim();
+
+  if (hasResponse && !isThinking) return { phase: 'Responding', isThinking: false, thinkingText: '' };
+
+  // If actively thinking (with or without response started)
+  if (isThinking) {
+    var label = thinkingText ? thinkingText.split('\\n')[0].trim().slice(0, 80) || 'Thinking' : 'Thinking';
+    return { phase: label, isThinking: true, thinkingText: thinkingText };
+  }
+
+  // Fallback: raw assistant-turn text. Avoid clone-pruning here; current ChatGPT Pro
+  // thinking previews can live under generic text containers and disappear if we over-prune.
+  var raw = (lastAssistant.textContent || '').trim();
+  raw = raw.replace(/^(ChatGPT said:|Assistant said:)/i, '').trim();
   var label = raw.split('\\n')[0].trim().slice(0, 80) || 'Thinking';
   var body = raw;
   var timerMatch = raw.match(/^(Thought|Thinking)\\s+(for\\s+)?\\d+\\s*s(econds?)?\\n?/);
@@ -677,9 +709,63 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       finalPrompt = `Generate an image: ${prompt}`;
     }
 
-    // type() is humanized by CloakBrowser (per-char timing, natural rhythm)
-    // fill() bypasses event handlers but is faster
-    await textarea.type(finalPrompt);
+    // Token estimation: ~4 chars/token for English text
+    const promptBytes = Buffer.byteLength(finalPrompt, 'utf-8');
+    const promptKB = (promptBytes / 1024).toFixed(1);
+    const promptLines = finalPrompt.split('\n').length;
+    const estimatedTokens = Math.ceil(finalPrompt.length / 4);
+    const tokenKStr = (estimatedTokens / 1000).toFixed(1) + 'K';
+    log('info', `Prompt: ${promptKB}KB, ${promptLines} lines, ~${tokenKStr} tokens`);
+    if (estimatedTokens > 120_000) {
+      log('warn', `⚠ Prompt ~${tokenKStr} tokens — approaching GPT Pro 150K limit`);
+    }
+
+    // For large prompts (>1KB), use Playwright fill() for instant injection.
+    // Small prompts use type() for natural human-like input.
+    // NOTE: ClipboardEvent('paste') creates a "Pasted text.txt" file attachment
+    // in ChatGPT instead of inline text — never use it.
+    const LARGE_PROMPT_THRESHOLD = 1024; // 1KB
+    if (promptBytes > LARGE_PROMPT_THRESHOLD) {
+      log('info', `Large prompt — using execCommand insertText (instant injection)`);
+      // Use execCommand('insertText') which properly triggers React's input handlers
+      // on contenteditable divs. fill() and ClipboardEvent both fail:
+      // - fill() bypasses React synthetic events → send button stays disabled
+      // - ClipboardEvent creates "Pasted text.txt" file attachment
+      await page.evaluate((text) => {
+        const el = document.querySelector('#prompt-textarea');
+        if (el) {
+          el.focus();
+          // Clear existing content first
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          // Insert text — this fires input/change events that React handles
+          document.execCommand('insertText', false, text);
+        }
+      }, finalPrompt);
+      await sleep(1000);
+      // Verify content was inserted
+      const filledLen = await page.evaluate(() => {
+        const el = document.querySelector('#prompt-textarea');
+        return el ? el.textContent.length : 0;
+      });
+      if (filledLen < 10) {
+        log('warn', `insertText may have failed (${filledLen} chars) — falling back to fill() + input event`);
+        await textarea.fill(finalPrompt);
+        // Dispatch input event to wake up React
+        await page.evaluate(() => {
+          const el = document.querySelector('#prompt-textarea');
+          if (el) {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+        await sleep(500);
+      }
+      log('info', `Prompt entered: ${filledLen} chars in textarea`);
+    } else {
+      log('info', `Small prompt — using humanized typing`);
+      await textarea.type(finalPrompt);
+    }
     await sleep(300);
 
     // Capture baseline before send (detect stale assistant turns)
@@ -689,9 +775,31 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     const baselineMessageId = baseline.messageId || null; // For reconcile API comparison
     log('info', 'Baseline captured', { turnId: baselineTurnId, messageId: baselineMessageId });
 
-    // Send
-    const sendBtn = page.locator('button[data-testid="send-button"]').first();
-    await sendBtn.click({ timeout: 10_000 });
+    // Send — try multiple selectors with retry for send button
+    // ChatGPT may use different button selectors across versions
+    const sendSelectors = [
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label="Send"]',
+      'form button[type="button"]:not([disabled])',
+    ];
+    let sendClicked = false;
+    for (const sel of sendSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        await btn.click({ timeout: 5_000 });
+        sendClicked = true;
+        log('info', `Send button clicked: ${sel}`);
+        break;
+      } catch {
+        log('info', `Send selector miss: ${sel}`);
+      }
+    }
+    if (!sendClicked) {
+      // Last resort: press Enter in the textarea
+      log('warn', 'No send button found — pressing Enter');
+      await textarea.press('Enter');
+    }
 
     // Emit conversationId if already known (continuation), and baseline
     if (conversationId) {
@@ -752,7 +860,8 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       const isNewTurn = dom.turnId && dom.turnId !== baselineTurnId;
       if (isNewTurn) responseTurnId = dom.turnId;
       const hasStreamContent = stream.text && stream.text.length > 0;
-      if (hasStreamContent || isNewTurn) {
+      const hasThinkingActivity = !!(phaseResult && phaseResult.isThinking);
+      if (hasStreamContent || isNewTurn || hasThinkingActivity) {
         sawActivity = true;
       }
       if (!sawActivity) continue;
@@ -769,7 +878,8 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       }
 
       // 5b. Live thinking trace — emit DOM thinking text as deltas
-      const isThinkingPhase = isStreaming && phaseResult && phaseResult.isThinking;
+      const isThinkingPhase = !!(phaseResult && phaseResult.isThinking);
+
       if (isThinkingPhase) {
         // DOM-based delta emission (timer line already stripped in DETECT_PHASE_JS)
         const fullText = (phaseResult.thinkingText || '').trim();
