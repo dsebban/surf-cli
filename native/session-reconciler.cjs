@@ -230,14 +230,14 @@ async function reconcileSessions(opts = {}) {
               nodeId:        inspection.nodeId,
             },
           });
-          results.push({ meta, action: "recovered", conversationId });
+          results.push({ meta, action: "recovered", reason: "conversation_completed", conversationId });
           recovered = true;
 
         } else if (inspection.outcome === "in_progress") {
           // Still generating on ChatGPT side — leave running but annotate
           reconcile.state = "unresolved";
           updateSession(meta.id, { reconcile });
-          results.push({ meta, action: "unresolved", conversationId });
+          results.push({ meta, action: "unresolved", reason: "conversation_in_progress", conversationId });
           recovered = true; // don't mark error
 
         } else {
@@ -269,7 +269,7 @@ async function reconcileSessions(opts = {}) {
           code:    "session_orphaned",
         },
       });
-      results.push({ meta, action: "orphaned" });
+      results.push({ meta, action: "orphaned", reason: pollNetwork ? "network_poll_failed_or_no_convo" : "pid_dead" });
     }
   }
 

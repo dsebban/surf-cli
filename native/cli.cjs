@@ -1955,7 +1955,13 @@ if (args[0] === "session" || args[0] === "sessions") {
   }
 
   // surf session <id>  — view a single session log
-  const idArg = sessionArgs.find(a => !a.startsWith("-"));
+  // Skip values that follow --hours / --limit (they're numeric args, not session IDs)
+  const flagsWithValues = new Set(["--hours", "--limit"]);
+  const idArg = sessionArgs.find((a, i) => {
+    if (a.startsWith("-")) return false;
+    if (i > 0 && flagsWithValues.has(sessionArgs[i - 1])) return false;
+    return true;
+  });
   if (idArg) {
     const found = sessionStore.loadSession(idArg);
     if (!found) {

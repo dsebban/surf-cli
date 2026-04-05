@@ -136,6 +136,12 @@ test_output "session list shows stale not orphaned" \
   "SURF_SESSIONS_DIR=$tmp_sessions node cli.cjs session --all" \
   "stale"
 rm -rf "$tmp_sessions"
+# --hours N should not be parsed as a session ID
+tmp_sessions=$(mktemp -d)
+test_output "session --hours arg not treated as ID" \
+  "SURF_SESSIONS_DIR=$tmp_sessions node cli.cjs session --hours 1" \
+  "No sessions found"
+rm -rf "$tmp_sessions"
 
 echo ""
 echo "-- List Command --"
