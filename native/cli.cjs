@@ -364,6 +364,7 @@ const TOOLS = {
           { cmd: 'chatgpt "explain this code"', desc: "Basic query" },
           { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
           { cmd: 'chatgpt "review" --file code.ts', desc: "With file (headless)" },
+          { cmd: 'chatgpt --prompt-file prompt.md --model gpt-5.4-pro', desc: "Prompt from file (large context)" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
           { cmd: 'chatgpt "robot surfing" --generate-image /tmp/robot.png', desc: "Generate image (headless)" },
           { cmd: 'chatgpt "hello" --profile me@gmail.com', desc: "Use Chrome profile (headless)" },
@@ -2957,6 +2958,23 @@ if (tool === "chatgpt") {
   if (toolArgs.file && typeof toolArgs.file === "string") {
     toolArgs.file = path.resolve(toolArgs.file);
   }
+  // --prompt-file: read file content as the prompt (for large exported prompts)
+  if (toolArgs["prompt-file"] && typeof toolArgs["prompt-file"] === "string") {
+    const promptFilePath = path.resolve(toolArgs["prompt-file"]);
+    try {
+      const promptContent = fs.readFileSync(promptFilePath, "utf-8");
+      if (!promptContent.trim()) {
+        console.error(`Error: prompt file is empty: ${promptFilePath}`);
+        process.exit(1);
+      }
+      // Use file content as the query, overriding any positional prompt
+      toolArgs.query = promptContent;
+      delete toolArgs["prompt-file"];
+    } catch (e) {
+      console.error(`Error: Failed to read prompt file: ${e.message}`);
+      process.exit(1);
+    }
+  }
 }
 
 if (tool === "chatgpt.chats" && typeof toolArgs.export === "string") {
@@ -3611,6 +3629,18 @@ if (tool === "chatgpt.chats") {
 
 if (tool === "chatgpt.reply") {
   const conversationId = typeof toolArgs.conversationId === "string" ? toolArgs.conversationId.trim() : "";
+  // --prompt-file overrides positional prompt for chatgpt.reply too
+  if (toolArgs["prompt-file"] && typeof toolArgs["prompt-file"] === "string") {
+    const pfPath = path.resolve(toolArgs["prompt-file"]);
+    try {
+      toolArgs.prompt = fs.readFileSync(pfPath, "utf-8");
+      toolArgs.query = toolArgs.prompt;
+      delete toolArgs["prompt-file"];
+    } catch (e) {
+      console.error(`Error: Failed to read prompt file: ${e.message}`);
+      process.exit(1);
+    }
+  }
   const prompt = typeof toolArgs.prompt === "string" ? toolArgs.prompt.trim() : "";
   if (!conversationId || !prompt) {
     console.error("Error: Usage: surf chatgpt.reply <conversation-id> \"prompt\"");

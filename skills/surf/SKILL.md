@@ -76,9 +76,12 @@ Use `--profile dsebban883@gmail.com` for reliable auth and for file / image / ch
 ```bash
 SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "explain this code" --profile dsebban883@gmail.com
 SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "review this PR" --file diff.patch --profile dsebban883@gmail.com
+SURF_USE_CLOAK_CHATGPT=1 surf chatgpt --prompt-file prompt.md --model gpt-5.4-pro --profile dsebban883@gmail.com
 SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
 SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "deep analysis" --model gpt-5.4-pro --profile dsebban883@gmail.com
 ```
+
+**`--prompt-file`** reads a file as the prompt text (for large exported contexts). Unlike `--file` which uploads as an attachment.
 
 ### ChatGPT model aliases
 

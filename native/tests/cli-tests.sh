@@ -144,6 +144,19 @@ test_output "session --hours arg not treated as ID" \
 rm -rf "$tmp_sessions"
 
 echo ""
+echo "-- Prompt File --"
+# --prompt-file with missing file should error
+test_output "prompt-file missing file" \
+  "node cli.cjs chatgpt --prompt-file /tmp/nonexistent_prompt_$$.md 2>&1 || true" \
+  "Failed to read prompt file"
+# --prompt-file with empty file should error
+empty_prompt=$(mktemp)
+test_output "prompt-file empty" \
+  "node cli.cjs chatgpt --prompt-file $empty_prompt 2>&1 || true" \
+  "prompt file is empty"
+rm -f "$empty_prompt"
+
+echo ""
 echo "-- List Command --"
 test_output "list shows new commands" "node cli.cjs --list" "back"
 test_output "list shows zoom" "node cli.cjs --list" "zoom"
