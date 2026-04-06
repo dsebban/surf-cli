@@ -3332,13 +3332,20 @@ const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
 
   const startMs = Date.now();
   let lastProgress = "";
+  let sawSentCheckpoint = false;
   try {
     const result = await withOptionalHeadedCloak(queryArgs.continueInBrowser === true, () => queryWithCloakBrowser(queryArgs, (progress) => {
       if (progress.type === "meta_update") {
         const patch = {};
         if (progress.conversationId)             patch.conversationId             = progress.conversationId;
         if (progress.baselineAssistantMessageId) patch.baselineAssistantMessageId = progress.baselineAssistantMessageId;
+        if (progress.lastCheckpoint)             patch.lastCheckpoint             = progress.lastCheckpoint;
+        if (progress.sentAt)                     patch.sentAt                     = progress.sentAt;
         if (Object.keys(patch).length > 0)       sess.update(patch);
+        if (!sawSentCheckpoint && progress.lastCheckpoint === "sent") {
+          sawSentCheckpoint = true;
+          sess.step(`[session] checkpoint: sent (${progress.source || "?"}) conv:${progress.conversationId || "?"} baseline:${progress.baselineAssistantMessageId || "?"}`);
+        }
         return;
       }
       if (progress.type === "trace") {

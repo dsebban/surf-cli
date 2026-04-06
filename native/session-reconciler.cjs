@@ -59,6 +59,22 @@ function resolveConversationId(meta) {
   );
 }
 
+function hasSentCheckpoint(meta) {
+  const hasCheckpointFields =
+    meta &&
+    (Object.prototype.hasOwnProperty.call(meta, "lastCheckpoint") ||
+      Object.prototype.hasOwnProperty.call(meta, "sentAt"));
+
+  if (!hasCheckpointFields) {
+    return true;
+  }
+
+  return (
+    meta.lastCheckpoint === "sent" ||
+    (typeof meta.sentAt === "string" && meta.sentAt.trim() !== "")
+  );
+}
+
 // ============================================================================
 // inspectConversation
 // ============================================================================
@@ -134,6 +150,11 @@ function inspectConversation(conversation, meta = {}) {
  * @param {number}  [opts.limit=200]       Pass through to listSessions.
  * @param {boolean} [opts.pollNetwork]     Enable network polling.
  * @param {Function}[opts.manageChats]     manageChatsWithCloakBrowser function ref.
+ *
+ * Network polling gate:
+ *   - New sessions poll only after the worker persisted a sent checkpoint.
+ *   - Legacy sessions (pre-checkpoint metadata) still poll when conversationId exists.
+ *
  * @returns {{ reconciled: number, sessions: Array }}
  */
 async function reconcileSessions(opts = {}) {
@@ -193,7 +214,7 @@ async function reconcileSessions(opts = {}) {
     let   recovered      = false;
 
     // ── Optional network poll ──────────────────────────────────────────────
-    if (pollNetwork && conversationId && typeof manageChats === "function") {
+    if (pollNetwork && hasSentCheckpoint(meta) && conversationId && typeof manageChats === "function") {
       try {
         const chatResult = await manageChats({
           action:         "get",

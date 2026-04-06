@@ -297,7 +297,7 @@ describe("reconcileSessions", () => {
     expect(meta.reconcile.pidAlive).toBe(true);
   });
 
-  it("recovers session via network poll when conversation completed", async () => {
+  it("recovers dead session with sent checkpoint + conversationId", async () => {
     const r = loadReconciler();
     writeSessionMeta(tmpDir, {
       id: "chatgpt-recoverable",
@@ -307,6 +307,8 @@ describe("reconcileSessions", () => {
       pid: 999999999,
       conversationId: "conv-abc123",
       baselineAssistantMessageId: null,
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:00:00.000Z",
     });
 
     const completedConv = {
@@ -342,6 +344,79 @@ describe("reconcileSessions", () => {
     );
   });
 
+  it("recovers legacy dead session with conversationId but no checkpoint metadata", async () => {
+    const r = loadReconciler();
+    writeSessionMeta(tmpDir, {
+      id: "chatgpt-legacy-recoverable",
+      tool: "chatgpt",
+      status: "running",
+      createdAt: new Date(Date.now() - 10_000).toISOString(),
+      pid: 999999999,
+      conversationId: "conv-legacy",
+      baselineAssistantMessageId: null,
+    });
+
+    const completedConv = {
+      current_node: "legacy-node",
+      mapping: {
+        "legacy-node": {
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+          },
+        },
+      },
+    };
+
+    const mockManageChats = vi.fn().mockResolvedValue({ conversation: completedConv });
+
+    const { reconciled, sessions } = await r.reconcileSessions({
+      all: true,
+      pollNetwork: true,
+      manageChats: mockManageChats,
+    });
+
+    expect(reconciled).toBe(1);
+    expect(sessions[0].action).toBe("recovered");
+    expect(mockManageChats).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "get", conversationId: "conv-legacy" }),
+    );
+
+    const meta = readSessionMeta(tmpDir, "chatgpt-legacy-recoverable") as any;
+    expect(meta.status).toBe("completed");
+    expect(meta.reconcile.state).toBe("recovered");
+  });
+
+  it("marks orphaned when dead session has conversationId but no sent checkpoint", async () => {
+    const r = loadReconciler();
+    writeSessionMeta(tmpDir, {
+      id: "chatgpt-nosent",
+      tool: "chatgpt",
+      status: "running",
+      createdAt: new Date(Date.now() - 5_000).toISOString(),
+      pid: 999999999,
+      conversationId: "conv-nosent",
+      baselineAssistantMessageId: null,
+      lastCheckpoint: "created",
+      sentAt: null,
+    });
+
+    const mockManageChats = vi.fn();
+
+    const { sessions } = await r.reconcileSessions({
+      all: true,
+      pollNetwork: true,
+      manageChats: mockManageChats,
+    });
+
+    expect(sessions[0].action).toBe("orphaned");
+    expect(mockManageChats).not.toHaveBeenCalled();
+
+    const meta = readSessionMeta(tmpDir, "chatgpt-nosent") as any;
+    expect(meta.status).toBe("error");
+    expect(meta.error.code).toBe("session_orphaned");
+  });
+
   it("marks unresolved when conversation still in_progress", async () => {
     const r = loadReconciler();
     writeSessionMeta(tmpDir, {
@@ -351,6 +426,8 @@ describe("reconcileSessions", () => {
       createdAt: new Date(Date.now() - 5_000).toISOString(),
       pid: 999999999,
       conversationId: "conv-inprog",
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:01:00.000Z",
     });
 
     const inProgressConv = {
@@ -383,6 +460,8 @@ describe("reconcileSessions", () => {
       createdAt: new Date(Date.now() - 5_000).toISOString(),
       pid: 999999999,
       conversationId: "conv-pollfail",
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:02:00.000Z",
     });
 
     const mockManageChats = vi.fn().mockRejectedValue(new Error("login_required"));
@@ -400,7 +479,7 @@ describe("reconcileSessions", () => {
     expect(meta.reconcile.remote.error).toBe("login_required");
   });
 
-  it("skips network poll when no conversationId", async () => {
+  it("marks orphaned when dead session has sent checkpoint but no conversationId", async () => {
     const r = loadReconciler();
     writeSessionMeta(tmpDir, {
       id: "chatgpt-noconv",
@@ -409,6 +488,8 @@ describe("reconcileSessions", () => {
       createdAt: new Date(Date.now() - 5_000).toISOString(),
       pid: 999999999,
       conversationId: null,
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:03:00.000Z",
     });
 
     const mockManageChats = vi.fn();

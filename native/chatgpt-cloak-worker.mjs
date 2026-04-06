@@ -15,9 +15,13 @@
 
 import { launchPersistentContext } from 'cloakbrowser';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { createRequire } from 'module';
 import { homedir, tmpdir } from 'os';
 import { join, resolve as pathResolve } from 'path';
 import { loadAndInjectChatgptCookies } from './chatgpt-cloak-profile-auth.mjs';
+
+const require = createRequire(import.meta.url);
+const { enterPromptWithVerification } = require('./chatgpt-cloak-prompt-entry.cjs');
 
 // ============================================================================
 // Logging helpers — everything goes to stdout as JSON lines
@@ -163,6 +167,12 @@ async function waitForConversationReady(page, conversationId, timeoutMs = 30_000
   return { ready: false, loggedIn: true, currentUrl: page.url() };
 }
 
+function extractConversationIdFromUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  const match = url.match(/\/c\/([^/?#]+)/i);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 // ============================================================================
 // Shared selectors — unified assistant-turn detection (mirrors bun worker)
 
@@ -174,6 +184,14 @@ const CONVERSATION_TURN_SELECTOR =
 
 const STOP_BUTTON_SELECTOR =
   'button[data-testid="stop-button"], button[aria-label="Stop"]';
+
+// Keep this list strict. Generic form buttons can match attach/model controls,
+// causing false-ready verification or clicking the wrong action.
+const SEND_BUTTON_SELECTORS = [
+  'button[data-testid="send-button"]',
+  'button[aria-label="Send prompt"]',
+  'button[aria-label="Send"]',
+];
 
 const FINISHED_ACTION_SELECTOR =
   'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"]';
@@ -720,52 +738,16 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       log('warn', `⚠ Prompt ~${tokenKStr} tokens — approaching GPT Pro 150K limit`);
     }
 
-    // For large prompts (>1KB), use Playwright fill() for instant injection.
-    // Small prompts use type() for natural human-like input.
-    // NOTE: ClipboardEvent('paste') creates a "Pasted text.txt" file attachment
-    // in ChatGPT instead of inline text — never use it.
-    const LARGE_PROMPT_THRESHOLD = 1024; // 1KB
-    if (promptBytes > LARGE_PROMPT_THRESHOLD) {
-      log('info', `Large prompt — using execCommand insertText (instant injection)`);
-      // Use execCommand('insertText') which properly triggers React's input handlers
-      // on contenteditable divs. fill() and ClipboardEvent both fail:
-      // - fill() bypasses React synthetic events → send button stays disabled
-      // - ClipboardEvent creates "Pasted text.txt" file attachment
-      await page.evaluate((text) => {
-        const el = document.querySelector('#prompt-textarea');
-        if (el) {
-          el.focus();
-          // Clear existing content first
-          document.execCommand('selectAll', false, null);
-          document.execCommand('delete', false, null);
-          // Insert text — this fires input/change events that React handles
-          document.execCommand('insertText', false, text);
-        }
-      }, finalPrompt);
-      await sleep(1000);
-      // Verify content was inserted
-      const filledLen = await page.evaluate(() => {
-        const el = document.querySelector('#prompt-textarea');
-        return el ? el.textContent.length : 0;
-      });
-      if (filledLen < 10) {
-        log('warn', `insertText may have failed (${filledLen} chars) — falling back to fill() + input event`);
-        await textarea.fill(finalPrompt);
-        // Dispatch input event to wake up React
-        await page.evaluate(() => {
-          const el = document.querySelector('#prompt-textarea');
-          if (el) {
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        });
-        await sleep(500);
-      }
-      log('info', `Prompt entered: ${filledLen} chars in textarea`);
-    } else {
-      log('info', `Small prompt — using humanized typing`);
-      await textarea.type(finalPrompt);
-    }
+    const promptEntry = await enterPromptWithVerification({
+      page,
+      textarea,
+      prompt: finalPrompt,
+      log,
+      sleep,
+      promptSelector: '#prompt-textarea',
+      sendButtonSelectors: SEND_BUTTON_SELECTORS,
+    });
+    log('info', 'Prompt entry metrics', promptEntry);
     await sleep(300);
 
     // Capture baseline before send (detect stale assistant turns)
@@ -777,14 +759,8 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
 
     // Send — try multiple selectors with retry for send button
     // ChatGPT may use different button selectors across versions
-    const sendSelectors = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="Send prompt"]',
-      'button[aria-label="Send"]',
-      'form button[type="button"]:not([disabled])',
-    ];
     let sendClicked = false;
-    for (const sel of sendSelectors) {
+    for (const sel of SEND_BUTTON_SELECTORS) {
       try {
         const btn = page.locator(sel).first();
         await btn.click({ timeout: 5_000 });
@@ -801,13 +777,18 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       await textarea.press('Enter');
     }
 
-    // Emit conversationId if already known (continuation), and baseline
-    if (conversationId) {
-      emit({ type: 'meta_update', conversationId, source: 'request', t: Date.now() });
-    }
-    if (baselineMessageId) {
-      emit({ type: 'meta_update', baselineAssistantMessageId: baselineMessageId, source: 'baseline', t: Date.now() });
-    }
+    const sentAt = new Date().toISOString();
+    const prePhase6ConversationId = conversationId || extractConversationIdFromUrl(page.url());
+    if (prePhase6ConversationId) conversationId = prePhase6ConversationId;
+    emit({
+      type: 'meta_update',
+      source: 'pre_phase_6',
+      lastCheckpoint: 'sent',
+      sentAt,
+      conversationId: conversationId || null,
+      baselineAssistantMessageId: baselineMessageId || null,
+      t: Date.now(),
+    });
 
     // ── Phase 6: Wait for response (hybrid stream + DOM) ────────────
     progress(6, 6, 'Waiting for response');
@@ -869,9 +850,9 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       // Detect conversationId from URL for new conversations (URL becomes /c/{id} once activity starts)
       if (!conversationId) {
         try {
-          const urlMatch = page.url().match(/\/c\/([0-9a-f-]{36})/i);
-          if (urlMatch) {
-            conversationId = urlMatch[1];
+          const detectedConversationId = extractConversationIdFromUrl(page.url());
+          if (detectedConversationId) {
+            conversationId = detectedConversationId;
             emit({ type: 'meta_update', conversationId, source: 'url', t: Date.now() });
           }
         } catch {}
@@ -994,7 +975,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
 
   } catch (e) {
     log('error', 'Query failed', { error: e.message, stack: e.stack, code: e.code });
-    fail(e.code || 'query_failed', e.message);
+    fail(e.code || 'query_failed', e.message, e.details);
   } finally {
     await context.close();
     if (tempDir) {
@@ -1038,7 +1019,7 @@ async function main() {
 
   const msg = await queryPromise;
   if (msg) {
-    await runQuery(msg).catch(e => fail('unhandled', e.message));
+    await runQuery(msg).catch(e => fail('unhandled', e.message, e.details));
   } else {
     fail('no_query', 'Stdin closed without receiving a query');
   }
@@ -1047,6 +1028,6 @@ async function main() {
 }
 
 main().catch(e => {
-  fail('fatal', e.message);
+  fail('fatal', e.message, e.details);
   process.exit(1);
 });

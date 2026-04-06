@@ -185,6 +185,8 @@ function createSession(tool, args = {}, env = {}) {
     pid:       process.pid,
     conversationId:             args.conversationId || null,
     baselineAssistantMessageId: null,
+    lastCheckpoint:             "created",
+    sentAt:                     null,
     reconcile:                  null,
   };
 

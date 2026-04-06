@@ -115,6 +115,8 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
                 type:                       "meta_update",
                 conversationId:             msg.conversationId || null,
                 baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
+                lastCheckpoint:             msg.lastCheckpoint || null,
+                sentAt:                     msg.sentAt || null,
                 source:                     msg.source || null,
                 t:                          msg.t || Date.now(),
               });
@@ -170,6 +172,8 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
               type:                       "meta_update",
               conversationId:             msg.conversationId || null,
               baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
+              lastCheckpoint:             msg.lastCheckpoint || null,
+              sentAt:                     msg.sentAt || null,
               source:                     msg.source || null,
               t:                          msg.t || Date.now(),
             });

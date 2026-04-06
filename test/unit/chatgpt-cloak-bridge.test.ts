@@ -233,6 +233,48 @@ describe("chatgpt-cloak-bridge", () => {
     bridge.__resetBridgeRuntimeForTests();
   });
 
+  it("forwards sent checkpoint metadata", async () => {
+    const worker = createWorker();
+    const spawn = vi.fn().mockReturnValue(worker);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+    const progressSpy = vi.fn();
+
+    const promise = bridge.queryWithCloakBrowser({ query: "hello", timeout: 5 }, progressSpy);
+    const sentAt = "2026-04-05T12:34:56.000Z";
+
+    worker.stdout.emit(
+      "data",
+      `${JSON.stringify({
+        type: "meta_update",
+        lastCheckpoint: "sent",
+        sentAt,
+        conversationId: "conv-123",
+        baselineAssistantMessageId: "msg-456",
+        source: "pre_phase_6",
+      })}\n`,
+    );
+    worker.stdout.emit(
+      "data",
+      `${JSON.stringify({ type: "success", response: "done", model: "gpt-5.3", tookMs: 100 })}\n`,
+    );
+
+    await promise;
+
+    expect(progressSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "meta_update",
+        lastCheckpoint: "sent",
+        sentAt,
+        conversationId: "conv-123",
+        baselineAssistantMessageId: "msg-456",
+        source: "pre_phase_6",
+      }),
+    );
+
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
   it("times out workers", async () => {
     vi.useFakeTimers();
     const worker = createWorker();
