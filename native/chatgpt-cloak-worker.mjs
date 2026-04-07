@@ -131,7 +131,7 @@ async function waitForReady(page, timeoutMs = 30_000) {
       const btns = Array.from(document.querySelectorAll('button, a'));
       if (btns.some(b => /^(log in|sign in|sign up)$/i.test((b.textContent || '').trim()))) return 'login';
       return 'loading';
-    }, PROMPT_SELECTORS);
+    }, PROMPT_SELECTORS_CSS);
 
     if (state === 'ready') return { ready: true, loggedIn: true };
     if (state === 'login') return { ready: true, loggedIn: false };
@@ -153,7 +153,7 @@ async function waitForConversationReady(page, conversationId, timeoutMs = 30_000
       const btns = Array.from(document.querySelectorAll('button, a'));
       if (btns.some((b) => /^(log in|sign in|sign up)$/i.test((b.textContent || '').trim()))) return 'login';
       return 'loading';
-    }, PROMPT_SELECTORS);
+    }, PROMPT_SELECTORS_CSS);
 
     if (state === 'login') return { ready: false, loggedIn: false, currentUrl };
     if (currentUrl.includes(expectedPath) && state === 'ready') {
@@ -186,7 +186,14 @@ const STOP_BUTTON_SELECTOR =
   'button[data-testid="stop-button"], button[aria-label="Stop"]';
 
 // Prompt composer selectors — broader than just #prompt-textarea to handle ChatGPT DOM changes
-const PROMPT_SELECTORS = '#prompt-textarea, [data-testid="composer-textarea"], textarea[name="prompt-textarea"], .ProseMirror, [contenteditable="true"][data-virtualkeyboard="true"]';
+const PROMPT_SELECTOR_LIST = [
+  '#prompt-textarea',
+  '[data-testid="composer-textarea"]',
+  'textarea[name="prompt-textarea"]',
+  '.ProseMirror',
+  '[contenteditable="true"][data-virtualkeyboard="true"]',
+];
+const PROMPT_SELECTORS_CSS = PROMPT_SELECTOR_LIST.join(', ');
 
 // Keep this list strict. Generic form buttons can match attach/model controls,
 // causing false-ready verification or clicking the wrong action.
@@ -720,8 +727,22 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       }
     }
 
-    // Prompt entry — use broad selectors
-    const textarea = page.locator(PROMPT_SELECTORS).first();
+    // Prompt entry — try each selector until one matches
+    let textarea = null;
+    for (const sel of PROMPT_SELECTOR_LIST) {
+      const loc = page.locator(sel).first();
+      const count = await loc.count().catch(() => 0);
+      if (count > 0) {
+        textarea = loc;
+        log('info', `Composer found: ${sel}`);
+        break;
+      }
+    }
+    if (!textarea) {
+      // Last resort: use first selector
+      textarea = page.locator(PROMPT_SELECTOR_LIST[0]).first();
+      log('warn', 'No composer selector matched — falling back to #prompt-textarea');
+    }
     await textarea.click({ timeout: 10_000 });
     await sleep(500);
 
@@ -748,7 +769,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       prompt: finalPrompt,
       log,
       sleep,
-      promptSelector: PROMPT_SELECTORS,
+      promptSelector: PROMPT_SELECTORS_CSS,
       sendButtonSelectors: SEND_BUTTON_SELECTORS,
     });
     log('info', 'Prompt entry metrics', promptEntry);
