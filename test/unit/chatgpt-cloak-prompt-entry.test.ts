@@ -111,11 +111,6 @@ function handleEvaluate(
     updateSendEnabled(state, options);
     return true;
   }
-  if (source.includes("navigator.clipboard.writeText")) {
-    // clipboard write — text stored for next keyboard paste
-    (state as any).__clipboardText = typeof arg === "string" ? arg : "";
-    return true;
-  }
   if (source.includes("el.focus") && source.includes("editableSelector")) {
     // focus call from clipboard paste
     return true;
@@ -149,21 +144,13 @@ function createHarness(options: HarnessOptions = {}) {
       return handleEvaluate(source, state, options, arg);
     }),
     keyboard: {
-      press: vi.fn(async (key: string) => {
-        // Simulate Meta+v / Ctrl+v paste — move clipboard text to composer
-        if (key.toLowerCase().includes("v")) {
-          const clipText = (state as any).__clipboardText || "";
-          if (clipText) {
-            state.composerText += clipText;
-            (state as any).__clipboardText = "";
-            updateSendEnabled(state, options);
-          }
-        }
+      press: vi.fn(async () => {}),
+      insertText: vi.fn(async (text: string) => {
+        // Simulate CDP Input.insertText — bulk insert into composer
+        state.composerText += text;
+        updateSendEnabled(state, options);
       }),
     },
-    context: vi.fn(() => ({
-      grantPermissions: vi.fn(async () => {}),
-    })),
   };
 
   return { page, textarea, state };

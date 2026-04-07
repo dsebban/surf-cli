@@ -188,17 +188,11 @@ async function insertViaFillFallback(page, textarea, promptSelector, prompt) {
 }
 
 async function insertViaClipboardPaste(page, promptSelector, prompt) {
-  // Write text to system clipboard, then trigger a real keyboard paste.
-  // This creates a trusted paste event that ProseMirror accepts.
-  // 1. Grant clipboard permissions (Chromium)
-  try {
-    const ctx = page.context();
-    if (typeof ctx.grantPermissions === "function") {
-      await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
-    }
-  } catch {}
+  // Use Playwright's keyboard.insertText() for bulk insertion.
+  // This uses CDP Input.insertText — fires a single 'input' event
+  // that ProseMirror accepts, and is instant regardless of text size.
 
-  // 2. Focus the editor
+  // 1. Focus the editor
   await page.evaluate(({ selector, editableSelector }) => {
     const root = document.querySelector(selector);
     const el = !root
@@ -209,14 +203,8 @@ async function insertViaClipboardPaste(page, promptSelector, prompt) {
     if (el && typeof el.focus === "function") el.focus();
   }, { selector: promptSelector, editableSelector: EDITABLE_SELECTOR });
 
-  // 3. Write text to clipboard
-  await page.evaluate(async (text) => {
-    await navigator.clipboard.writeText(text);
-  }, prompt);
-
-  // 4. Trigger real paste via keyboard shortcut
-  const isMac = process.platform === "darwin";
-  await page.keyboard.press(isMac ? "Meta+v" : "Control+v");
+  // 2. Bulk insert via CDP Input.insertText (single input event, not char-by-char)
+  await page.keyboard.insertText(prompt);
   return true;
 }
 
