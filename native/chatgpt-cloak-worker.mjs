@@ -122,16 +122,16 @@ function buildLaunchOpts(userDataDir) {
 async function waitForReady(page, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const state = await page.evaluate(() => {
+    const state = await page.evaluate((promptSelectors) => {
       // Cloudflare challenge
       if (document.title.toLowerCase().includes('just a moment')) return 'cloudflare';
-      // Editor present = ready
-      if (document.querySelector('#prompt-textarea')) return 'ready';
+      // Editor present = ready (try multiple selectors)
+      if (document.querySelector(promptSelectors)) return 'ready';
       // Login page
       const btns = Array.from(document.querySelectorAll('button, a'));
       if (btns.some(b => /^(log in|sign in|sign up)$/i.test((b.textContent || '').trim()))) return 'login';
       return 'loading';
-    });
+    }, PROMPT_SELECTORS);
 
     if (state === 'ready') return { ready: true, loggedIn: true };
     if (state === 'login') return { ready: true, loggedIn: false };
@@ -148,12 +148,12 @@ async function waitForConversationReady(page, conversationId, timeoutMs = 30_000
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const currentUrl = page.url();
-    const state = await page.evaluate(() => {
-      if (document.querySelector('#prompt-textarea')) return 'ready';
+    const state = await page.evaluate((promptSelectors) => {
+      if (document.querySelector(promptSelectors)) return 'ready';
       const btns = Array.from(document.querySelectorAll('button, a'));
       if (btns.some((b) => /^(log in|sign in|sign up)$/i.test((b.textContent || '').trim()))) return 'login';
       return 'loading';
-    });
+    }, PROMPT_SELECTORS);
 
     if (state === 'login') return { ready: false, loggedIn: false, currentUrl };
     if (currentUrl.includes(expectedPath) && state === 'ready') {
@@ -185,10 +185,14 @@ const CONVERSATION_TURN_SELECTOR =
 const STOP_BUTTON_SELECTOR =
   'button[data-testid="stop-button"], button[aria-label="Stop"]';
 
+// Prompt composer selectors — broader than just #prompt-textarea to handle ChatGPT DOM changes
+const PROMPT_SELECTORS = '#prompt-textarea, [data-testid="composer-textarea"], textarea[name="prompt-textarea"], .ProseMirror, [contenteditable="true"][data-virtualkeyboard="true"]';
+
 // Keep this list strict. Generic form buttons can match attach/model controls,
 // causing false-ready verification or clicking the wrong action.
 const SEND_BUTTON_SELECTORS = [
   'button[data-testid="send-button"]',
+  'button[data-testid*="composer-send"]',
   'button[aria-label="Send prompt"]',
   'button[aria-label="Send"]',
 ];
@@ -716,8 +720,8 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       }
     }
 
-    // Prompt entry
-    const textarea = page.locator('#prompt-textarea').first();
+    // Prompt entry — use broad selectors
+    const textarea = page.locator(PROMPT_SELECTORS).first();
     await textarea.click({ timeout: 10_000 });
     await sleep(500);
 
@@ -744,7 +748,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       prompt: finalPrompt,
       log,
       sleep,
-      promptSelector: '#prompt-textarea',
+      promptSelector: PROMPT_SELECTORS,
       sendButtonSelectors: SEND_BUTTON_SELECTORS,
     });
     log('info', 'Prompt entry metrics', promptEntry);

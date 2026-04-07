@@ -34,7 +34,9 @@ function updateSendEnabled(state: HarnessState, options: HarnessOptions) {
 }
 
 function readState(state: HarnessState, options: HarnessOptions) {
+  state.readCalls += 1;
   updateSendEnabled(state, options);
+  const sendButtonFound = options.sendButtonFound ?? true;
   return {
     actualText: state.composerText,
     actualChars: state.composerText.length,
@@ -43,7 +45,9 @@ function readState(state: HarnessState, options: HarnessOptions) {
       textContent: state.composerText.length,
       innerText: state.composerText.length,
     },
-    sendEnabled: state.sendEnabled,
+    sendEnabled: sendButtonFound ? state.sendEnabled : false,
+    sendButtonFound,
+    sendState: sendButtonFound ? (state.sendEnabled ? "enabled" : "disabled") : "unknown",
   };
 }
 
@@ -214,6 +218,55 @@ describe("chatgpt-cloak-prompt-entry", () => {
     expect(result.method).toBe("fill_fallback");
     expect(result.sendEnabled).toBe(true);
     expect(harness.textarea.fill).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits briefly for delayed send readiness before fallback", async () => {
+    let evalCount = 0;
+    const harness = createHarness({
+      sendEnabledFunc: () => {
+        evalCount++;
+        // Enable send after a few evaluations (simulates React state propagation delay)
+        return evalCount >= 4;
+      },
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: "tiny prompt",
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("type");
+    expect(result.usedFallback).toBe(false);
+    expect(result.sendEnabled).toBe(true);
+    expect(harness.textarea.fill).not.toHaveBeenCalled();
+  });
+
+  it("does not fail when prompt text verifies but send selector is missing", async () => {
+    const harness = createHarness({
+      sendButtonFound: false,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: "selector drift",
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("type");
+    expect(result.usedFallback).toBe(false);
+    expect(result.sendEnabled).toBe(false);
+    expect(result.sendButtonFound).toBe(false);
   });
 
   it("throws with details when fallback still cannot insert full prompt", async () => {

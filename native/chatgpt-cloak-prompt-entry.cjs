@@ -8,7 +8,11 @@ const DEFAULT_THRESHOLDS = {
   allowedDeltaChars: 2,
   chunkDelayMs: 50,
   settleMs: 500,
+  sendReadyTimeoutMs: 1500,
+  sendReadyPollMs: 100,
 };
+
+const EDITABLE_SELECTOR = 'textarea, input, [contenteditable="true"], .ProseMirror';
 
 function normalizeForLengthComparison(text) {
   return String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -49,22 +53,38 @@ function splitUtf8Chunks(text, chunkBytes = DEFAULT_THRESHOLDS.chunkBytes) {
 }
 
 async function readComposerState(page, promptSelector, sendButtonSelectors = []) {
-  return await page.evaluate(({ promptSelector, sendButtonSelectors }) => {
-    const el = document.querySelector(promptSelector);
+  return await page.evaluate(({ promptSelector, sendButtonSelectors, editableSelector }) => {
+    // Resolve editable child if promptSelector points to a wrapper
+    const resolveComposer = (selector) => {
+      const root = document.querySelector(selector);
+      if (!root) return null;
+      if (typeof root.matches === "function" && root.matches(editableSelector)) return root;
+      if (typeof root.querySelector === "function") {
+        const nested = root.querySelector(editableSelector);
+        if (nested) return nested;
+      }
+      return root;
+    };
+
+    const el = resolveComposer(promptSelector);
     const rawValue = el && typeof el.value === "string" ? el.value : "";
+    const rawInnerText = el && typeof el.innerText === "string" ? el.innerText : "";
     const rawTextContent = el ? (el.textContent || "") : "";
-    const rawInnerText = el ? (el.innerText || "") : "";
-    const actualText = rawValue || rawTextContent || rawInnerText || "";
+    const actualText = rawValue || rawInnerText || rawTextContent || "";
 
     let sendEnabled = false;
+    let sendButtonFound = false;
     for (const selector of sendButtonSelectors || []) {
-      const btn = document.querySelector(selector);
-      if (!btn) continue;
-      const disabled = btn.hasAttribute("disabled") || btn.getAttribute("aria-disabled") === "true" || btn.getAttribute("data-disabled") === "true";
-      if (!disabled) {
-        sendEnabled = true;
-        break;
+      const buttons = Array.from(document.querySelectorAll(selector));
+      for (const btn of buttons) {
+        sendButtonFound = true;
+        const disabled = btn.hasAttribute("disabled") || btn.getAttribute("aria-disabled") === "true" || btn.getAttribute("data-disabled") === "true";
+        if (!disabled) {
+          sendEnabled = true;
+          break;
+        }
       }
+      if (sendEnabled) break;
     }
 
     return {
@@ -76,8 +96,10 @@ async function readComposerState(page, promptSelector, sendButtonSelectors = [])
         innerText: rawInnerText.length,
       },
       sendEnabled,
+      sendButtonFound,
+      sendState: sendEnabled ? "enabled" : (sendButtonFound ? "disabled" : "unknown"),
     };
-  }, { promptSelector, sendButtonSelectors });
+  }, { promptSelector, sendButtonSelectors, editableSelector: EDITABLE_SELECTOR });
 }
 
 async function clearComposer(page, promptSelector) {
@@ -178,13 +200,31 @@ function buildMetrics({ method, expectedText, actualState, usedFallback = false,
     deltaChars,
     ratio,
     sendEnabled: !!actualState?.sendEnabled,
+    sendButtonFound: !!actualState?.sendButtonFound,
+    sendState: actualState?.sendState || "unknown",
     rawLengths: actualState?.rawLengths || { value: 0, textContent: 0, innerText: 0 },
     chunkCount,
   };
 }
 
 function isSuccess(metrics, thresholds) {
-  return Math.abs(metrics.deltaChars) <= thresholds.allowedDeltaChars && metrics.ratio >= thresholds.minSuccessRatio && metrics.sendEnabled;
+  const textOk = Math.abs(metrics.deltaChars) <= thresholds.allowedDeltaChars && metrics.ratio >= thresholds.minSuccessRatio;
+  if (!textOk) return false;
+  // If no send button found at all (selector drift), don't block — send phase will try click/Enter fallback
+  if (!metrics.sendButtonFound) return true;
+  return metrics.sendEnabled;
+}
+
+async function waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds, initialState }) {
+  let state = initialState || await readComposerState(page, promptSelector, sendButtonSelectors);
+  if (state.sendEnabled || !state.sendButtonFound || typeof sleep !== "function") return state;
+  const maxPolls = Math.ceil(thresholds.sendReadyTimeoutMs / thresholds.sendReadyPollMs);
+  for (let i = 0; i < maxPolls; i++) {
+    await sleep(thresholds.sendReadyPollMs);
+    state = await readComposerState(page, promptSelector, sendButtonSelectors);
+    if (state.sendEnabled || !state.sendButtonFound) return state;
+  }
+  return state;
 }
 
 function makeInsertionError(code, message, details) {
@@ -221,10 +261,12 @@ async function enterPromptWithVerification({
     await textarea.type(prompt);
     await sleep(merged.settleMs);
     actualState = await readComposerState(page, promptSelector, sendButtonSelectors);
+    actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
   } else if (strategy === "exec") {
     await insertViaExecCommand(page, promptSelector, prompt);
     await sleep(merged.settleMs);
     actualState = await readComposerState(page, promptSelector, sendButtonSelectors);
+    actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
   } else {
     const chunks = splitUtf8Chunks(prompt, merged.chunkBytes);
     chunkCount = chunks.length;
@@ -239,13 +281,14 @@ async function enterPromptWithVerification({
       merged,
     );
     actualState = chunked.state || await readComposerState(page, promptSelector, sendButtonSelectors);
+    actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
     if (chunked.hardMismatch) {
       logf("warn", "Prompt chunked insert fell below success ratio — switching to fallback");
     }
   }
 
   let metrics = buildMetrics({ method: strategy, expectedText: prompt, actualState, usedFallback, chunkCount });
-  logf("info", `Prompt insert verify: ${metrics.method} ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), delta=${metrics.deltaChars}, sendEnabled=${metrics.sendEnabled}`);
+  logf("info", `Prompt insert verify: ${metrics.method} ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), delta=${metrics.deltaChars}, sendEnabled=${metrics.sendEnabled}, sendState=${metrics.sendState}`);
 
   if (!isSuccess(metrics, merged)) {
     logf("warn", `Prompt insert fallback: fill_fallback after ${metrics.method} mismatch`);
@@ -254,19 +297,21 @@ async function enterPromptWithVerification({
     await insertViaFillFallback(page, textarea, promptSelector, prompt);
     await sleep(merged.settleMs);
     actualState = await readComposerState(page, promptSelector, sendButtonSelectors);
+    actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
     metrics = buildMetrics({ method: "fill_fallback", expectedText: prompt, actualState, usedFallback, chunkCount });
-    logf("info", `Prompt insert verify: ${metrics.method} ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), delta=${metrics.deltaChars}, sendEnabled=${metrics.sendEnabled}`);
+    logf("info", `Prompt insert verify: ${metrics.method} ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), delta=${metrics.deltaChars}, sendEnabled=${metrics.sendEnabled}, sendState=${metrics.sendState}`);
   }
 
   if (!isSuccess(metrics, merged)) {
+    const textFailed = Math.abs(metrics.deltaChars) > merged.allowedDeltaChars || metrics.ratio < merged.minSuccessRatio;
     throw makeInsertionError(
-      metrics.sendEnabled ? "prompt_insertion_failed" : "prompt_send_not_ready",
-      `Prompt insertion failed: ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), sendEnabled=${metrics.sendEnabled}`,
+      !textFailed && metrics.sendButtonFound && !metrics.sendEnabled ? "prompt_send_not_ready" : "prompt_insertion_failed",
+      `Prompt insertion failed: ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), sendEnabled=${metrics.sendEnabled}, sendState=${metrics.sendState}`,
       metrics,
     );
   }
 
-  logf("info", `Prompt insert success: ${metrics.method} ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), sendEnabled=${metrics.sendEnabled}`);
+  logf("info", `Prompt insert success: ${metrics.method} ${metrics.actualChars}/${metrics.expectedChars} chars (${(metrics.ratio * 100).toFixed(1)}%), sendEnabled=${metrics.sendEnabled}, sendState=${metrics.sendState}`);
   return metrics;
 }
 
