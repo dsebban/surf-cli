@@ -105,6 +105,13 @@ function handleEvaluate(
     return applyFallback(state, options, arg);
   }
 
+  // Clipboard paste via synthetic ClipboardEvent
+  if (source.includes("ClipboardEvent") && source.includes("paste")) {
+    state.composerText += typeof arg === "string" ? arg : (arg as any)?.text || "";
+    updateSendEnabled(state, options);
+    return true;
+  }
+
   throw new Error(`Unhandled evaluate call: ${source.slice(0, 120)}`);
 }
 
@@ -141,7 +148,7 @@ describe("chatgpt-cloak-prompt-entry", () => {
   it("selects strategy by prompt bytes", () => {
     expect(__private.selectPromptInsertionStrategy(4 * 1024)).toBe("type");
     expect(__private.selectPromptInsertionStrategy(20 * 1024)).toBe("exec");
-    expect(__private.selectPromptInsertionStrategy(60 * 1024)).toBe("chunked_exec");
+    expect(__private.selectPromptInsertionStrategy(60 * 1024)).toBe("clipboard_paste");
   });
 
   it("splits UTF-8 chunks without breaking content", () => {
@@ -176,7 +183,7 @@ describe("chatgpt-cloak-prompt-entry", () => {
     expect(harness.textarea.fill).toHaveBeenCalledTimes(1);
   });
 
-  it("uses chunked exec for very large prompts without fallback when chunks verify", async () => {
+  it("uses clipboard paste for very large prompts without fallback when paste succeeds", async () => {
     const harness = createHarness();
     const log = vi.fn();
     const sleep = createSleepMock();
@@ -192,11 +199,9 @@ describe("chatgpt-cloak-prompt-entry", () => {
       sendButtonSelectors: ["button[data-testid='send-button']"],
     });
 
-    expect(result.method).toBe("chunked_exec");
+    expect(result.method).toBe("clipboard_paste");
     expect(result.usedFallback).toBe(false);
-    expect(result.chunkCount).toBeGreaterThan(1);
     expect(harness.textarea.fill).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith("info", expect.stringContaining("Prompt insert chunk"));
   });
 
   it("falls back when send button is not ready after exact insertion", async () => {

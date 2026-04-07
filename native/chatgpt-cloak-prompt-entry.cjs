@@ -24,7 +24,7 @@ function byteLength(text) {
 
 function selectPromptInsertionStrategy(promptBytes, thresholds = DEFAULT_THRESHOLDS) {
   if (promptBytes <= thresholds.typedMaxBytes) return "type";
-  if (promptBytes > thresholds.chunkedMinBytes) return "chunked_exec";
+  if (promptBytes > thresholds.chunkedMinBytes) return "clipboard_paste";
   return "exec";
 }
 
@@ -187,6 +187,33 @@ async function insertViaFillFallback(page, textarea, promptSelector, prompt) {
   }, { selector: promptSelector, text: prompt });
 }
 
+async function insertViaClipboardPaste(page, promptSelector, prompt) {
+  // Simulate a native paste event — works with ProseMirror/contenteditable editors
+  // that ignore execCommand for large text but handle paste events correctly.
+  return await page.evaluate(({ selector, text, editableSelector }) => {
+    const root = document.querySelector(selector);
+    const el = !root
+      ? null
+      : ((typeof root.matches === "function" && root.matches(editableSelector))
+          ? root
+          : (typeof root.querySelector === "function" ? root.querySelector(editableSelector) : null)) || root;
+    if (!el) return false;
+
+    if (typeof el.focus === "function") el.focus();
+
+    // Build a synthetic ClipboardEvent with DataTransfer carrying the text
+    const dt = new DataTransfer();
+    dt.setData("text/plain", text);
+    const pasteEvent = new ClipboardEvent("paste", {
+      clipboardData: dt,
+      bubbles: true,
+      cancelable: true,
+    });
+    el.dispatchEvent(pasteEvent);
+    return true;
+  }, { selector: promptSelector, text: prompt, editableSelector: EDITABLE_SELECTOR });
+}
+
 function buildMetrics({ method, expectedText, actualState, usedFallback = false, chunkCount = 0 }) {
   const expectedChars = normalizeForLengthComparison(expectedText).length;
   const actualChars = normalizeForLengthComparison(actualState?.actualText || "").length;
@@ -267,6 +294,33 @@ async function enterPromptWithVerification({
     await sleep(merged.settleMs);
     actualState = await readComposerState(page, promptSelector, sendButtonSelectors);
     actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
+  } else if (strategy === "clipboard_paste") {
+    // Clipboard paste — preferred for large prompts (>50KB).
+    // Dispatches a synthetic paste event which ProseMirror handles natively.
+    logf("info", "Attempting clipboard paste insertion for large prompt");
+    await insertViaClipboardPaste(page, promptSelector, prompt);
+    await sleep(merged.settleMs + 500); // extra settle for paste processing
+    actualState = await readComposerState(page, promptSelector, sendButtonSelectors);
+    actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
+
+    // Verify paste worked — if not, fall back to chunked exec
+    const pasteMetrics = buildMetrics({ method: "clipboard_paste", expectedText: prompt, actualState });
+    if (pasteMetrics.ratio < merged.minSuccessRatio) {
+      logf("warn", `Clipboard paste insertion low ratio (${(pasteMetrics.ratio * 100).toFixed(1)}%) — falling back to chunked_exec`);
+      await clearComposer(page, promptSelector);
+      // Fall through to chunked_exec
+      const chunks = splitUtf8Chunks(prompt, merged.chunkBytes);
+      chunkCount = chunks.length;
+      const chunked = await insertViaChunkedExecCommand(
+        page, promptSelector, chunks, logf, sleep,
+        normalizedPrompt.length, sendButtonSelectors, merged,
+      );
+      actualState = chunked.state || await readComposerState(page, promptSelector, sendButtonSelectors);
+      actualState = await waitForSendReady({ page, promptSelector, sendButtonSelectors, sleep, thresholds: merged, initialState: actualState });
+      if (chunked.hardMismatch) {
+        logf("warn", "Prompt chunked insert fell below success ratio — switching to fallback");
+      }
+    }
   } else {
     const chunks = splitUtf8Chunks(prompt, merged.chunkBytes);
     chunkCount = chunks.length;
