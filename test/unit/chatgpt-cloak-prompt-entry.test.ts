@@ -105,10 +105,19 @@ function handleEvaluate(
     return applyFallback(state, options, arg);
   }
 
-  // Clipboard paste via synthetic ClipboardEvent
+  // Clipboard paste via navigator.clipboard.writeText + focus
   if (source.includes("ClipboardEvent") && source.includes("paste")) {
     state.composerText += typeof arg === "string" ? arg : (arg as any)?.text || "";
     updateSendEnabled(state, options);
+    return true;
+  }
+  if (source.includes("navigator.clipboard.writeText")) {
+    // clipboard write — text stored for next keyboard paste
+    (state as any).__clipboardText = typeof arg === "string" ? arg : "";
+    return true;
+  }
+  if (source.includes("el.focus") && source.includes("editableSelector")) {
+    // focus call from clipboard paste
     return true;
   }
 
@@ -139,6 +148,22 @@ function createHarness(options: HarnessOptions = {}) {
       const source = typeof fn === "function" ? fn.toString() : String(fn);
       return handleEvaluate(source, state, options, arg);
     }),
+    keyboard: {
+      press: vi.fn(async (key: string) => {
+        // Simulate Meta+v / Ctrl+v paste — move clipboard text to composer
+        if (key.toLowerCase().includes("v")) {
+          const clipText = (state as any).__clipboardText || "";
+          if (clipText) {
+            state.composerText += clipText;
+            (state as any).__clipboardText = "";
+            updateSendEnabled(state, options);
+          }
+        }
+      }),
+    },
+    context: vi.fn(() => ({
+      grantPermissions: vi.fn(async () => {}),
+    })),
   };
 
   return { page, textarea, state };

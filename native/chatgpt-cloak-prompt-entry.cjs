@@ -188,30 +188,36 @@ async function insertViaFillFallback(page, textarea, promptSelector, prompt) {
 }
 
 async function insertViaClipboardPaste(page, promptSelector, prompt) {
-  // Simulate a native paste event — works with ProseMirror/contenteditable editors
-  // that ignore execCommand for large text but handle paste events correctly.
-  return await page.evaluate(({ selector, text, editableSelector }) => {
+  // Write text to system clipboard, then trigger a real keyboard paste.
+  // This creates a trusted paste event that ProseMirror accepts.
+  // 1. Grant clipboard permissions (Chromium)
+  try {
+    const ctx = page.context();
+    if (typeof ctx.grantPermissions === "function") {
+      await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
+    }
+  } catch {}
+
+  // 2. Focus the editor
+  await page.evaluate(({ selector, editableSelector }) => {
     const root = document.querySelector(selector);
     const el = !root
       ? null
       : ((typeof root.matches === "function" && root.matches(editableSelector))
           ? root
           : (typeof root.querySelector === "function" ? root.querySelector(editableSelector) : null)) || root;
-    if (!el) return false;
+    if (el && typeof el.focus === "function") el.focus();
+  }, { selector: promptSelector, editableSelector: EDITABLE_SELECTOR });
 
-    if (typeof el.focus === "function") el.focus();
+  // 3. Write text to clipboard
+  await page.evaluate(async (text) => {
+    await navigator.clipboard.writeText(text);
+  }, prompt);
 
-    // Build a synthetic ClipboardEvent with DataTransfer carrying the text
-    const dt = new DataTransfer();
-    dt.setData("text/plain", text);
-    const pasteEvent = new ClipboardEvent("paste", {
-      clipboardData: dt,
-      bubbles: true,
-      cancelable: true,
-    });
-    el.dispatchEvent(pasteEvent);
-    return true;
-  }, { selector: promptSelector, text: prompt, editableSelector: EDITABLE_SELECTOR });
+  // 4. Trigger real paste via keyboard shortcut
+  const isMac = process.platform === "darwin";
+  await page.keyboard.press(isMac ? "Meta+v" : "Control+v");
+  return true;
 }
 
 function buildMetrics({ method, expectedText, actualState, usedFallback = false, chunkCount = 0 }) {
