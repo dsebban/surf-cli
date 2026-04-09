@@ -82,6 +82,7 @@ SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "deep analysis" --model gpt-5.4-pro --prof
 ```
 
 **`--prompt-file`** reads a file as the prompt text (for large exported contexts). Unlike `--file` which uploads as an attachment.
+For large exports, prefer `--prompt-file` so the worker verifies the actual latest user turn instead of accepting a pasted-file placeholder.
 
 ### ChatGPT model aliases
 
@@ -141,6 +142,7 @@ SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "complex problem" --model gpt-5.4-pro --pr
 ### Long-running ChatGPT runs
 
 Use tmux for long-think models.
+If a run dies after send or status looks uncertain, check `surf session <id>` then `surf session --reconcile --network` to confirm whether ChatGPT persisted the turn.
 
 ```bash
 tmux new -d -s surf-chat "bash -lc 'SURF_USE_CLOAK_CHATGPT=1 surf chatgpt \"complex analysis\" --model gpt-5.4-pro --profile dsebban883@gmail.com --timeout 3000 2>&1 | tee /tmp/surf-chatgpt.log'"
