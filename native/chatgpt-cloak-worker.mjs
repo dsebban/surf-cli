@@ -22,6 +22,10 @@ import { loadAndInjectChatgptCookies } from './chatgpt-cloak-profile-auth.mjs';
 
 const require = createRequire(import.meta.url);
 const { enterPromptWithVerification } = require('./chatgpt-cloak-prompt-entry.cjs');
+const {
+  extractLatestActiveUserMessage,
+  evaluatePromptPersistence,
+} = require('./chatgpt-cloak-prompt-validation.cjs');
 
 // ============================================================================
 // Logging helpers — everything goes to stdout as JSON lines
@@ -171,6 +175,153 @@ function extractConversationIdFromUrl(url) {
   if (!url || typeof url !== 'string') return null;
   const match = url.match(/\/c\/([^/?#]+)/i);
   return match ? decodeURIComponent(match[1]) : null;
+}
+
+async function waitForConversationIdFromUrl(page, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const id = extractConversationIdFromUrl(page.url());
+    if (id) return id;
+    await sleep(500);
+  }
+  return extractConversationIdFromUrl(page.url());
+}
+
+async function fetchConversation(page, conversationId) {
+  return await page.evaluate(async (id) => {
+    const safeJson = async (response) => {
+      const text = await response.text();
+      if (!text) return { text: '', json: null };
+      try { return { text, json: JSON.parse(text) }; }
+      catch { return { text, json: null }; }
+    };
+
+    try {
+      const sessionResp = await fetch('/api/auth/session', { credentials: 'same-origin' });
+      const sessionPayload = await safeJson(sessionResp);
+      const accessToken = sessionPayload.json?.accessToken;
+      if (!sessionResp.ok || !accessToken) {
+        return { ok: false, code: 'login_required', status: sessionResp.status || 401, body: sessionPayload.text };
+      }
+
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(id)}`, {
+        credentials: 'same-origin',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+      });
+      const payload = await safeJson(response);
+      if (!response.ok) {
+        return {
+          ok: false,
+          code: response.status === 404 ? 'conversation_not_found' : 'backend_error',
+          status: response.status,
+          body: payload.text,
+        };
+      }
+      return { ok: true, conversation: payload.json };
+    } catch (error) {
+      return { ok: false, code: error?.code || 'backend_error', message: error?.message || String(error) };
+    }
+  }, conversationId);
+}
+
+function summarizePromptValidation(validation) {
+  const actualText = typeof validation?.actualText === 'string' ? validation.actualText : '';
+  const previewChars = 120;
+  return {
+    conversationId: validation?.conversationId || null,
+    code: validation?.code || null,
+    failureReason: validation?.failureReason || null,
+    expectedChars: validation?.expectedChars || 0,
+    actualChars: validation?.actualChars || 0,
+    exactMatch: validation?.exactMatch === true,
+    latestUserNodeId: validation?.latestUserNodeId || null,
+    advancedPastBaseline:
+      Object.prototype.hasOwnProperty.call(validation || {}, 'advancedPastBaseline')
+        ? validation.advancedPastBaseline
+        : null,
+    fileMapOnly: validation?.fileMapOnly === true,
+    hasBigPasteAttachment: validation?.hasBigPasteAttachment === true,
+    attachmentCount: validation?.attachmentCount || 0,
+    attachmentNames: Array.isArray(validation?.attachmentNames) ? validation.attachmentNames : [],
+    timedOut: validation?.timedOut === true,
+    status: validation?.status || null,
+    actualPreviewStart: actualText ? actualText.slice(0, previewChars) : '',
+    actualPreviewEnd: actualText.length > previewChars ? actualText.slice(-previewChars) : '',
+  };
+}
+
+async function captureBaselineUserNodeId(page, conversationId) {
+  if (!conversationId) return null;
+  const result = await fetchConversation(page, conversationId);
+  if (!result?.ok) return { ok: false, code: result?.code || 'prompt_validation_fetch_failed', status: result?.status, body: result?.body };
+  const latestUser = extractLatestActiveUserMessage(result.conversation);
+  return { ok: true, baselineUserNodeId: latestUser?.nodeId || null };
+}
+
+async function resolveConversationIdForValidation(page, existingConversationId, timeoutMs = 30_000) {
+  if (existingConversationId) return existingConversationId;
+  return await waitForConversationIdFromUrl(page, timeoutMs);
+}
+
+async function waitForPromptPersistenceValidation({
+  page,
+  conversationId,
+  expectedPrompt,
+  baselineUserNodeId = null,
+  timeoutMs = 30_000,
+  pollMs = 1_000,
+}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastObserved = {
+    ok: false,
+    failureReason: 'validation_not_started',
+    expectedChars: expectedPrompt.length,
+    actualChars: 0,
+    exactMatch: false,
+    latestUserNodeId: null,
+    advancedPastBaseline: baselineUserNodeId ? false : null,
+    fileMapOnly: false,
+    hasBigPasteAttachment: false,
+    attachmentCount: 0,
+    attachmentNames: [],
+    actualText: '',
+    conversationId,
+  };
+
+  while (Date.now() < deadline) {
+    const result = await fetchConversation(page, conversationId);
+    if (!result?.ok) {
+      lastObserved = {
+        ok: false,
+        code: result?.code || 'prompt_validation_fetch_failed',
+        failureReason: result?.code || 'prompt_validation_fetch_failed',
+        status: result?.status,
+        body: result?.body,
+        conversationId,
+      };
+      if (lastObserved.code === 'login_required') return lastObserved;
+    } else {
+      lastObserved = {
+        ...evaluatePromptPersistence({
+          conversation: result.conversation,
+          expectedPrompt,
+          baselineUserNodeId,
+        }),
+        conversationId,
+      };
+      if (lastObserved.ok) return lastObserved;
+      if (lastObserved.failureReason === 'file_map_placeholder' || lastObserved.failureReason === 'big_paste_attachment') {
+        return lastObserved;
+      }
+    }
+    await sleep(pollMs);
+  }
+
+  return { ...lastObserved, ok: false, timedOut: true };
 }
 
 // ============================================================================
@@ -729,22 +880,33 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
 
     // Prompt entry — try each selector until one matches
     let textarea = null;
+    let promptSelector = PROMPT_SELECTORS_CSS;
     for (const sel of PROMPT_SELECTOR_LIST) {
       const loc = page.locator(sel).first();
       const count = await loc.count().catch(() => 0);
       if (count > 0) {
         textarea = loc;
+        promptSelector = sel;
         log('info', `Composer found: ${sel}`);
         break;
       }
     }
     if (!textarea) {
-      // Last resort: use first selector
-      textarea = page.locator(PROMPT_SELECTOR_LIST[0]).first();
-      log('warn', 'No composer selector matched — falling back to #prompt-textarea');
+      fail('composer_not_found', 'No editable ChatGPT composer found', { triedSelectors: PROMPT_SELECTOR_LIST });
+      return;
     }
     await textarea.click({ timeout: 10_000 });
     await sleep(500);
+    for (const sel of PROMPT_SELECTOR_LIST) {
+      const loc = page.locator(sel).first();
+      const count = await loc.count().catch(() => 0);
+      if (count > 0) {
+        textarea = loc;
+        promptSelector = sel;
+        log('info', `Composer active: ${sel}`);
+        break;
+      }
+    }
 
     // Prepare prompt (prefix for image generation)
     let finalPrompt = prompt;
@@ -769,11 +931,22 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       prompt: finalPrompt,
       log,
       sleep,
-      promptSelector: PROMPT_SELECTORS_CSS,
+      promptSelector,
       sendButtonSelectors: SEND_BUTTON_SELECTORS,
     });
     log('info', 'Prompt entry metrics', promptEntry);
     await sleep(300);
+
+    let baselineUserNodeId = null;
+    if (conversationId) {
+      const baselineUser = await captureBaselineUserNodeId(page, conversationId);
+      if (baselineUser?.ok) {
+        baselineUserNodeId = baselineUser.baselineUserNodeId || null;
+        log('info', 'Baseline user captured', { conversationId, baselineUserNodeId });
+      } else {
+        log('warn', 'Baseline user capture failed', baselineUser);
+      }
+    }
 
     // Capture baseline before send (detect stale assistant turns)
     // Use data-message-id (backend message UUID) not data-testid (DOM turn id)
@@ -782,38 +955,88 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     const baselineMessageId = baseline.messageId || null; // For reconcile API comparison
     log('info', 'Baseline captured', { turnId: baselineTurnId, messageId: baselineMessageId });
 
-    // Send — try multiple selectors with retry for send button
-    // ChatGPT may use different button selectors across versions
-    let sendClicked = false;
-    for (const sel of SEND_BUTTON_SELECTORS) {
-      try {
-        const btn = page.locator(sel).first();
-        await btn.click({ timeout: 5_000 });
-        sendClicked = true;
-        log('info', `Send button clicked: ${sel}`);
-        break;
-      } catch {
-        log('info', `Send selector miss: ${sel}`);
+    // Send — prefer click when enabled, otherwise press Enter directly.
+    let sendTriggered = false;
+    if (promptEntry.sendEnabled) {
+      for (const sel of SEND_BUTTON_SELECTORS) {
+        try {
+          const btn = page.locator(sel).first();
+          await btn.click({ timeout: 5_000 });
+          sendTriggered = true;
+          log('info', `Send button clicked: ${sel}`);
+          break;
+        } catch {
+          log('info', `Send selector miss: ${sel}`);
+        }
       }
     }
-    if (!sendClicked) {
-      // Last resort: press Enter in the textarea
-      log('warn', 'No send button found — pressing Enter');
+    if (!sendTriggered) {
+      log(
+        promptEntry.sendButtonFound ? 'warn' : 'info',
+        promptEntry.sendButtonFound
+          ? 'Send button not usable after inline insert — pressing Enter'
+          : 'No send button found — pressing Enter'
+      );
       await textarea.press('Enter');
     }
 
     const sentAt = new Date().toISOString();
-    const prePhase6ConversationId = conversationId || extractConversationIdFromUrl(page.url());
-    if (prePhase6ConversationId) conversationId = prePhase6ConversationId;
     emit({
       type: 'meta_update',
-      source: 'pre_phase_6',
+      source: 'post_send',
       lastCheckpoint: 'sent',
       sentAt,
       conversationId: conversationId || null,
       baselineAssistantMessageId: baselineMessageId || null,
       t: Date.now(),
     });
+
+    const conversationIdBeforeResolve = conversationId || null;
+    conversationId = await resolveConversationIdForValidation(page, conversationId, 30_000);
+    if ((conversationId || null) !== conversationIdBeforeResolve) {
+      emit({
+        type: 'meta_update',
+        source: 'conversation_resolved',
+        lastCheckpoint: 'sent',
+        sentAt,
+        conversationId: conversationId || null,
+        baselineAssistantMessageId: baselineMessageId || null,
+        t: Date.now(),
+      });
+    }
+
+    if (!conversationId) {
+      fail(
+        'prompt_sent_validation_failed',
+        'Prompt send validation failed: conversationId did not resolve after send',
+        { failureReason: 'conversation_id_unresolved' },
+      );
+      return;
+    }
+
+    const sentPromptValidation = await waitForPromptPersistenceValidation({
+      page,
+      conversationId,
+      expectedPrompt: finalPrompt,
+      baselineUserNodeId,
+      timeoutMs: 30_000,
+      pollMs: 1_000,
+    });
+    const validationSummary = summarizePromptValidation(sentPromptValidation);
+    log('info', 'Sent prompt validation', validationSummary);
+    if (!sentPromptValidation.ok) {
+      const failureReason = sentPromptValidation.failureReason || sentPromptValidation.code || 'prompt_sent_validation_failed';
+      fail(
+        failureReason === 'file_map_placeholder' ? 'prompt_materialized_as_file_map' : 'prompt_sent_validation_failed',
+        failureReason === 'file_map_placeholder'
+          ? 'Prompt sent incorrectly: latest user message became <file_map> instead of inline prompt'
+          : failureReason === 'big_paste_attachment'
+            ? 'Prompt sent incorrectly: latest user message materialized as big-paste attachment'
+            : `Prompt sent incorrectly: ${validationSummary.actualChars || 0}/${validationSummary.expectedChars || 0} chars persisted`,
+        validationSummary,
+      );
+      return;
+    }
 
     // ── Phase 6: Wait for response (hybrid stream + DOM) ────────────
     progress(6, 6, 'Waiting for response');

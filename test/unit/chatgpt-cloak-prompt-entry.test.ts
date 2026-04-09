@@ -6,19 +6,26 @@ const {
 } = require("../../native/chatgpt-cloak-prompt-entry.cjs");
 
 type HarnessOptions = {
-  execTransform?: (text: string, callIndex: number, state: HarnessState) => string;
-  fallbackTransform?: (text: string, state: HarnessState) => string;
-  fillTransform?: (text: string, state: HarnessState) => string;
+  insertTransform?: (text: string, state: HarnessState) => string;
   sendEnabledFunc?: (state: HarnessState) => boolean;
   sendThreshold?: number;
-  typeTransform?: (text: string, state: HarnessState) => string;
+  sendButtonFound?: boolean;
+  // ProseMirror simulation
+  composerKind?: "prosemirror" | "textarea" | "unknown";
+  prosemirrorViewAvailable?: boolean;
+  prosemirrorViewResolutionMethod?: "pmViewDesc" | "property_scan";
+  prosemirrorFallbackReason?: "view_not_found" | "unsupported_schema";
+  // Optional transform for PM replace (text → composer text after PM replace)
+  prosemirrorReplaceTransform?: (text: string) => string;
 };
 
 type HarnessState = {
   composerText: string;
-  execCalls: number;
-  fallbackCalls: number;
+  insertCalls: number;
+  readCalls: number;
   sendEnabled: boolean;
+  pmReplaceCalled: boolean;
+  lastMethod: string;
 };
 
 function createSleepMock() {
@@ -31,6 +38,13 @@ function updateSendEnabled(state: HarnessState, options: HarnessOptions) {
     return;
   }
   state.sendEnabled = state.composerText.length >= (options.sendThreshold ?? 1);
+}
+
+function resolveSendState(sendButtonFound: boolean, sendEnabled: boolean) {
+  if (!sendButtonFound) {
+    return "unknown";
+  }
+  return sendEnabled ? "enabled" : "disabled";
 }
 
 function readState(state: HarnessState, options: HarnessOptions) {
@@ -47,107 +61,130 @@ function readState(state: HarnessState, options: HarnessOptions) {
     },
     sendEnabled: sendButtonFound ? state.sendEnabled : false,
     sendButtonFound,
-    sendState: sendButtonFound ? (state.sendEnabled ? "enabled" : "disabled") : "unknown",
+    sendState: resolveSendState(sendButtonFound, state.sendEnabled),
   };
 }
 
-function clearState(state: HarnessState) {
-  state.composerText = "";
-  state.sendEnabled = false;
-  return true;
+function isReadStateCall(source: string) {
+  return source.includes("readProseMirrorText") && source.includes("sendEnabled");
 }
 
-function applyExec(state: HarnessState, options: HarnessOptions, arg?: { text?: string } | string) {
-  state.execCalls += 1;
-  const text = typeof arg === "string" ? arg : (arg?.text ?? "");
-  const inserted = options.execTransform
-    ? options.execTransform(text, state.execCalls, state)
-    : text;
-  state.composerText += inserted;
-  updateSendEnabled(state, options);
-  return true;
+function isClearComposerCall(source: string) {
+  return source.includes("deleteContentBackward") && source.includes("ProseMirror-trailingBreak");
 }
 
-function applyFallback(
-  state: HarnessState,
-  options: HarnessOptions,
-  arg?: { text?: string } | string,
+function isFillFallbackCall(source: string) {
+  return source.includes("insertFromPaste") && source.includes("escapeHtml");
+}
+
+function isProseMirrorReplaceCall(source: string) {
+  return source.includes("pmViewDesc") && source.includes("replaceWith");
+}
+
+function createPmFallbackResult(
+  composerKind: "prosemirror" | "textarea" | "unknown",
+  fallbackReason: "not_prosemirror" | "view_not_found" | "unsupported_schema",
 ) {
-  state.fallbackCalls += 1;
-  const text = typeof arg === "string" ? arg : (arg?.text ?? "");
-  state.composerText = options.fallbackTransform ? options.fallbackTransform(text, state) : text;
-  updateSendEnabled(state, options);
-  return true;
+  return {
+    applied: false,
+    fallbackSafe: true,
+    composerKind,
+    fallbackReason,
+  };
 }
 
-function handleEvaluate(
-  source: string,
-  state: HarnessState,
-  options: HarnessOptions,
-  arg?: { text?: string } | string,
-) {
-  if (source.includes("rawValue") && source.includes("sendEnabled")) {
+function handleEvaluate(source: string, state: HarnessState, options: HarnessOptions) {
+  if (isReadStateCall(source)) {
     return readState(state, options);
   }
 
-  if (
-    source.includes("deleteContentBackward") ||
-    source.includes('document.execCommand("selectAll"')
-  ) {
-    return clearState(state);
-  }
-
-  if (source.includes('document.execCommand("insertText"')) {
-    return applyExec(state, options, arg);
-  }
-
-  if (source.includes("insertFromPaste") && source.includes("el.value = text")) {
-    return applyFallback(state, options, arg);
-  }
-
-  // Clipboard paste via navigator.clipboard.writeText + focus
-  if (source.includes("ClipboardEvent") && source.includes("paste")) {
-    state.composerText += typeof arg === "string" ? arg : (arg as any)?.text || "";
+  if (isClearComposerCall(source)) {
+    state.composerText = "";
     updateSendEnabled(state, options);
     return true;
   }
-  if (source.includes("el.focus") && source.includes("editableSelector")) {
-    // focus call from clipboard paste
+
+  if (isFillFallbackCall(source)) {
     return true;
   }
 
-  throw new Error(`Unhandled evaluate call: ${source.slice(0, 120)}`);
+  if (isProseMirrorReplaceCall(source)) {
+    const kind = options.composerKind ?? "textarea";
+    if (kind !== "prosemirror") {
+      return createPmFallbackResult(kind, "not_prosemirror");
+    }
+    if (options.prosemirrorFallbackReason) {
+      return createPmFallbackResult("prosemirror", options.prosemirrorFallbackReason);
+    }
+    if (options.prosemirrorViewAvailable === false) {
+      return createPmFallbackResult("prosemirror", "view_not_found");
+    }
+    state.pmReplaceCalled = true;
+    state.lastMethod = "prosemirror_replace";
+    return {
+      applied: true,
+      composerKind: "prosemirror",
+      viewResolutionMethod: options.prosemirrorViewResolutionMethod ?? "pmViewDesc",
+      paragraphCount: 1,
+    };
+  }
+
+  throw new Error(`Unhandled evaluate call: ${source.slice(0, 140)}`);
 }
 
 function createHarness(options: HarnessOptions = {}) {
   const state: HarnessState = {
     composerText: "",
-    execCalls: 0,
-    fallbackCalls: 0,
+    insertCalls: 0,
+    readCalls: 0,
     sendEnabled: false,
+    pmReplaceCalled: false,
+    lastMethod: "",
   };
 
   const textarea = {
-    type: vi.fn(async (text: string) => {
-      state.composerText += options.typeTransform ? options.typeTransform(text, state) : text;
-      updateSendEnabled(state, options);
-    }),
-    fill: vi.fn(async (text: string) => {
-      state.composerText = options.fillTransform ? options.fillTransform(text, state) : text;
-      updateSendEnabled(state, options);
-    }),
+    type: vi.fn(async () => undefined),
+    fill: vi.fn(async () => undefined),
+  };
+
+  const applyEvaluateArgs = (source: string, args: unknown) => {
+    if (isProseMirrorReplaceCall(source)) {
+      const promptArgs = args as { prompt?: string } | undefined;
+      const canApplyPrompt =
+        promptArgs?.prompt !== undefined &&
+        options.composerKind === "prosemirror" &&
+        options.prosemirrorViewAvailable !== false &&
+        !options.prosemirrorFallbackReason;
+      if (canApplyPrompt) {
+        const prompt = promptArgs.prompt;
+        if (prompt === undefined) {
+          return;
+        }
+        const transform = options.prosemirrorReplaceTransform ?? ((t: string) => t);
+        state.composerText = transform(prompt);
+        updateSendEnabled(state, options);
+      }
+    }
+
+    if (isFillFallbackCall(source)) {
+      const fillArgs = args as { text?: string } | undefined;
+      if (fillArgs?.text !== undefined) {
+        state.composerText = fillArgs.text;
+        updateSendEnabled(state, options);
+      }
+    }
   };
 
   const page = {
-    evaluate: vi.fn(async (fn: unknown, arg?: { text?: string } | string) => {
+    evaluate: vi.fn(async (fn: unknown, args?: unknown) => {
       const source = typeof fn === "function" ? fn.toString() : String(fn);
-      return handleEvaluate(source, state, options, arg);
+      applyEvaluateArgs(source, args);
+      return handleEvaluate(source, state, options);
     }),
-    keyboard: {
-      press: vi.fn(async () => {}),
-      insertText: vi.fn(async (text: string) => {
-        // Simulate CDP Input.insertText — bulk insert into composer
-        state.composerText += text;
+    _original: {
+      keyboardInsertText: vi.fn(async (text: string) => {
+        state.insertCalls += 1;
+        state.composerText = options.insertTransform ? options.insertTransform(text, state) : text;
         updateSendEnabled(state, options);
       }),
     },
@@ -157,114 +194,93 @@ function createHarness(options: HarnessOptions = {}) {
 }
 
 describe("chatgpt-cloak-prompt-entry", () => {
-  it("selects strategy by prompt bytes", () => {
-    expect(__private.selectPromptInsertionStrategy(4 * 1024)).toBe("type");
-    expect(__private.selectPromptInsertionStrategy(20 * 1024)).toBe("exec");
-    expect(__private.selectPromptInsertionStrategy(60 * 1024)).toBe("clipboard_paste");
-  });
-
-  it("splits UTF-8 chunks without breaking content", () => {
-    const text = "abc😀".repeat(5000);
-    const chunks = __private.splitUtf8Chunks(text, 1024);
-    expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks.every((chunk: { bytes: number }) => chunk.bytes <= 1024)).toBe(true);
-    expect(chunks.map((chunk: { text: string }) => chunk.text).join("")).toBe(text);
-  });
-
-  it("falls back when execCommand truncates medium prompts", async () => {
-    const harness = createHarness({
-      execTransform: (text) => text.slice(0, Math.floor(text.length * 0.6)),
-    });
-    const log = vi.fn();
-    const sleep = createSleepMock();
-    const prompt = "x".repeat(20 * 1024);
-
-    const result = await enterPromptWithVerification({
-      page: harness.page,
-      textarea: harness.textarea,
-      prompt,
-      log,
-      sleep,
-      promptSelector: "#prompt-textarea",
-      sendButtonSelectors: ["button[data-testid='send-button']"],
-    });
-
-    expect(result.method).toBe("fill_fallback");
-    expect(result.usedFallback).toBe(true);
-    expect(result.actualChars).toBe(result.expectedChars);
-    expect(harness.textarea.fill).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses clipboard paste for very large prompts without fallback when paste succeeds", async () => {
+  it("inserts exact text via native keyboardInsertText for small prompts", async () => {
     const harness = createHarness();
-    const log = vi.fn();
     const sleep = createSleepMock();
-    const prompt = "abcd".repeat(20 * 1024);
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: "small prompt",
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).toHaveBeenCalledTimes(1);
+    expect(harness.textarea.type).not.toHaveBeenCalled();
+    expect(harness.textarea.fill).not.toHaveBeenCalled();
+  });
+
+  it("inserts exact text via native keyboardInsertText bulk insert for very large prompts when not ProseMirror", async () => {
+    const harness = createHarness({
+      composerKind: "textarea",
+    });
+    const sleep = createSleepMock();
+    const prompt = "abcd".repeat(60 * 1024);
 
     const result = await enterPromptWithVerification({
       page: harness.page,
       textarea: harness.textarea,
       prompt,
-      log,
-      sleep,
-      promptSelector: "#prompt-textarea",
-      sendButtonSelectors: ["button[data-testid='send-button']"],
-    });
-
-    expect(result.method).toBe("clipboard_paste");
-    expect(result.usedFallback).toBe(false);
-    expect(harness.textarea.fill).not.toHaveBeenCalled();
-  });
-
-  it("falls back when send button is not ready after exact insertion", async () => {
-    const harness = createHarness({
-      sendEnabledFunc: (state) => state.fallbackCalls > 0,
-    });
-    const sleep = createSleepMock();
-
-    const result = await enterPromptWithVerification({
-      page: harness.page,
-      textarea: harness.textarea,
-      prompt: "x".repeat(16 * 1024),
       log: vi.fn(),
       sleep,
       promptSelector: "#prompt-textarea",
       sendButtonSelectors: ["button[data-testid='send-button']"],
     });
 
-    expect(result.method).toBe("fill_fallback");
-    expect(result.sendEnabled).toBe(true);
-    expect(harness.textarea.fill).toHaveBeenCalledTimes(1);
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+    expect(result.actualChars).toBe(prompt.length);
+    expect(harness.page._original.keyboardInsertText).toHaveBeenCalledTimes(1);
   });
 
-  it("waits briefly for delayed send readiness before fallback", async () => {
-    let evalCount = 0;
+  it("waits briefly for delayed send readiness", async () => {
     const harness = createHarness({
-      sendEnabledFunc: () => {
-        evalCount++;
-        // Enable send after a few evaluations (simulates React state propagation delay)
-        return evalCount >= 4;
-      },
+      sendEnabledFunc: (state) => state.readCalls >= 4,
     });
     const sleep = createSleepMock();
 
     const result = await enterPromptWithVerification({
       page: harness.page,
       textarea: harness.textarea,
-      prompt: "tiny prompt",
+      prompt: "delayed ready",
       log: vi.fn(),
       sleep,
       promptSelector: "#prompt-textarea",
       sendButtonSelectors: ["button[data-testid='send-button']"],
     });
 
-    expect(result.method).toBe("type");
-    expect(result.usedFallback).toBe(false);
+    expect(result.exactMatch).toBe(true);
     expect(result.sendEnabled).toBe(true);
-    expect(harness.textarea.fill).not.toHaveBeenCalled();
+    expect(sleep).toHaveBeenCalled();
   });
 
-  it("does not fail when prompt text verifies but send selector is missing", async () => {
+  it("does not fail when exact text matches but send button remains disabled", async () => {
+    const harness = createHarness({
+      sendEnabledFunc: () => false,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: "exact text, disabled send",
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.exactMatch).toBe(true);
+    expect(result.sendEnabled).toBe(false);
+    expect(result.sendState).toBe("disabled");
+  });
+
+  it("does not fail when send selector is missing", async () => {
     const harness = createHarness({
       sendButtonFound: false,
     });
@@ -280,36 +296,373 @@ describe("chatgpt-cloak-prompt-entry", () => {
       sendButtonSelectors: ["button[data-testid='send-button']"],
     });
 
-    expect(result.method).toBe("type");
-    expect(result.usedFallback).toBe(false);
-    expect(result.sendEnabled).toBe(false);
+    expect(result.exactMatch).toBe(true);
     expect(result.sendButtonFound).toBe(false);
+    expect(result.sendState).toBe("unknown");
   });
 
-  it("throws with details when fallback still cannot insert full prompt", async () => {
+  it("recovers via fill_fallback when native insertion strategies mismatch", async () => {
     const harness = createHarness({
-      execTransform: (text) => text.slice(0, Math.floor(text.length * 0.4)),
-      fillTransform: (text) => text.slice(0, Math.floor(text.length * 0.5)),
-      fallbackTransform: (text) => text.slice(0, Math.floor(text.length * 0.5)),
+      insertTransform: (text, state) =>
+        `${state.composerText}${text.slice(0, Math.floor(text.length * 0.4))}`,
     });
     const sleep = createSleepMock();
 
-    await expect(
-      enterPromptWithVerification({
-        page: harness.page,
-        textarea: harness.textarea,
-        prompt: "x".repeat(20 * 1024),
-        log: vi.fn(),
-        sleep,
-        promptSelector: "#prompt-textarea",
-        sendButtonSelectors: ["button[data-testid='send-button']"],
-      }),
-    ).rejects.toMatchObject({
-      code: "prompt_insertion_failed",
-      details: expect.objectContaining({
-        ratio: expect.any(Number),
-        usedFallback: true,
-      }),
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: "x".repeat(20 * 1024),
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
     });
+
+    expect(result.method).toBe("fill_fallback");
+    expect(result.exactMatch).toBe(true);
+  });
+
+  it("uses prosemirror_replace for large prompts when ProseMirror EditorView is available", async () => {
+    const largePrompt = "hello world\nsecond line".padEnd(10 * 1024, " x");
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("prosemirror_replace");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).not.toHaveBeenCalled();
+    expect(harness.state.pmReplaceCalled).toBe(true);
+  });
+
+  it("falls back to native_insert_text for large prompts when ProseMirror EditorView is not available", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: false,
+      insertTransform: (text, state) => `${state.composerText}${text}`,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).toHaveBeenCalled();
+  });
+
+  it("falls back to native_insert_text for large prompts when composer is not ProseMirror", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "textarea",
+      insertTransform: (text, state) => `${state.composerText}${text}`,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+  });
+
+  it("prosemirror_replace preserves multiline structure with blank lines after normalization", async () => {
+    const prompt = ["line one", "", "line three", "", "line five"]
+      .join("\n")
+      .padEnd(9 * 1024, "\npadding");
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("prosemirror_replace");
+    expect(result.exactMatch).toBe(true);
+  });
+
+  it("falls back to native insertion when prosemirror_replace verification mismatches", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+      // Simulate PM writing only half the content (drift/bug)
+      prosemirrorReplaceTransform: (text) => text.slice(0, Math.floor(text.length / 2)),
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).toHaveBeenCalledTimes(1);
+  });
+
+  it("prosemirror_replace still honors delayed send readiness", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+      sendEnabledFunc: (state) => state.readCalls >= 3,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("prosemirror_replace");
+    expect(result.sendEnabled).toBe(true);
+    expect(sleep).toHaveBeenCalled();
+  });
+
+  it("does not accept large same-length native mismatches and falls back to fill_fallback", async () => {
+    const harness = createHarness({
+      composerKind: "textarea",
+      insertTransform: (text) => `y${text.slice(1)}`,
+    });
+    const sleep = createSleepMock();
+    const prompt = "x".repeat(9 * 1024);
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("fill_fallback");
+    expect(result.exactMatch).toBe(true);
+  });
+
+  it("falls back to chunked native insertion after severe bulk mismatch", async () => {
+    const prompt = "abcd".repeat(5 * 1024);
+    const harness = createHarness({
+      composerKind: "textarea",
+      insertTransform: (text, state) => {
+        if (state.insertCalls === 1) {
+          return text.slice(0, Math.floor(text.length / 4));
+        }
+        return `${state.composerText}${text}`;
+      },
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text_chunked");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).toHaveBeenCalledTimes(4);
+  });
+
+  it("buildMetrics normalizes line endings, terminal newlines, and nbsp", () => {
+    expect(
+      __private.buildMetrics({
+        method: "native_insert_text",
+        expectedText: "a\r\n\u00a0b\n\n",
+        actualState: {
+          actualText: "a\n b",
+          sendEnabled: false,
+          sendButtonFound: true,
+          sendState: "disabled",
+          rawLengths: { value: 3, textContent: 3, innerText: 3 },
+        },
+      }),
+    ).toMatchObject({
+      exactMatch: true,
+      expectedChars: 4,
+      actualChars: 4,
+    });
+  });
+
+  it("splits native insert chunks at the configured boundary", () => {
+    expect(__private.splitNativeInsertChunks("abcdefghij", 4)).toEqual(["abcd", "efgh", "ij"]);
+  });
+
+  it("scales native insert timeout with very large payloads", () => {
+    expect(__private.resolveNativeInsertTimeoutMs("x".repeat(4 * 1024))).toBe(120_000);
+    expect(__private.resolveNativeInsertTimeoutMs("x".repeat(446 * 1024))).toBeGreaterThan(120_000);
+  });
+
+  it("prefers fill_fallback first for very large payloads", async () => {
+    const prompt = "x".repeat(300 * 1024);
+    const harness = createHarness({
+      composerKind: "textarea",
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("fill_fallback");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).not.toHaveBeenCalled();
+  });
+
+  it("uses proseMirror byte threshold for multibyte-heavy prompts", async () => {
+    const prompt = "🙂".repeat(3_000);
+    expect(prompt.length).toBeLessThan(8 * 1024);
+    expect(__private.byteLength(prompt)).toBeGreaterThan(8 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("prosemirror_replace");
+    expect(result.exactMatch).toBe(true);
+  });
+
+  it("falls back to native insertion when proseMirror text is exact but send stays disabled", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+      sendEnabledFunc: () => false,
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+    expect(harness.page._original.keyboardInsertText).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports property_scan when proseMirror view is discovered via fallback scan", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorViewAvailable: true,
+      prosemirrorViewResolutionMethod: "property_scan",
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("prosemirror_replace");
+    expect(harness.state.pmReplaceCalled).toBe(true);
+  });
+
+  it("falls back to native insertion when proseMirror schema is unsupported", async () => {
+    const largePrompt = "x".repeat(10 * 1024);
+    const harness = createHarness({
+      composerKind: "prosemirror",
+      prosemirrorFallbackReason: "unsupported_schema",
+    });
+    const sleep = createSleepMock();
+
+    const result = await enterPromptWithVerification({
+      page: harness.page,
+      textarea: harness.textarea,
+      prompt: largePrompt,
+      log: vi.fn(),
+      sleep,
+      promptSelector: "#prompt-textarea",
+      sendButtonSelectors: ["button[data-testid='send-button']"],
+    });
+
+    expect(result.method).toBe("native_insert_text");
+    expect(result.exactMatch).toBe(true);
+  });
+
+  it("splits utf8 chunks without breaking multibyte characters", () => {
+    const text = "🙂🙂🙂🙂🙂";
+    const chunks = __private.splitUtf8Chunks(text, 8);
+    expect(chunks.map((chunk: { text: string }) => chunk.text).join("")).toBe(text);
+    expect(chunks.every((chunk: { bytes: number }) => chunk.bytes <= 8)).toBe(true);
   });
 });
