@@ -51,6 +51,25 @@ describe("chatgpt-cloak-bridge", () => {
     bridge.__resetBridgeRuntimeForTests();
   });
 
+  it("uses 2700s default timeout for query workers", async () => {
+    const worker = createWorker();
+    const spawn = vi.fn().mockReturnValue(worker);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+
+    const promise = bridge.queryWithCloakBrowser({ query: "hello" });
+
+    expect(worker.stdin.write).toHaveBeenCalledWith(expect.stringContaining('"timeout":2700'));
+
+    worker.stdout.emit(
+      "data",
+      `${JSON.stringify({ type: "success", response: "hi", model: "gpt-5.4-pro", tookMs: 10, backend: "cloak" })}\n`,
+    );
+
+    await expect(promise).resolves.toMatchObject({ response: "hi", model: "gpt-5.4-pro" });
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
   it("forwards progress and maps chats success payload", async () => {
     const worker = createWorker();
     const spawn = vi.fn().mockReturnValue(worker);
@@ -119,6 +138,78 @@ describe("chatgpt-cloak-bridge", () => {
       code: "conversation_not_found",
       details: { status: 404 },
     });
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
+  it("retries chat get in headed mode after clean worker_exit", async () => {
+    const worker1 = createWorker();
+    const worker2 = createWorker();
+    const spawn = vi.fn().mockReturnValueOnce(worker1).mockReturnValueOnce(worker2);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+    const progress = vi.fn();
+
+    const promise = bridge.manageChatsWithCloakBrowser(
+      { action: "get", conversationId: "conv-123", timeout: 5 },
+      progress,
+    );
+
+    worker1.emit("close", 0, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    worker2.stdout.emit(
+      "data",
+      `${JSON.stringify({
+        type: "success",
+        action: "get",
+        conversationId: "conv-123",
+        conversation: { current_node: "n1", mapping: { n1: {} } },
+      })}\n`,
+    );
+
+    await expect(promise).resolves.toMatchObject({
+      action: "get",
+      conversationId: "conv-123",
+    });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(progress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "progress",
+        message: expect.stringContaining("retrying"),
+      }),
+    );
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
+  it("keeps original worker_exit context when headed retry also fails", async () => {
+    const worker1 = createWorker();
+    const worker2 = createWorker();
+    const spawn = vi.fn().mockReturnValueOnce(worker1).mockReturnValueOnce(worker2);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+
+    const promise = bridge.manageChatsWithCloakBrowser({
+      action: "get",
+      conversationId: "conv-err",
+      timeout: 5,
+    });
+
+    worker1.emit("close", 0, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    worker2.emit("close", 0, null);
+
+    await expect(promise).rejects.toMatchObject({
+      code: "worker_exit",
+      exitCode: 0,
+      retryContext: {
+        initialError: {
+          code: "worker_exit",
+          exitCode: 0,
+        },
+      },
+    });
+
     bridge.__resetBridgeRuntimeForTests();
   });
 
@@ -285,6 +376,52 @@ describe("chatgpt-cloak-bridge", () => {
     const promise = bridge.manageChatsWithCloakBrowser({ action: "list", timeout: 1 });
     const rejection = expect(promise).rejects.toMatchObject({ code: "timeout" });
     await vi.advanceTimersByTimeAsync(1000);
+
+    await rejection;
+    expect(worker.kill).toHaveBeenCalledWith("SIGTERM");
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
+  it("resets the worker timer on keepalive activity", async () => {
+    vi.useFakeTimers();
+    const worker = createWorker();
+    const spawn = vi.fn().mockReturnValue(worker);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+
+    const promise = bridge.queryWithCloakBrowser({ query: "hello", timeout: 1 });
+
+    await vi.advanceTimersByTimeAsync(900);
+    worker.stdout.emit("data", `${JSON.stringify({ type: "keepalive", reason: "text" })}\n`);
+    await vi.advanceTimersByTimeAsync(900);
+
+    expect(worker.kill).not.toHaveBeenCalled();
+
+    worker.stdout.emit(
+      "data",
+      `${JSON.stringify({ type: "success", response: "done", model: "gpt-5.4-pro", tookMs: 1500, backend: "cloak" })}\n`,
+    );
+
+    await expect(promise).resolves.toMatchObject({ response: "done", model: "gpt-5.4-pro" });
+    bridge.__resetBridgeRuntimeForTests();
+  });
+
+  it("does not let log chatter extend the worker timer", async () => {
+    vi.useFakeTimers();
+    const worker = createWorker();
+    const spawn = vi.fn().mockReturnValue(worker);
+    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
+    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
+
+    const promise = bridge.queryWithCloakBrowser({ query: "hello", timeout: 1 });
+    const rejection = expect(promise).rejects.toMatchObject({ code: "timeout" });
+
+    await vi.advanceTimersByTimeAsync(900);
+    worker.stdout.emit(
+      "data",
+      `${JSON.stringify({ type: "log", level: "warn", message: "Cloudflare challenge detected, waiting..." })}\n`,
+    );
+    await vi.advanceTimersByTimeAsync(100);
 
     await rejection;
     expect(worker.kill).toHaveBeenCalledWith("SIGTERM");

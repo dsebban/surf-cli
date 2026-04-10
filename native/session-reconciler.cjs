@@ -15,7 +15,8 @@
 
 "use strict";
 
-const { listSessions, updateSession } = require("./session-store.cjs");
+const { listSessions, updateSession, appendSessionLog, persistSessionResponse } = require("./session-store.cjs");
+const { extractMessageText, summarizeConversation } = require("./chatgpt-chats-formatter.cjs");
 
 // ============================================================================
 // Constants
@@ -73,6 +74,25 @@ function hasSentCheckpoint(meta) {
     meta.lastCheckpoint === "sent" ||
     (typeof meta.sentAt === "string" && meta.sentAt.trim() !== "")
   );
+}
+
+function extractRecoveredAssistantPayload(conversation, nodeId = null) {
+  if (!conversation || typeof conversation !== "object") return null;
+  const mapping = conversation.mapping && typeof conversation.mapping === "object" ? conversation.mapping : null;
+  const node = mapping && nodeId ? mapping[nodeId] : null;
+  const nodeMessage = node && node.message ? node.message : null;
+  const nodeText = extractMessageText(nodeMessage);
+  const summary = summarizeConversation(conversation);
+  const lastAssistant = Array.isArray(summary.messages)
+    ? [...summary.messages].reverse().find((msg) => msg && msg.role === "assistant")
+    : null;
+  const fallbackText = lastAssistant && (!nodeId || lastAssistant.id === nodeId) ? lastAssistant.text : "";
+  const responseText = String(nodeText || fallbackText || "").trim();
+  if (!responseText) return null;
+  return {
+    responseText,
+    model: nodeMessage?.metadata?.model_slug || lastAssistant?.model || summary.model || null,
+  };
 }
 
 // ============================================================================
@@ -238,19 +258,40 @@ async function reconcileSessions(opts = {}) {
         };
 
         if (inspection.outcome === "completed") {
+          const recoveredPayload = extractRecoveredAssistantPayload(convo, inspection.nodeId);
+          const recoveredResponse = recoveredPayload?.responseText || "";
+          const responsePreview = recoveredResponse ? recoveredResponse.slice(0, 160) : null;
+          const responseArtifact = persistSessionResponse(meta.id, recoveredResponse);
+          const result = {
+            ok:            true,
+            reconciled:    true,
+            recovered:     true,
+            conversationId,
+            nodeId:        inspection.nodeId,
+            model:         recoveredPayload?.model || null,
+            responsePreview,
+            responsePath: responseArtifact?.responsePath || null,
+            responseChars: responseArtifact?.responseChars || 0,
+          };
+          if (!responseArtifact?.responsePath && recoveredResponse) {
+            result.inlineResponse = recoveredResponse;
+            result.inlineResponseTruncated = false;
+            result.inlineResponseChars = recoveredResponse.length;
+          }
           reconcile.state = "recovered";
           updateSession(meta.id, {
             status:      "completed",
             completedAt: new Date().toISOString(),
             elapsedMs:   age,
             reconcile,
-            result: {
-              ok:            true,
-              reconciled:    true,
-              conversationId,
-              nodeId:        inspection.nodeId,
-            },
+            result,
           });
+          appendSessionLog(meta.id, `[session] ✓ recovered remote reply from conversation ${conversationId}`);
+          if (responseArtifact?.responsePath) {
+            appendSessionLog(meta.id, `[session] response saved: ${responseArtifact.responsePath}`);
+          } else if (recoveredResponse) {
+            appendSessionLog(meta.id, `[session] recovered assistant reply stored in inline fallback (${recoveredResponse.length} chars)`);
+          }
           results.push({ meta, action: "recovered", reason: "conversation_completed", conversationId });
           recovered = true;
 

@@ -90,6 +90,7 @@ echo "-- Command Help with Examples --"
 test_output "click help examples" "node cli.cjs click --help" "Examples"
 test_output "type help examples" "node cli.cjs type --help" "Examples"
 test_output "screenshot help examples" "node cli.cjs screenshot --help" "Examples"
+test_output "session help" "node cli.cjs session --help" "inspect and reconcile"
 test_output "chatgpt.chats help" "node cli.cjs chatgpt.chats --help" "Search conversations"
 test_output "chatgpt.reply help" "node cli.cjs chatgpt.reply --help" "Reply in-thread"
 

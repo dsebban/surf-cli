@@ -49,6 +49,10 @@ function readSessionMeta(dir: string, id: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(dir, id, "meta.json"), "utf8"));
 }
 
+function readSessionLog(dir: string, id: string): string {
+  return fs.readFileSync(path.join(dir, id, "output.log"), "utf8");
+}
+
 // ── defaultPidIsAlive ────────────────────────────────────────────────────────
 
 describe("defaultPidIsAlive", () => {
@@ -318,9 +322,12 @@ describe("reconcileSessions", () => {
           message: {
             status: "finished_successfully",
             author: { role: "assistant" },
+            content: { parts: ["Recovered answer line 1\n\nRecovered answer line 2"] },
+            metadata: { model_slug: "gpt-5.4-pro" },
           },
         },
       },
+      title: "Recovered conversation",
     };
 
     const mockManageChats = vi.fn().mockResolvedValue({ conversation: completedConv });
@@ -339,9 +346,168 @@ describe("reconcileSessions", () => {
     expect(meta.status).toBe("completed");
     expect(meta.reconcile.state).toBe("recovered");
     expect(meta.result.reconciled).toBe(true);
+    expect(meta.result.recovered).toBe(true);
+    expect(meta.result.model).toBe("gpt-5.4-pro");
+    expect(meta.result.responsePreview).toContain("Recovered answer line 1");
+    expect(meta.result.responsePath).toContain("response.md");
+    expect(meta.result.responseChars).toBeGreaterThan(0);
+    expect(meta.result.inlineResponse).toBeUndefined();
+    expect(meta.result.inlineResponseChars).toBeUndefined();
+    expect(meta.result.recoveredResponse).toBeUndefined();
+    const log = readSessionLog(tmpDir, "chatgpt-recoverable");
+    expect(log).toContain("response saved:");
+    expect(log).not.toContain("Recovered answer line 1");
     expect(mockManageChats).toHaveBeenCalledWith(
       expect.objectContaining({ action: "get", conversationId: "conv-abc123" }),
     );
+  });
+
+  it("keeps long recovered responses in the artifact instead of meta/log", async () => {
+    const r = loadReconciler();
+    writeSessionMeta(tmpDir, {
+      id: "chatgpt-recover-truncated",
+      tool: "chatgpt",
+      status: "running",
+      createdAt: new Date(Date.now() - 10_000).toISOString(),
+      pid: 999999999,
+      conversationId: "conv-truncated",
+      baselineAssistantMessageId: null,
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:00:00.000Z",
+    });
+
+    const longReply = "A".repeat(13005);
+    const completedConv = {
+      current_node: "long-node",
+      mapping: {
+        "long-node": {
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+            content: { parts: [longReply] },
+          },
+        },
+      },
+    };
+
+    const mockManageChats = vi.fn().mockResolvedValue({ conversation: completedConv });
+    await r.reconcileSessions({ all: true, pollNetwork: true, manageChats: mockManageChats });
+
+    const meta = readSessionMeta(tmpDir, "chatgpt-recover-truncated") as any;
+    expect(meta.result.responsePath).toContain("response.md");
+    expect(meta.result.responseChars).toBe(13005);
+    expect(meta.result.inlineResponse).toBeUndefined();
+    expect(meta.result.inlineResponseTruncated).toBeUndefined();
+    expect(meta.result.inlineResponseChars).toBeUndefined();
+    expect(meta.result.recoveredResponse).toBeUndefined();
+    expect(fs.readFileSync(meta.result.responsePath, "utf8")).toBe(longReply);
+
+    const log = readSessionLog(tmpDir, "chatgpt-recover-truncated");
+    expect(log).toContain("response saved:");
+    expect(log).not.toContain(longReply);
+  });
+
+  it("falls back to meta storage when the response artifact cannot be written", async () => {
+    const r = loadReconciler();
+    writeSessionMeta(tmpDir, {
+      id: "chatgpt-recover-fallback",
+      tool: "chatgpt",
+      status: "running",
+      createdAt: new Date(Date.now() - 10_000).toISOString(),
+      pid: 999999999,
+      conversationId: "conv-fallback",
+      baselineAssistantMessageId: null,
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:00:00.000Z",
+    });
+    fs.mkdirSync(path.join(tmpDir, "chatgpt-recover-fallback", "response.md"));
+
+    const recoveredReply = "Recovered via fallback storage.";
+    const completedConv = {
+      current_node: "fallback-node",
+      mapping: {
+        "fallback-node": {
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+            content: { parts: [recoveredReply] },
+          },
+        },
+      },
+    };
+
+    const mockManageChats = vi.fn().mockResolvedValue({ conversation: completedConv });
+    await r.reconcileSessions({ all: true, pollNetwork: true, manageChats: mockManageChats });
+
+    const meta = readSessionMeta(tmpDir, "chatgpt-recover-fallback") as any;
+    expect(meta.result.responsePath).toBe(null);
+    expect(meta.result.responseChars).toBe(0);
+    expect(meta.result.inlineResponse).toBe(recoveredReply);
+    expect(meta.result.inlineResponseTruncated).toBe(false);
+    expect(meta.result.inlineResponseChars).toBe(recoveredReply.length);
+    expect(meta.result.recoveredResponse).toBeUndefined();
+
+    const log = readSessionLog(tmpDir, "chatgpt-recover-fallback");
+    expect(log).toContain("stored in inline fallback");
+    expect(log).not.toContain(recoveredReply);
+  });
+
+  it("does not hydrate stale older assistant text when recovered node has no text", async () => {
+    const r = loadReconciler();
+    writeSessionMeta(tmpDir, {
+      id: "chatgpt-recover-empty-current",
+      tool: "chatgpt",
+      status: "running",
+      createdAt: new Date(Date.now() - 10_000).toISOString(),
+      pid: 999999999,
+      conversationId: "conv-empty-current",
+      baselineAssistantMessageId: "old-node",
+      lastCheckpoint: "sent",
+      sentAt: "2026-04-05T12:00:00.000Z",
+    });
+
+    const completedConv = {
+      current_node: "new-node",
+      mapping: {
+        "old-node": {
+          id: "old-node",
+          parent: null,
+          children: ["new-node"],
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+            content: { parts: ["Older assistant reply"] },
+          },
+        },
+        "new-node": {
+          id: "new-node",
+          parent: "old-node",
+          children: [],
+          message: {
+            status: "finished_successfully",
+            author: { role: "assistant" },
+            content: { parts: [] },
+          },
+        },
+      },
+    };
+
+    const mockManageChats = vi.fn().mockResolvedValue({ conversation: completedConv });
+    await r.reconcileSessions({ all: true, pollNetwork: true, manageChats: mockManageChats });
+
+    const meta = readSessionMeta(tmpDir, "chatgpt-recover-empty-current") as any;
+    expect(meta.status).toBe("completed");
+    expect(meta.result.recovered).toBe(true);
+    expect(meta.result.responsePreview).toBe(null);
+    expect(meta.result.responsePath).toBe(null);
+    expect(meta.result.responseChars).toBe(0);
+    expect(meta.result.inlineResponse).toBeUndefined();
+    expect(meta.result.inlineResponseChars).toBeUndefined();
+    expect(meta.result.recoveredResponse).toBeUndefined();
+
+    const log = readSessionLog(tmpDir, "chatgpt-recover-empty-current");
+    expect(log).toContain("recovered remote reply from conversation conv-empty-current");
+    expect(log).not.toContain("Older assistant reply");
   });
 
   it("recovers legacy dead session with conversationId but no checkpoint metadata", async () => {

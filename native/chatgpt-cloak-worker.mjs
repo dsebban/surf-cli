@@ -26,6 +26,12 @@ const {
   extractLatestActiveUserMessage,
   evaluatePromptPersistence,
 } = require('./chatgpt-cloak-prompt-validation.cjs');
+const {
+  DEFAULT_CHATGPT_QUERY_TIMEOUT_SEC,
+  detectResponseActivity,
+  resolveKeepaliveIntervalMs,
+  resolveQueryTimeoutSeconds,
+} = require('./chatgpt-cloak-timeout.cjs');
 
 // ============================================================================
 // Logging helpers — everything goes to stdout as JSON lines
@@ -336,6 +342,31 @@ const CONVERSATION_TURN_SELECTOR =
 const STOP_BUTTON_SELECTOR =
   'button[data-testid="stop-button"], button[aria-label="Stop"]';
 
+const IS_ACTIVE_STOP_BUTTON_JS = `(() => {
+  var STOP_SEL = '${STOP_BUTTON_SELECTOR}';
+  function isVisible(el) {
+    if (!el || !(el instanceof HTMLElement)) return false;
+    var style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) return false;
+    var rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+  function isEnabled(el) {
+    if (!el) return false;
+    if (el.disabled) return false;
+    var aria = (el.getAttribute('aria-disabled') || '').toLowerCase();
+    if (aria === 'true') return false;
+    return true;
+  }
+  var buttons = document.querySelectorAll(STOP_SEL);
+  for (var i = 0; i < buttons.length; i++) {
+    var btn = buttons[i];
+    if (isVisible(btn) && isEnabled(btn)) return true;
+  }
+  return false;
+})()`;
+
 // Prompt composer selectors — broader than just #prompt-textarea to handle ChatGPT DOM changes
 const PROMPT_SELECTOR_LIST = [
   '#prompt-textarea',
@@ -413,7 +444,27 @@ const EXTRACT_TEXT_JS = `(() => {
 
 const DETECT_PHASE_JS = `(() => {
   var STOP_SEL = '${STOP_BUTTON_SELECTOR}';
-  var stop = document.querySelector(STOP_SEL);
+  function isVisible(el) {
+    if (!el || !(el instanceof HTMLElement)) return false;
+    var style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) return false;
+    var rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+  function isEnabled(el) {
+    if (!el) return false;
+    if (el.disabled) return false;
+    var aria = (el.getAttribute('aria-disabled') || '').toLowerCase();
+    if (aria === 'true') return false;
+    return true;
+  }
+  var stop = null;
+  var buttons = document.querySelectorAll(STOP_SEL);
+  for (var i = 0; i < buttons.length; i++) {
+    var candidate = buttons[i];
+    if (isVisible(candidate) && isEnabled(candidate)) { stop = candidate; break; }
+  }
   if (!stop) return { phase: '', isThinking: false, thinkingText: '' };
   ${FIND_LAST_ASSISTANT_JS}
   if (!lastAssistant) return { phase: 'Connecting', isThinking: true, thinkingText: '' };
@@ -729,7 +780,7 @@ async function detectAndSaveImage(page, savePath) {
 // ============================================================================
 // Main query handler
 
-async function runQuery({ prompt, model, file, profile, timeout = 120, generateImage, conversationId }) {
+async function runQuery({ prompt, model, file, profile, timeout = DEFAULT_CHATGPT_QUERY_TIMEOUT_SEC, generateImage, conversationId }) {
   const t0 = Date.now();
   const resolved = resolveModel(model);
   const useInjectedProfile = !!profile;
@@ -951,6 +1002,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     // Capture baseline before send (detect stale assistant turns)
     // Use data-message-id (backend message UUID) not data-testid (DOM turn id)
     const baseline = await page.evaluate(EXTRACT_TEXT_JS);
+    const baselineText = sanitize(baseline.text || '');
     const baselineTurnId = baseline.turnId || null; // For DOM change detection
     const baselineMessageId = baseline.messageId || null; // For reconcile API comparison
     log('info', 'Baseline captured', { turnId: baselineTurnId, messageId: baselineMessageId });
@@ -1041,7 +1093,10 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     // ── Phase 6: Wait for response (hybrid stream + DOM) ────────────
     progress(6, 6, 'Waiting for response');
 
-    const deadline = Date.now() + timeout * 1000;
+    const timeoutSec = resolveQueryTimeoutSeconds(timeout);
+    const timeoutMs = timeoutSec * 1000;
+    const keepaliveIntervalMs = resolveKeepaliveIntervalMs(timeoutSec);
+    let deadline = Date.now() + timeoutMs;
     let responseText = '';
     let sawActivity = false;
     let capturedModel = null;
@@ -1053,13 +1108,31 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
     let responseTurnId = null;
     let liveThinkingTrace = null;
     let lastThinkingText = '';
+    let lastStreamText = '';
+    let lastStreamChangeAtMs = Date.now();
+    let lastKeepaliveAtMs = 0;
+    let timedOut = false;
 
-    while (Date.now() < deadline) {
+    const noteActivity = (reason) => {
+      const now = Date.now();
+      deadline = now + timeoutMs;
+      if ((now - lastKeepaliveAtMs) >= keepaliveIntervalMs) {
+        emit({ type: 'keepalive', reason, phase: lastPhase || 'Waiting for response' });
+        lastKeepaliveAtMs = now;
+      }
+    };
+
+    while (true) {
+      if (Date.now() >= deadline) {
+        timedOut = true;
+        break;
+      }
       await sleep(500);
 
       // 1. Detect phase
       const phaseResult = await page.evaluate(DETECT_PHASE_JS);
       const phase = (phaseResult && phaseResult.phase) || '';
+      const previousPhase = lastPhase;
       if (phase && phase !== lastPhase) {
         log('info', `⏳ ${phase}`);
         emit({ type: 'trace', phase, isThinking: !!(phaseResult && phaseResult.isThinking) });
@@ -1075,7 +1148,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       if (stream.model) capturedModel = stream.model;
 
       // 4. Streaming state
-      const isStreaming = await page.locator(STOP_BUTTON_SELECTOR).count() > 0;
+      const isStreaming = await page.evaluate(IS_ACTIVE_STOP_BUTTON_JS);
 
       // 5. Arbitrate best text
       const currentText = chooseBestText({
@@ -1086,13 +1159,44 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       });
 
       // Track activity — only if we see a NEW turn (not baseline stale content)
-      const isNewTurn = dom.turnId && dom.turnId !== baselineTurnId;
-      if (isNewTurn) responseTurnId = dom.turnId;
-      const hasStreamContent = stream.text && stream.text.length > 0;
-      const hasThinkingActivity = !!(phaseResult && phaseResult.isThinking);
-      if (hasStreamContent || isNewTurn || hasThinkingActivity) {
+      const observedTurnId = dom.turnId || null;
+      const isNewTurn = observedTurnId && observedTurnId !== baselineTurnId;
+      const previousTurnId = responseTurnId;
+      if (isNewTurn) responseTurnId = observedTurnId;
+      const isThinkingPhase = !!(phaseResult && phaseResult.isThinking);
+      const fullThinkingText = isThinkingPhase ? (phaseResult.thinkingText || '').trim() : '';
+      const activity = detectResponseActivity({
+        phase,
+        previousPhase,
+        turnId: responseTurnId || null,
+        previousTurnId: previousTurnId || null,
+        observedTurnId,
+        baselineTurnId,
+        currentText,
+        previousText: lastText,
+        baselineText,
+        streamText: stream.text || '',
+        previousStreamText: lastStreamText,
+        thinkingText: fullThinkingText,
+        previousThinkingText: lastThinkingText,
+        trustedActivitySeen: sawActivity,
+      });
+      if (activity.active) {
         sawActivity = true;
+        noteActivity(activity.reasons[0] || 'response');
       }
+      const streamText = stream.text || '';
+      if (streamText !== lastStreamText) {
+        lastStreamText = streamText;
+        lastStreamChangeAtMs = Date.now();
+      }
+      const isBaselineTurn = !!(baselineTurnId && observedTurnId && observedTurnId === baselineTurnId);
+      const isBaselineResponseSnapshot = !!(
+        isBaselineTurn &&
+        baselineText &&
+        currentText === baselineText &&
+        !streamText
+      );
       if (!sawActivity) continue;
 
       // Detect conversationId from URL for new conversations (URL becomes /c/{id} once activity starts)
@@ -1107,11 +1211,9 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       }
 
       // 5b. Live thinking trace — emit DOM thinking text as deltas
-      const isThinkingPhase = !!(phaseResult && phaseResult.isThinking);
-
       if (isThinkingPhase) {
         // DOM-based delta emission (timer line already stripped in DETECT_PHASE_JS)
-        const fullText = (phaseResult.thinkingText || '').trim();
+        const fullText = fullThinkingText;
         if (fullText && fullText !== lastThinkingText) {
           let delta;
           if (lastThinkingText && fullText.startsWith(lastThinkingText)) {
@@ -1164,12 +1266,33 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       lastChangeAtMs = stability.lastChangeAtMs;
       lastText = currentText;
 
-      if (stability.shouldComplete && currentText.length > 0) {
+      if (stability.shouldComplete && currentText.length > 0 && !isBaselineResponseSnapshot) {
         responseText = currentText;
         break;
       }
 
-      if (currentText) responseText = currentText;
+      const nowMs = Date.now();
+      const phaseLooksFinalizing = /^Finalizing\b/i.test(phase || '');
+      const textStableMs = nowMs - lastChangeAtMs;
+      const streamStableMs = nowMs - lastStreamChangeAtMs;
+      if (
+        currentText.length > 0 &&
+        sawActivity &&
+        phaseLooksFinalizing &&
+        textStableMs >= 20000 &&
+        streamStableMs >= 20000 &&
+        !isBaselineResponseSnapshot
+      ) {
+        log('warn', 'Completing response after finalizing-phase stability fallback', {
+          textStableMs,
+          streamStableMs,
+          phase,
+        });
+        responseText = currentText;
+        break;
+      }
+
+      if (currentText && !isBaselineResponseSnapshot) responseText = currentText;
     }
 
     // Thinking trace extraction (post-response, from React fiber state)
@@ -1215,7 +1338,7 @@ async function runQuery({ prompt, model, file, profile, timeout = 120, generateI
       model: capturedModel || model || resolved.mode,
       tookMs: durationMs,
       imagePath,
-      partial: Date.now() >= deadline,
+      partial: timedOut,
       backend: 'cloak',
       conversationId: conversationId || null,
       thinkingTrace: thinkingTrace || undefined,

@@ -13,6 +13,7 @@
  *   session.fail(err)
  *   listSessions({ hours, all, limit })
  *   loadSession(idOrPrefix)
+ *   appendSessionLog(id, message)
  *   deleteSessions({ hours, all })
  */
 
@@ -38,6 +39,10 @@ const getSessionsDir = () =>
 
 const DEFAULT_TTL_HOURS = 72;
 const MAX_SESSIONS      = 500;
+const RESPONSE_ARTIFACT_NAME = "response.md";
+const INLINE_RESPONSE_FIELD = "inlineResponse";
+const INLINE_RESPONSE_TRUNCATED_FIELD = "inlineResponseTruncated";
+const INLINE_RESPONSE_CHARS_FIELD = "inlineResponseChars";
 
 // ============================================================================
 // Slug helpers (Oracle-style: prompt words → kebab)
@@ -85,6 +90,37 @@ function sanitizeArgs(args) {
   return out;
 }
 
+function persistResponseArtifact(dir, response, filename = RESPONSE_ARTIFACT_NAME) {
+  if (!dir || typeof response !== "string" || response.length === 0) return null;
+  const responsePath = path.join(dir, filename);
+  try {
+    fs.writeFileSync(responsePath, response, { mode: 0o600 });
+    return {
+      responsePath,
+      responseChars: response.length,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function applyResponsePersistenceResult(result, response, responseArtifact) {
+  const nextResult = result && typeof result === "object" ? result : {};
+  delete nextResult[INLINE_RESPONSE_FIELD];
+  delete nextResult[INLINE_RESPONSE_TRUNCATED_FIELD];
+  delete nextResult[INLINE_RESPONSE_CHARS_FIELD];
+  if (responseArtifact) {
+    Object.assign(nextResult, responseArtifact);
+    return nextResult;
+  }
+  if (typeof response === "string" && response.length > 0) {
+    nextResult[INLINE_RESPONSE_FIELD] = response;
+    nextResult[INLINE_RESPONSE_TRUNCATED_FIELD] = false;
+    nextResult[INLINE_RESPONSE_CHARS_FIELD] = response.length;
+  }
+  return nextResult;
+}
+
 // ============================================================================
 // Session class
 // ============================================================================
@@ -121,12 +157,16 @@ class Session {
     this._meta.elapsedMs   = now - this._meta._startMs;
     delete this._meta._startMs;
 
-    if (result.model)         this._meta.result = { ok: true, model: result.model };
-    if (result.tookMs)        this._meta.elapsedMs = result.tookMs;
-    if (result.imagePath)     this._meta.result = { ...(this._meta.result||{}), imagePath: result.imagePath };
-    if (result.responsePreview) this._meta.result = { ...(this._meta.result||{}), responsePreview: String(result.responsePreview).slice(0, 160) };
+    const nextResult = { ...(this._meta.result || {}), ok: true };
+    if (result.model) nextResult.model = result.model;
+    if (result.tookMs) this._meta.elapsedMs = result.tookMs;
+    if (result.imagePath) nextResult.imagePath = result.imagePath;
+    if (result.responsePreview) nextResult.responsePreview = String(result.responsePreview).slice(0, 160);
+    const responseArtifact = persistResponseArtifact(this.dir, result.response);
+    this._meta.result = applyResponsePersistenceResult(nextResult, result.response, responseArtifact);
 
     this._writeMeta();
+    if (responseArtifact?.responsePath) this.step(`[session] response saved: ${responseArtifact.responsePath}`);
     this.step(`[session] ✓ completed in ${(this._meta.elapsedMs/1000).toFixed(1)}s`);
   }
 
@@ -258,9 +298,12 @@ function loadSession(idOrPrefix) {
     const metaPath = path.join(exactDir, "meta.json");
     const logPath  = path.join(exactDir, "output.log");
     try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+      const responseInfo = resolveSessionResponse(meta, exactDir);
       return {
-        meta: JSON.parse(fs.readFileSync(metaPath, "utf8")),
+        meta,
         log:  fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "",
+        ...responseInfo,
       };
     } catch {}
   }
@@ -289,9 +332,12 @@ function loadSession(idOrPrefix) {
   const metaPath = path.join(dir, "meta.json");
   const logPath  = path.join(dir, "output.log");
   try {
+    const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+    const responseInfo = resolveSessionResponse(meta, dir);
     return {
-      meta: JSON.parse(fs.readFileSync(metaPath, "utf8")),
+      meta,
       log:  fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "",
+      ...responseInfo,
     };
   } catch { return null; }
 }
@@ -360,6 +406,53 @@ function updateSession(id, patch = {}) {
   }
 }
 
+function appendSessionLog(id, message) {
+  if (!id) return false;
+  const dir = path.join(getSessionsDir(), id);
+  const logPath = path.join(dir, "output.log");
+  try {
+    fs.appendFileSync(logPath, `${String(message ?? "")}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function persistSessionResponse(id, response, filename = RESPONSE_ARTIFACT_NAME) {
+  if (!id) return null;
+  const dir = path.join(getSessionsDir(), id);
+  return persistResponseArtifact(dir, response, filename);
+}
+
+function resolveSessionResponse(meta, dir) {
+  const result = (meta && typeof meta === "object" && meta.result && typeof meta.result === "object") ? meta.result : {};
+  const configuredResponsePath = typeof result.responsePath === "string" && result.responsePath.trim() ? result.responsePath : null;
+  const artifactCandidates = configuredResponsePath
+    ? [configuredResponsePath, path.join(dir, RESPONSE_ARTIFACT_NAME)]
+    : [path.join(dir, RESPONSE_ARTIFACT_NAME)];
+
+  for (const candidate of artifactCandidates) {
+    if (!candidate) continue;
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const response = fs.readFileSync(candidate, "utf8");
+      return { response, responseSource: "artifact", responsePath: candidate };
+    } catch {
+      // fall through to legacy field
+    }
+  }
+
+  if (typeof result[INLINE_RESPONSE_FIELD] === "string" && result[INLINE_RESPONSE_FIELD].length > 0) {
+    return { response: result[INLINE_RESPONSE_FIELD], responseSource: "inline_response", responsePath: configuredResponsePath };
+  }
+
+  if (typeof result.recoveredResponse === "string" && result.recoveredResponse.length > 0) {
+    return { response: result.recoveredResponse, responseSource: "legacy_recoveredResponse", responsePath: configuredResponsePath };
+  }
+
+  return { response: null, responseSource: null, responsePath: configuredResponsePath };
+}
+
 // ============================================================================
 // Exports
 // ============================================================================
@@ -370,6 +463,8 @@ const exports_ = {
   loadSession,
   deleteSessions,
   updateSession,
+  appendSessionLog,
+  persistSessionResponse,
 };
 // Dynamic getter so SURF_SESSIONS_DIR env changes are reflected immediately
 Object.defineProperty(exports_, "SESSIONS_DIR", {

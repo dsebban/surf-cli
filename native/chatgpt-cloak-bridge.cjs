@@ -8,6 +8,11 @@
 const { spawn } = require("child_process");
 const { existsSync } = require("fs");
 const { join, dirname } = require("path");
+const {
+  DEFAULT_CHATGPT_CHATS_TIMEOUT_SEC,
+  resolveChatsTimeoutSeconds,
+  resolveQueryTimeoutSeconds,
+} = require("./chatgpt-cloak-timeout.cjs");
 
 const DEFAULT_RUNTIME = { spawn, existsSync };
 let runtime = { ...DEFAULT_RUNTIME };
@@ -50,14 +55,22 @@ function ensureAvailability(workerPath) {
   }
 }
 
-function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () => {}, mapSuccess = (msg) => msg }) {
+function runCloakWorker({ workerPath, request, timeout = DEFAULT_CHATGPT_CHATS_TIMEOUT_SEC, onProgress = () => {}, mapSuccess = (msg) => msg }) {
   ensureAvailability(workerPath);
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let timer = null;
+    const clearWorkerTimer = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
     const settle = (fn, value) => {
       if (!settled) {
         settled = true;
+        clearWorkerTimer();
         fn(value);
       }
     };
@@ -72,10 +85,64 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
     });
 
     const timeoutMs = timeout * 1000;
-    const timer = setTimeout(() => {
-      worker.kill("SIGTERM");
-      settle(reject, Object.assign(new Error(`CloakBrowser worker killed after ${timeoutMs}ms`), { code: "timeout" }));
-    }, timeoutMs);
+    const armWorkerTimer = () => {
+      clearWorkerTimer();
+      timer = setTimeout(() => {
+        worker.kill("SIGTERM");
+        settle(reject, Object.assign(new Error(`CloakBrowser worker killed after ${timeoutMs}ms`), { code: "timeout" }));
+      }, timeoutMs);
+    };
+    armWorkerTimer();
+
+    const handleWorkerMessage = (msg) => {
+      if (msg.type === "progress" || msg.type === "trace" || msg.type === "meta_update" || msg.type === "keepalive" || msg.type === "success" || msg.type === "error") {
+        armWorkerTimer();
+      }
+      switch (msg.type) {
+        case "progress":
+          onProgress(msg);
+          return false;
+        case "success":
+          settle(resolve, mapSuccess(msg));
+          return true;
+        case "error":
+          settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
+          return true;
+        case "trace":
+          onProgress({
+            type: "trace",
+            phase: msg.phase,
+            isThinking: msg.isThinking,
+            traceType: msg.traceType,
+            thoughtText: msg.thoughtText,
+            thoughtDelta: msg.thoughtDelta,
+            thoughtCount: msg.thoughtCount,
+            durationSec: msg.durationSec,
+            recapText: msg.recapText,
+          });
+          return false;
+        case "meta_update":
+          onProgress({
+            type:                       "meta_update",
+            conversationId:             msg.conversationId || null,
+            baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
+            lastCheckpoint:             msg.lastCheckpoint || null,
+            sentAt:                     msg.sentAt || null,
+            source:                     msg.source || null,
+            t:                          msg.t || Date.now(),
+          });
+          return false;
+        case "keepalive":
+          return false;
+        case "log":
+          if (process.env.SURF_DEBUG) {
+            process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);
+          }
+          return false;
+        default:
+          return false;
+      }
+    };
 
     let stdoutBuf = "";
     worker.stdout.setEncoding("utf8");
@@ -87,46 +154,7 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          switch (msg.type) {
-            case "progress":
-              onProgress(msg);
-              break;
-            case "success":
-              settle(resolve, mapSuccess(msg));
-              break;
-            case "error":
-              settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
-              break;
-            case "trace":
-              onProgress({
-                type: "trace",
-                phase: msg.phase,
-                isThinking: msg.isThinking,
-                traceType: msg.traceType,
-                thoughtText: msg.thoughtText,
-                thoughtDelta: msg.thoughtDelta,
-                thoughtCount: msg.thoughtCount,
-                durationSec: msg.durationSec,
-                recapText: msg.recapText,
-              });
-              break;
-            case "meta_update":
-              onProgress({
-                type:                       "meta_update",
-                conversationId:             msg.conversationId || null,
-                baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
-                lastCheckpoint:             msg.lastCheckpoint || null,
-                sentAt:                     msg.sentAt || null,
-                source:                     msg.source || null,
-                t:                          msg.t || Date.now(),
-              });
-              break;
-            case "log":
-              if (process.env.SURF_DEBUG) {
-                process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);
-              }
-              break;
-          }
+          handleWorkerMessage(msg);
         } catch {
           // Ignore non-JSON lines.
         }
@@ -144,53 +172,14 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
       if (!line || !line.trim()) return false;
       try {
         const msg = JSON.parse(line);
-        switch (msg.type) {
-          case "progress":
-            onProgress(msg);
-            return false;
-          case "success":
-            settle(resolve, mapSuccess(msg));
-            return true;
-          case "error":
-            settle(reject, Object.assign(new Error(msg.message), { code: msg.code, details: msg.details }));
-            return true;
-          case "trace":
-            onProgress({
-              type: "trace",
-              phase: msg.phase,
-              isThinking: msg.isThinking,
-              traceType: msg.traceType,
-              thoughtText: msg.thoughtText,
-              thoughtDelta: msg.thoughtDelta,
-              thoughtCount: msg.thoughtCount,
-              durationSec: msg.durationSec,
-              recapText: msg.recapText,
-            });
-            return false;
-          case "meta_update":
-            onProgress({
-              type:                       "meta_update",
-              conversationId:             msg.conversationId || null,
-              baselineAssistantMessageId: msg.baselineAssistantMessageId || null,
-              lastCheckpoint:             msg.lastCheckpoint || null,
-              sentAt:                     msg.sentAt || null,
-              source:                     msg.source || null,
-              t:                          msg.t || Date.now(),
-            });
-            return false;
-          case "log":
-            if (process.env.SURF_DEBUG) process.stderr.write(`[cloak:${msg.level}] ${msg.message}\n`);
-            return false;
-          default:
-            return false;
-        }
+        return handleWorkerMessage(msg);
       } catch {
         return false;
       }
     };
 
     worker.on("close", (code, signal) => {
-      clearTimeout(timer);
+      clearWorkerTimer();
       if (settled) return;
       if (stdoutBuf.trim()) {
         const handled = tryHandleLine(stdoutBuf);
@@ -209,7 +198,8 @@ function runCloakWorker({ workerPath, request, timeout = 120, onProgress = () =>
 }
 
 async function queryWithCloakBrowser(opts, onProgress = () => {}) {
-  const { model, file, profile, timeout = 120, conversationId } = opts;
+  const timeout = resolveQueryTimeoutSeconds(opts.timeout);
+  const { model, file, profile, conversationId } = opts;
   const prompt = opts.prompt || opts.query || "";
   const promptKB = (Buffer.byteLength(prompt, "utf-8") / 1024).toFixed(1);
   const estimatedTokens = Math.ceil(prompt.length / 4);
@@ -250,8 +240,8 @@ async function queryWithCloakBrowser(opts, onProgress = () => {}) {
 }
 
 async function manageChatsWithCloakBrowser(opts, onProgress = () => {}) {
-  const timeout = opts.timeout || 120;
-  return runCloakWorker({
+  const timeout = resolveChatsTimeoutSeconds(opts.timeout);
+  const runChatsRequest = () => runCloakWorker({
     workerPath: CHATS_WORKER_PATH,
     request: {
       type: "chats",
@@ -276,6 +266,44 @@ async function manageChatsWithCloakBrowser(opts, onProgress = () => {}) {
       return out;
     },
   });
+
+  try {
+    return await runChatsRequest();
+  } catch (err) {
+    const shouldRetryHeaded = (
+      opts?.action === "get" &&
+      opts?.continueInBrowser !== true &&
+      err?.code === "worker_exit" &&
+      err?.exitCode === 0
+    );
+    if (!shouldRetryHeaded) throw err;
+    onProgress({
+      type: "progress",
+      step: 0,
+      total: 0,
+      message: "Worker exited without result; retrying in headed CloakBrowser",
+    });
+    const previousHeadless = process.env.CLOAK_HEADLESS;
+    try {
+      process.env.CLOAK_HEADLESS = "0";
+      return await runChatsRequest();
+    } catch (retryErr) {
+      const retryContext = {
+        initialError: {
+          code: err?.code || null,
+          exitCode: err?.exitCode ?? null,
+          message: err?.message || String(err),
+        },
+      };
+      if (retryErr && typeof retryErr === "object") {
+        retryErr.retryContext = retryContext;
+      }
+      throw retryErr;
+    } finally {
+      if (previousHeadless === undefined) delete process.env.CLOAK_HEADLESS;
+      else process.env.CLOAK_HEADLESS = previousHeadless;
+    }
+  }
 }
 
 function __setBridgeRuntimeForTests(overrides = {}) {

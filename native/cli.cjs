@@ -387,7 +387,7 @@ const TOOLS = {
           model: "Model: gpt-4o, o3, o4-mini, etc.",
           file: "Attach file (requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)",
           "generate-image": "Generate image and save to path (requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)",
-          timeout: "Timeout in seconds (default: 2700 = 45min)",
+          timeout: "Inactivity timeout in seconds (default: 2700 = 45min)",
           profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)"
         },
         examples: [
@@ -432,7 +432,7 @@ const TOOLS = {
         opts: {
           model: "Model override (optional)",
           continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
-          timeout: "Timeout in seconds (default: 120)",
+          timeout: "Inactivity timeout in seconds (default: 2700 = 45min)",
           profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1)",
         },
         examples: [
@@ -1835,6 +1835,22 @@ const showAllTools = () => {
   console.log(`\n  Total: ${ALL_SOCKET_TOOLS.length} commands\n`);
 };
 
+const showSessionHelp = () => {
+  console.log(`
+session - inspect and reconcile saved surf sessions
+
+Usage:
+  surf session                      List recent sessions
+  surf session <id>                 View a session
+  surf session --reconcile          Reconcile orphaned sessions
+  surf session --reconcile --network  + poll ChatGPT remotely
+  surf session --all                Show all sessions
+  surf session --hours 72           Last 72 hours
+  surf session --clear              Delete all sessions
+  surf session --clear --hours 24   Delete sessions older than 24h
+`);
+};
+
 if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
   showBasicHelp();
   process.exit(0);
@@ -1867,6 +1883,11 @@ if (args[0] === "--find" && args[1]) {
 
 if (args[0] === "--about" && args[1]) {
   showAbout(args[1]);
+  process.exit(0);
+}
+
+if ((args[0] === "session" || args[0] === "sessions") && (args.includes("--help") || args.includes("-h"))) {
+  showSessionHelp();
   process.exit(0);
 }
 
@@ -2010,6 +2031,7 @@ if (args[0] === "session" || args[0] === "sessions") {
     if (meta.args?.query)  console.log(`  Query:   ${meta.args.query}`);
     if (meta.args?.file)   console.log(`  File:    ${meta.args.file}`);
     if (meta.args?.model)  console.log(`  Model:   ${meta.args.model}`);
+    if (meta.result?.responsePath) console.log(`  Response: ${meta.result.responsePath}`);
     if (meta.error)        console.log(`  Error:   ${meta.error.message}`);
     if (log) {
       console.log(`\n--- output.log ---`);
@@ -3383,6 +3405,7 @@ const runChatGptCloakQueryDirect = async (sessionTool, queryArgs) => {
       model: result.model || sessionTool,
       tookMs: durationMs,
       imagePath: result.imagePath,
+      response: result.response,
       responsePreview: result.response ? result.response.slice(0, 160) : `${sessionTool} completed`,
     });
 
@@ -3698,9 +3721,10 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
         const bunResult = await runChatGPTViaBun(toolArgs);
         process.stderr.write = _origWrite;
         if (bunResult.ok) {
-          const data = bunResult.result;
-          sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
-            responsePreview: data.response ? data.response.slice(0, 160) : "" });
+            const data = bunResult.result;
+            sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
+              response: data.response,
+              responsePreview: data.response ? data.response.slice(0, 160) : "" });
           if (wantJson) {
             console.log(JSON.stringify(data, null, 2));
           } else {
@@ -3807,9 +3831,10 @@ if (tool === "gemini" && shouldUseBunGemini(process.env)) {
         const bunResult = await runGeminiViaBun(toolArgs);
         process.stderr.write = _origWrite;
         if (bunResult.ok) {
-          const data = bunResult.result;
-          sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
-            responsePreview: data.response ? data.response.slice(0, 160) : "" });
+            const data = bunResult.result;
+            sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
+              response: data.response,
+              responsePreview: data.response ? data.response.slice(0, 160) : "" });
           if (wantJson) {
             console.log(JSON.stringify(data, null, 2));
           } else {
