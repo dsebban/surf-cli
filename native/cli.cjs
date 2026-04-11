@@ -9,7 +9,7 @@ const networkFormatters = require("./formatters/network.cjs");
 const networkStore = require("./network-store.cjs");
 const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
-const { shouldUseBunGemini, isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
+const { isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
 const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require("./chatgpt-bun-bridge.cjs");
 const { isCloakBrowserAvailable, queryWithCloakBrowser, manageChatsWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
 const chatgptChatsFormatter = require("./chatgpt-chats-formatter.cjs");
@@ -22,6 +22,153 @@ const IS_WIN = process.platform === "win32";
 const SURF_TMP = IS_WIN ? path.join(os.tmpdir(), "surf") : "/tmp";
 const SOCKET_PATH = IS_WIN ? "//./pipe/surf" : "/tmp/surf.sock";
 if (IS_WIN) { try { fs.mkdirSync(SURF_TMP, { recursive: true }); } catch {} }
+
+const SURF_SKILL_BT = "`";
+const SURF_SKILL_DOC = String.raw`---
+name: surf
+description: Run the headless-only surf CLI for ChatGPT and Gemini terminal workflows.
+---
+
+# Surf
+
+Headless terminal AI via local signed-in browser profiles.
+Prefer real CLI execution over guessed provider APIs.
+
+Repo + local CLI verified against **surf-cli v2.11.1**.
+
+## Use when
+
+- ChatGPT prompts, file review, prompt-file runs, image generation
+- Gemini prompts, file/video analysis, image generation/editing
+- ChatGPT conversation list/search/view/export/reply/manage flows
+- Long-running browser-session AI from shell, tmux, or agent workflows
+
+## Defaults
+
+- Headless-only CLI.
+- ChatGPT uses CloakBrowser headless by default.
+- Gemini uses Bun WebView headless by default.
+- Default profile on macOS: ${SURF_SKILL_BT}dsebban883@gmail.com${SURF_SKILL_BT} unless the user asks for another account.
+- Use ${SURF_SKILL_BT}--profile dsebban883@gmail.com${SURF_SKILL_BT} for reliable auth and file/image/chats features.
+
+## Sanity check
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf --version
+surf --help
+surf chatgpt.chats --limit 1 --profile dsebban883@gmail.com
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+## ChatGPT
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf chatgpt "explain this code" --profile dsebban883@gmail.com
+surf chatgpt "review this PR" --file diff.patch --profile dsebban883@gmail.com
+surf chatgpt --prompt-file prompt.md --model gpt-5.4-pro --profile dsebban883@gmail.com
+surf chatgpt "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
+surf chatgpt "deep analysis" --model gpt-5.4-pro --profile dsebban883@gmail.com
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+${SURF_SKILL_BT}--prompt-file${SURF_SKILL_BT} reads the file as prompt text. Use it for large exported contexts. ${SURF_SKILL_BT}--file${SURF_SKILL_BT} uploads as an attachment.
+
+### ChatGPT model aliases
+
+- ${SURF_SKILL_BT}instant${SURF_SKILL_BT}, ${SURF_SKILL_BT}gpt-5.3${SURF_SKILL_BT}, ${SURF_SKILL_BT}gpt-4o${SURF_SKILL_BT}, ${SURF_SKILL_BT}gpt-4.1${SURF_SKILL_BT}, ${SURF_SKILL_BT}gpt-4.1-mini${SURF_SKILL_BT} → GPT-5.3 Instant
+- ${SURF_SKILL_BT}thinking${SURF_SKILL_BT}, ${SURF_SKILL_BT}gpt-5.4-thinking${SURF_SKILL_BT}, ${SURF_SKILL_BT}o3${SURF_SKILL_BT}, ${SURF_SKILL_BT}o4-mini${SURF_SKILL_BT} → GPT-5.4 Thinking
+- ${SURF_SKILL_BT}pro${SURF_SKILL_BT}, ${SURF_SKILL_BT}gpt-5.4-pro${SURF_SKILL_BT}, ${SURF_SKILL_BT}chatgpt-pro${SURF_SKILL_BT}, ${SURF_SKILL_BT}o1-pro${SURF_SKILL_BT} → GPT-5.4 Pro
+
+## ChatGPT conversations
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf chatgpt.chats --limit 20 --profile dsebban883@gmail.com
+surf chatgpt.chats --search "auth system" --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --export /tmp/chat.md --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --export /tmp/chat.json --format json --json --profile dsebban883@gmail.com
+surf chatgpt.reply <conversation-id> "follow-up" --profile dsebban883@gmail.com
+surf chatgpt.reply <conversation-id> --prompt-file followup.md --model gpt-5.4-thinking --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --rename "New Title" --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --delete --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --download-file <file-id> --output /tmp/file.txt --profile dsebban883@gmail.com
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+Notes:
+- ${SURF_SKILL_BT}--delete${SURF_SKILL_BT} is destructive; no CLI undo.
+- Search may use a recent-history fallback; if JSON shows ${SURF_SKILL_BT}partial: true${SURF_SKILL_BT}, misses are not authoritative for older chats.
+- ${SURF_SKILL_BT}--download-file${SURF_SKILL_BT} needs ${SURF_SKILL_BT}--output${SURF_SKILL_BT}.
+
+## ChatGPT thinking trace
+
+Pro/Thinking models stream live thinking content via ${SURF_SKILL_BT}🧠${SURF_SKILL_BT} lines.
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf chatgpt "complex problem" --model gpt-5.4-pro --profile dsebban883@gmail.com
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+## Gemini
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf gemini "explain quantum computing" --profile dsebban883@gmail.com
+surf gemini "analyze this chart" --file chart.jpg --model gemini-3-pro --profile dsebban883@gmail.com
+surf gemini "reason about this architecture" --model gemini-3.1-pro-preview --profile dsebban883@gmail.com
+surf gemini "summarize this video" --youtube "https://youtube.com/..." --profile dsebban883@gmail.com
+surf gemini "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
+surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9 --profile dsebban883@gmail.com
+surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile dsebban883@gmail.com
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+### Gemini model notes
+
+Default/listed models:
+
+- ${SURF_SKILL_BT}gemini-3-pro${SURF_SKILL_BT} default
+- ${SURF_SKILL_BT}gemini-2.5-pro${SURF_SKILL_BT}
+- ${SURF_SKILL_BT}gemini-2.5-flash${SURF_SKILL_BT}
+
+Gemini UI selection also accepts best-effort mode IDs when available:
+
+- ${SURF_SKILL_BT}gemini-3.1-pro-preview${SURF_SKILL_BT}
+- ${SURF_SKILL_BT}gemini-3.1-pro${SURF_SKILL_BT}
+- ${SURF_SKILL_BT}gemini-3.1-thinking${SURF_SKILL_BT}
+- ${SURF_SKILL_BT}gemini-3.1-flash${SURF_SKILL_BT}
+- ${SURF_SKILL_BT}gemini-3.1-flash-lite-preview${SURF_SKILL_BT}
+
+Use ${SURF_SKILL_BT}gemini-3.1-pro-preview${SURF_SKILL_BT} for strongest reasoning/image analysis when the account UI exposes it. Unknown Gemini model names are passed through to the UI picker best-effort.
+
+## Workflows
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf do 'chatgpt "Draft release notes" --profile dsebban883@gmail.com | gemini "Make it concise" --profile dsebban883@gmail.com'
+surf do 'chatgpt "Review this" --file diff.patch --profile dsebban883@gmail.com' --dry-run
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+## Sessions & reconciliation
+
+Every surf AI command creates a session in ${SURF_SKILL_BT}~/.surf/sessions/${SURF_SKILL_BT}.
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+surf session
+surf session <id>
+surf session --reconcile
+surf session --reconcile --network
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+For long runs, use tmux:
+
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
+tmux new -d -s surf-chat "bash -lc 'surf chatgpt \"complex analysis\" --model gpt-5.4-pro --profile dsebban883@gmail.com --timeout 3000 2>&1 | tee /tmp/surf-chatgpt.log'"
+tail -f /tmp/surf-chatgpt.log
+${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
+
+## Troubleshooting
+
+- ${SURF_SKILL_BT}--profile${SURF_SKILL_BT} is macOS-only.
+- ${SURF_SKILL_BT}--with-page${SURF_SKILL_BT} is not supported.
+- Page-context/browser-extension commands were removed.
+- Default ChatGPT timeout: **2700s**.
+- If auth fails, sign in with the same local profile and retry.
+- Use ${SURF_SKILL_BT}surf session <id>${SURF_SKILL_BT} to inspect stderr/result details.
+`;
 
 /**
  * Read a prompt file and return its content. Exits on error/empty.
@@ -385,10 +532,10 @@ const TOOLS = {
         opts: { 
           "with-page": "Include current page context",
           model: "Model: gpt-4o, o3, o4-mini, etc.",
-          file: "Attach file (requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)",
-          "generate-image": "Generate image and save to path (requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)",
+          file: "Attach file",
+          "generate-image": "Generate image and save to path",
           timeout: "Inactivity timeout in seconds (default: 2700 = 45min)",
-          profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)"
+          profile: "Chrome profile email for headless auth (macOS)"
         },
         examples: [
           { cmd: 'chatgpt "explain this code"', desc: "Basic query" },
@@ -416,7 +563,7 @@ const TOOLS = {
           continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
           "no-cache": "Bypass local chats cache",
           timeout: "Timeout in seconds (default: 120)",
-          profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1)",
+          profile: "Chrome profile email for headless auth (macOS)",
         },
         examples: [
           { cmd: "chatgpt.chats", desc: "List recent conversations" },
@@ -433,7 +580,7 @@ const TOOLS = {
           model: "Model override (optional)",
           continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
           timeout: "Inactivity timeout in seconds (default: 2700 = 45min)",
-          profile: "Chrome profile email for headless auth (macOS, requires SURF_USE_CLOAK_CHATGPT=1)",
+          profile: "Chrome profile email for headless auth (macOS)",
         },
         examples: [
           { cmd: 'chatgpt.reply <conversation-id> "follow-up question"', desc: "Reply in-thread" },
@@ -1590,88 +1737,83 @@ const SEE_ALSO = {
   "network": ["console", "network.get"],
 };
 
+const HEADLESS_COMMAND_HELP = {
+  chatgpt: "Send prompt to ChatGPT",
+  "chatgpt.chats": "Search conversations",
+  "chatgpt.reply": "Reply in-thread",
+  gemini: "Send prompt to Gemini",
+  session: "Inspect and reconcile AI sessions",
+  do: "Execute multiple commands",
+  server: "Start MCP server",
+  skills: "Print the full agent skill reference",
+};
+
+const HEADLESS_COMMAND_LIST = [
+  "chatgpt",
+  "chatgpt.chats",
+  "chatgpt.reply",
+  "gemini",
+  "session",
+  "do",
+  "server",
+  "skills",
+];
+
 const showBasicHelp = () => {
-  console.log(`surf v${VERSION} - Browser automation CLI
+  console.log(`surf v${VERSION} - Headless terminal AI CLI
 
 Usage: surf <command> [args] [options]
 
-Common Commands:
-  navigate <url>     Go to URL (alias: go)
-  click <ref>        Click element by ref or selector
-  type <text>        Type text at cursor or into element
-  screenshot         Capture screenshot (alias: snap)
-  page.read          Get page accessibility tree (alias: read)
-  locate.role <role> Find element by ARIA role
-  search <term>      Search for text in page (alias: find)
-  window.new <url>   Create isolated browser window
-  wait <seconds>     Wait N seconds
+AI Commands (headless-only):
+  chatgpt <query>                Send prompt to ChatGPT
+  chatgpt.chats [conversation_id] List/search/view conversations
+  chatgpt.reply <conversation_id> <prompt> Reply inside a conversation
+  gemini <query>                 Send prompt to Gemini
+
+Workflow + Session:
+  do <commands>                  Execute multiple commands as a workflow
+  session                        List recent AI sessions
+  session <id>                   View session log
+  session --reconcile            Reconcile orphaned sessions
+
+Platform:
+  server                         Start MCP server
+  skills                         Print the embedded skill reference
 
 Quick Examples:
-  surf go "https://example.com"
-  surf read
-  surf click e5
-  surf type "hello" --submit
-  surf locate.role button --name "Submit" --action click
-  surf read --depth 3 --compact
-  surf emulate.device "iPhone 14"
-  surf window.new "https://example.com" && surf --window-id 123 go "https://other.com"
-
-AI Headless Mode:
-  ChatGPT (recommended — defeats Cloudflare/reCAPTCHA via CloakBrowser):
-    SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "prompt" --profile user@gmail.com
-    SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "prompt" --file code.ts --model gpt-5.4-pro
-    SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "prompt" --generate-image /tmp/out.png
-  Fallback (Bun.WebView):
-    SURF_USE_BUN_CHATGPT=1 surf chatgpt "prompt" --profile user@gmail.com
-
-  Gemini (headless, no extension needed):
-    SURF_USE_BUN_GEMINI=1 surf gemini "prompt" --profile user@gmail.com
-    SURF_USE_BUN_GEMINI=1 surf gemini "prompt" --file data.csv --model gemini-3-pro
-
-  ChatGPT models: instant (gpt-5.3), thinking (gpt-5.4), pro (gpt-5.4-pro)
-  Also accepts legacy aliases: gpt-4o → instant, o3/o4-mini → thinking, o1-pro → pro
+  surf chatgpt "review this PR" --file diff.patch --profile user@gmail.com
+  surf gemini "analyze this chart" --file chart.jpg --model gemini-3-pro --profile user@gmail.com
+  surf do 'chatgpt "Draft" --profile user@gmail.com | gemini "Tighten" --profile user@gmail.com'
 
 More Help:
-  surf --help-full           All commands
-  surf --help-topic <topic>  Topic guide (refs, semantic, frames, devices...)
+  surf --help-full           All headless commands
   surf <command> --help      Command details
-  surf --find <query>        Search for commands
-  surf --about <topic>       Learn about a topic
-  surf skills                Print the full agent skill reference (SKILL.md)
-  surf session               List recent AI sessions (~/.surf/sessions/)
-  surf session <id>          View session log (full stderr + result)
-  surf session --clear       Delete all sessions
+  surf --find <query>        Search supported commands
 `);
 };
 
 const showFullHelp = () => {
-  console.log(`surf v${VERSION} - Browser automation CLI
+  console.log(`surf v${VERSION} - Headless terminal AI CLI
 
 Usage: surf <command> [args] [options]
 
-`);
-  for (const [groupName, group] of Object.entries(TOOLS)) {
-    console.log(`${groupName.toUpperCase()} - ${group.desc}`);
-    for (const [cmd, info] of Object.entries(group.commands)) {
-      if (info.alias) continue;
-      const argStr = info.args?.length ? `<${info.args.join("> <")}>` : "";
-      const line = `  ${cmd} ${argStr}`.padEnd(32);
-      console.log(`${line}${info.desc}`);
-    }
-    console.log();
-  }
-  console.log(`Aliases: snap -> screenshot, read -> page.read, find -> search, go -> navigate
+AI - AI assistants (headless-only)
+  chatgpt <query>               Send prompt to ChatGPT
+  chatgpt.chats <conversation_id> Search conversations
+  chatgpt.reply <conversation_id> <prompt> Reply in-thread
+  gemini <query>                Send prompt to Gemini
 
-Options:
-  --tab-id <id>     Target specific tab
-  --window-id <id>  Target specific window (isolate from your browsing)
-  --json            Output raw JSON
-  --auto-capture    On error: capture screenshot + console to /tmp
-  --soft-fail       On error: warn and exit 0 (for non-critical commands)
+WORKFLOW
+  do <commands>                 Execute multiple commands
 
-Script Mode:
-  surf --script <file>     Run workflow from JSON
-  surf --script <file> --dry-run
+SESSIONS
+  session                       List/review/reconcile sessions
+
+MCP
+  server                        Start MCP server
+
+DOCS
+  skills                        Print embedded skill reference
 `);
 };
 
@@ -1776,18 +1918,16 @@ const showToolHelp = (toolName) => {
 const fuzzyFind = (query) => {
   const terms = query.toLowerCase().split(/\s+/);
   const results = [];
-  
-  for (const [groupName, group] of Object.entries(TOOLS)) {
-    for (const [cmd, info] of Object.entries(group.commands)) {
-      if (info.alias) continue;
-      const searchText = `${cmd} ${info.desc} ${groupName}`.toLowerCase();
-      const score = terms.filter(t => searchText.includes(t)).length;
-      if (score > 0) {
-        results.push({ cmd, desc: info.desc, group: groupName, score });
-      }
+
+  for (const cmd of HEADLESS_COMMAND_LIST) {
+    const desc = HEADLESS_COMMAND_HELP[cmd] || "";
+    const searchText = `${cmd} ${desc} headless ai`.toLowerCase();
+    const score = terms.filter((t) => searchText.includes(t)).length;
+    if (score > 0) {
+      results.push({ cmd, desc, group: "headless", score });
     }
   }
-  
+
   return results.sort((a, b) => b.score - a.score);
 };
 
@@ -1825,14 +1965,11 @@ const showAbout = (topic) => {
 
 const showAllTools = () => {
   console.log("\n  All available commands:\n");
-  const sorted = [...ALL_SOCKET_TOOLS].sort();
-  const cols = 4;
-  const width = 22;
-  for (let i = 0; i < sorted.length; i += cols) {
-    const row = sorted.slice(i, i + cols).map(t => t.padEnd(width)).join("");
-    console.log("  " + row);
+  const sorted = [...HEADLESS_COMMAND_LIST].sort();
+  for (const cmd of sorted) {
+    console.log(`  ${cmd.padEnd(24)} ${HEADLESS_COMMAND_HELP[cmd] || ""}`);
   }
-  console.log(`\n  Total: ${ALL_SOCKET_TOOLS.length} commands\n`);
+  console.log(`\n  Total: ${HEADLESS_COMMAND_LIST.length} commands\n`);
 };
 
 const showSessionHelp = () => {
@@ -1909,20 +2046,7 @@ if (args[0] === "server") {
 }
 
 if (args[0] === "skills" || args[0] === "skill") {
-  const fs = require("fs");
-  // Search order: npm package skills dir, then symlinked agent skill
-  const candidatePaths = [
-    path.resolve(__dirname, "../skills/surf/SKILL.md"),
-    path.join(os.homedir(), ".pi", "agent", "skills", "surf", "SKILL.md"),
-    path.join(os.homedir(), ".agents", "skills", "surf", "SKILL.md"),
-  ];
-  const skillPath = candidatePaths.find(p => fs.existsSync(p));
-  if (!skillPath) {
-    console.error("SKILL.md not found. Expected at: " + candidatePaths[0]);
-    console.error("To install: ln -s \"$(npm root -g)/surf-cli/skills/surf\" ~/.agents/skills/surf");
-    process.exit(1);
-  }
-  process.stdout.write(fs.readFileSync(skillPath, "utf-8"));
+  process.stdout.write(SURF_SKILL_DOC);
   process.exit(0);
 }
 
@@ -3522,24 +3646,10 @@ const requestedProfile = (() => {
   return undefined;
 })();
 
-// Bun-only ChatGPT features: --file, --generate-image, --profile
+// Retained for legacy Bun fallback block below (currently unreachable in headless-only mode).
 const hasBunOnlyChatGPTFeature = !!(
   toolArgs.file || toolArgs["generate-image"] || requestedProfile
 );
-
-// CloakBrowser check (defined here to avoid TDZ issues)
-const shouldUseCloakChatGPT = () => process.env.SURF_USE_CLOAK_CHATGPT === "1";
-
-if (tool === "chatgpt" && hasBunOnlyChatGPTFeature && !shouldUseBunChatGPT(process.env) && !shouldUseCloakChatGPT()) {
-  // Bun-only feature requested but env flag not set — fail fast
-  const features = [
-    toolArgs.file && "--file",
-    toolArgs["generate-image"] && "--generate-image",
-    requestedProfile && "--profile",
-  ].filter(Boolean).join(", ");
-  console.error(`Error: ${features} requires headless mode (set SURF_USE_CLOAK_CHATGPT=1 or SURF_USE_BUN_CHATGPT=1)`);
-  process.exit(1);
-}
 
 if ((tool === "chatgpt" || CHATGPT_CLOAK_ONLY_TOOLS.has(tool)) && requestedProfile) {
   if (process.platform !== "darwin") {
@@ -3552,17 +3662,11 @@ if ((tool === "chatgpt" || CHATGPT_CLOAK_ONLY_TOOLS.has(tool)) && requestedProfi
   }
 }
 
-if (CHATGPT_CLOAK_ONLY_TOOLS.has(tool) && !shouldUseCloakChatGPT()) {
-  console.error("Error: this command requires CloakBrowser mode (set SURF_USE_CLOAK_CHATGPT=1)");
-  process.exit(1);
-}
-
 // ---------------------------------------------------------------------------
-// CloakBrowser ChatGPT path (opt-in via SURF_USE_CLOAK_CHATGPT=1)
-// Premium stealth: C++ patches, human-like behavior, defeats detection
+// CloakBrowser ChatGPT path (default)
 // ---------------------------------------------------------------------------
 
-if (tool === "chatgpt" && shouldUseCloakChatGPT()) {
+if (tool === "chatgpt") {
   (async () => {
     if (requestedProfile) toolArgs.profile = requestedProfile;
     if (toolArgs["generate-image"]) toolArgs.generateImage = toolArgs["generate-image"];
@@ -3799,7 +3903,7 @@ if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
 }
 
 // ---------------------------------------------------------------------------
-// Bun-native Gemini path (opt-in via SURF_USE_BUN_GEMINI=1)
+// Bun-native Gemini path (default)
 // ---------------------------------------------------------------------------
 
 if (tool === "gemini" && requestedProfile) {
@@ -3808,17 +3912,13 @@ if (tool === "gemini" && requestedProfile) {
     console.error("Error: --profile is only supported on macOS");
     process.exit(1);
   }
-  if (!shouldUseBunGemini(process.env)) {
-    console.error("Error: --profile requires Bun Gemini (set SURF_USE_BUN_GEMINI=1)");
-    process.exit(1);
-  }
   if (toolArgs["with-page"] || toolArgs.withPage) {
     console.error("Error: --profile cannot be used with --with-page");
     process.exit(1);
   }
 }
 
-if (tool === "gemini" && shouldUseBunGemini(process.env)) {
+if (tool === "gemini") {
   const eligibility = isBunGeminiEligible(toolArgs);
   if (eligibility.eligible) {
     // Pass profile into the toolArgs for the bridge

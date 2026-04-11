@@ -8,9 +8,9 @@ test_output() {
   local name="$1"
   local cmd="$2"
   local expect="$3"
-  
+
   output=$(eval "$cmd" 2>&1) || true
-  if echo "$output" | grep -q "$expect"; then
+  if echo "$output" | grep -q -- "$expect"; then
     echo "PASS: $name"
     PASS=$((PASS + 1))
   else
@@ -22,94 +22,78 @@ test_output() {
   fi
 }
 
-test_exit_code() {
+test_no_output() {
   local name="$1"
   local cmd="$2"
-  local expect_code="$3"
-  
-  eval "$cmd" > /dev/null 2>&1
-  actual_code=$?
-  if [ "$actual_code" -eq "$expect_code" ]; then
-    echo "PASS: $name"
-    PASS=$((PASS + 1))
-  else
+  local unexpected="$3"
+
+  output=$(eval "$cmd" 2>&1) || true
+  if echo "$output" | grep -q -- "$unexpected"; then
     echo "FAIL: $name"
     echo "  Command: $cmd"
-    echo "  Expected exit code: $expect_code"
-    echo "  Got: $actual_code"
+    echo "  Unexpected: $unexpected"
+    echo "  Got: $output"
     FAIL=$((FAIL + 1))
+  else
+    echo "PASS: $name"
+    PASS=$((PASS + 1))
   fi
 }
 
-echo "=== CLI Unit Tests (no extension required) ==="
+echo "=== CLI Unit Tests (headless-only) ==="
 echo ""
 
 echo "-- Version and Help --"
 test_output "version flag" "node cli.cjs --version" "surf version"
 test_output "version short" "node cli.cjs -v" "surf version"
-test_output "basic help" "node cli.cjs --help" "Common Commands"
-test_output "full help" "node cli.cjs --help-full" "Aliases:"
-test_output "help topic refs" "node cli.cjs --help-topic refs" "Element References"
-test_output "help topic selectors" "node cli.cjs --help-topic selectors" "CSS Selectors"
-test_output "help topic cookies" "node cli.cjs --help-topic cookies" "Cookie Management"
+test_output "basic help" "node cli.cjs --help" "Headless terminal AI CLI"
+test_output "basic help AI commands" "node cli.cjs --help" "AI Commands (headless-only)"
+test_output "full help chatgpt" "node cli.cjs --help-full" "chatgpt"
+test_output "full help gemini" "node cli.cjs --help-full" "gemini"
+test_output "full help session" "node cli.cjs --help-full" "session"
+test_output "full help workflow" "node cli.cjs --help-full" "do"
+test_output "full help mcp" "node cli.cjs --help-full" "server"
+test_no_output "full help omits screenshot" "node cli.cjs --help-full" "screenshot"
 
 echo ""
-echo "-- Migration Hints --"
-test_output "removed read_page" "node cli.cjs read_page" "Use: page.read"
-test_output "removed list_tabs" "node cli.cjs list_tabs" "Use: tab.list"
-test_output "removed wait_for_element" "node cli.cjs wait_for_element" "Use: wait.element"
-test_output "removed javascript_tool" "node cli.cjs javascript_tool" "Use: js"
+echo "-- Supported Command Discovery --"
+test_output "list shows chatgpt" "node cli.cjs --list" "chatgpt"
+test_output "list shows gemini" "node cli.cjs --list" "gemini"
+test_output "list shows session" "node cli.cjs --list" "session"
+test_output "list shows do" "node cli.cjs --list" "do"
+test_output "list shows server" "node cli.cjs --list" "server"
+test_no_output "list omits screenshot" "node cli.cjs --list" "screenshot"
+test_no_output "list omits tab.list" "node cli.cjs --list" "tab.list"
+test_output "find chatgpt" "node cli.cjs --find chatgpt" "chatgpt"
+test_output "find gemini" "node cli.cjs --find gemini" "gemini"
+test_output "find session" "node cli.cjs --find session" "session"
+test_output "find old screenshot empty" "node cli.cjs --find screenshot" "No commands found"
 
 echo ""
-echo "-- Aliases --"
-test_output "snap help" "node cli.cjs snap --help" "snap -> screenshot"
-test_output "read help" "node cli.cjs read --help" "accessibility tree"
-test_output "find help" "node cli.cjs find --help" "search"
-test_output "go help" "node cli.cjs go --help" "URL"
+echo "-- Skill Command --"
+test_output "skills prints frontmatter" "node cli.cjs skills" "name: surf"
+test_output "skill alias works" "node cli.cjs skill" "Headless terminal AI via local signed-in browser profiles"
+test_output "skills version current" "node cli.cjs skills" "surf-cli v2.11.1"
+test_output "skills chatgpt aliases current" "node cli.cjs skills" "gpt-4.1-mini"
+test_output "skills gemini preview current" "node cli.cjs skills" "gemini-3.1-pro-preview"
+test_no_output "skills no missing file error" "node cli.cjs skills" "SKILL.md not found"
 
 echo ""
-echo "-- Find Command --"
-test_output "find screenshot" "node cli.cjs --find screenshot" "screenshot"
-test_output "find cookie" "node cli.cjs --find cookie" "cookie"
-test_output "find wait" "node cli.cjs --find wait" "wait"
-
-echo ""
-echo "-- About Command --"
-test_output "about refs" "node cli.cjs --about refs" "Element References"
-test_output "about cookies" "node cli.cjs --about cookies" "Cookie Management"
-test_output "about tab" "node cli.cjs --about tab" "Tab management"
-
-echo ""
-echo "-- Group Help --"
-test_output "tab group help" "node cli.cjs tab" "tab.list"
-test_output "cookie group help" "node cli.cjs cookie" "cookie.list"
-test_output "scroll group help" "node cli.cjs scroll" "scroll.top"
-
-echo ""
-echo "-- Command Help with Examples --"
-test_output "click help examples" "node cli.cjs click --help" "Examples"
-test_output "type help examples" "node cli.cjs type --help" "Examples"
-test_output "screenshot help examples" "node cli.cjs screenshot --help" "Examples"
-test_output "session help" "node cli.cjs session --help" "inspect and reconcile"
+echo "-- Command Help --"
+test_output "chatgpt help" "node cli.cjs chatgpt --help" "Send prompt to ChatGPT"
+test_output "gemini help" "node cli.cjs gemini --help" "Send prompt to Gemini"
 test_output "chatgpt.chats help" "node cli.cjs chatgpt.chats --help" "Search conversations"
 test_output "chatgpt.reply help" "node cli.cjs chatgpt.reply --help" "Reply in-thread"
-
-echo ""
-echo "-- New Commands in Help --"
-test_output "back in help" "node cli.cjs --help-full" "back"
-test_output "forward in help" "node cli.cjs --help-full" "forward"
-test_output "zoom in help" "node cli.cjs --help-full" "zoom"
-test_output "bookmark in help" "node cli.cjs --help-full" "bookmark"
-test_output "history in help" "node cli.cjs --help-full" "history"
+test_output "session help" "node cli.cjs session --help" "inspect and reconcile"
+test_output "do help" "node cli.cjs do --help" "Execute multiple commands"
 
 echo ""
 echo "-- ChatGPT Chats Validation --"
-test_output "chatgpt.chats cloak hint" "node cli.cjs chatgpt.chats" "requires CloakBrowser mode"
-test_output "chatgpt.chats invalid combo" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --search test" "cannot use conversation ID with --search"
-test_output "chatgpt.chats all+limit invalid" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats --all --limit 5" "cannot be combined with --limit"
-test_output "chatgpt.chats advanced conflict" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --rename 'New Title' --delete" "use only one of --rename, --delete, --delete-ids, or --download-file"
-test_output "chatgpt.chats download requires output" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.chats abc --download-file file-123" "requires --output"
-test_output "chatgpt.reply usage" "SURF_USE_CLOAK_CHATGPT=1 node cli.cjs chatgpt.reply" "Usage: surf chatgpt.reply"
+test_output "chatgpt.chats invalid combo" "node cli.cjs chatgpt.chats abc --search test" "cannot use conversation ID with --search"
+test_output "chatgpt.chats all+limit invalid" "node cli.cjs chatgpt.chats --all --limit 5" "cannot be combined with --limit"
+test_output "chatgpt.chats advanced conflict" "node cli.cjs chatgpt.chats abc --rename 'New Title' --delete" "use only one of --rename, --delete, --delete-ids, or --download-file"
+test_output "chatgpt.chats download requires output" "node cli.cjs chatgpt.chats abc --download-file file-123" "requires --output"
+test_output "chatgpt.reply usage" "node cli.cjs chatgpt.reply" "Usage: surf chatgpt.reply"
 
 echo ""
 echo "-- Session Reconcile --"
@@ -146,21 +130,14 @@ rm -rf "$tmp_sessions"
 
 echo ""
 echo "-- Prompt File --"
-# --prompt-file with missing file should error
 test_output "prompt-file missing file" \
   "node cli.cjs chatgpt --prompt-file /tmp/nonexistent_prompt_$$.md 2>&1 || true" \
   "Failed to read prompt file"
-# --prompt-file with empty file should error
 empty_prompt=$(mktemp)
 test_output "prompt-file empty" \
   "node cli.cjs chatgpt --prompt-file $empty_prompt 2>&1 || true" \
   "prompt file is empty"
 rm -f "$empty_prompt"
-
-echo ""
-echo "-- List Command --"
-test_output "list shows new commands" "node cli.cjs --list" "back"
-test_output "list shows zoom" "node cli.cjs --list" "zoom"
 
 echo ""
 echo "==================================="

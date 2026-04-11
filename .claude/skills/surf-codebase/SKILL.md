@@ -1,105 +1,65 @@
 ---
 name: surf-codebase
-description: Navigate and modify surf-cli codebase - Chrome extension + native host for AI browser automation. Use for surf-cli code work, architecture questions, implementing browser control/CDP/accessibility/network features.
+description: Navigate and modify the headless-only surf-cli codebase for ChatGPT/Gemini terminal AI workflows.
 ---
 
 # surf-cli Codebase
 
 ## Architecture
+
+```text
+native/cli.cjs → provider bridge → headless worker → provider website
+                 ├─ ChatGPT: CloakBrowser
+                 └─ Gemini: Bun WebView
 ```
-cli.cjs --socket:/tmp/surf.sock--> host.cjs --native-msg--> service-worker/index.ts --CDP/chrome-APIs--> browser
-```
 
-## Add CLI Command
+## Core files
 
-1. Add to `TOOLS` in native/cli.cjs:158 (args, opts, examples)
-2. Add handler in src/service-worker/index.ts:50 `handleMessage()` switch
-3. CDP op? → add method src/cdp/controller.ts:60
-4. DOM interaction? → add handler src/content/accessibility-tree.ts:99
+**native/cli.cjs** - CLI parser, help text, session wiring, direct provider routing.
 
-## Add CDP Operation
+**native/chatgpt-cloak-bridge.cjs** - Spawns ChatGPT Cloak workers and manages JSON-line protocol.
 
-1. Add method to `CDPController` class src/cdp/controller.ts:60
-2. Use `this.send(tabId, "Domain.method", params)`
-3. Handle events in `handleCDPEvent()` if needed
+**native/chatgpt-cloak-worker.mjs** - ChatGPT prompt/file/image flow in CloakBrowser.
 
-## Core Files
+**native/chatgpt-cloak-chats-worker.mjs** - ChatGPT conversation list/search/view/export/reply/manage flow.
 
-**src/service-worker/index.ts** (~2500L) - Central msg router, CDP ops, screenshot cache, tab registry
-- Msg types: EXECUTE_CLICK, EXECUTE_TYPE, READ_PAGE, EXECUTE_SCREENSHOT
-- Screenshot cache: generateScreenshotId(), cacheScreenshot(), getScreenshot()
-- Tab names: tabNameRegistry Map<name,tabId>
+**native/gemini-bun-bridge.cjs** - Spawns Gemini Bun worker and handles worker protocol.
 
-**src/cdp/controller.ts** (~1000L) - CDP wrapper, CDPController class
-- Mouse: click(), rightClick(), doubleClick(), hover(), drag()
-- Keyboard: type(), pressKey(), pressKeyChord()
-- Screenshots: captureScreenshot(), captureRegion()
-- Network/Console: enableNetworkTracking(), getNetworkRequests(), getResponseBody(), subscribeToNetwork(), enableConsoleTracking(), getConsoleMessages()
-- Emulation: emulateNetwork(), emulateCPU(), emulateGeolocation()
+**native/gemini-bun-worker.ts** - Gemini prompt/file/video/image/edit flow in Bun WebView.
 
-**src/content/accessibility-tree.ts** (~1900L) - Content script, generates a11y tree YAML, element interactions
-- Handlers: GENERATE_ACCESSIBILITY_TREE, CLICK_ELEMENT, FORM_INPUT, GET_ELEMENT_COORDINATES, WAIT_FOR_ELEMENT, WAIT_FOR_URL
-- Element refs: e1, e2... in window.__piRefs for stable references
+**native/headless-command-runner.cjs** - Shared CLI subprocess runner for `surf do` and MCP tools.
 
-**native/cli.cjs** (~2100L) - CLI parser, socket client
-- TOOLS: command defs with args/opts
-- ALIASES: shortcut→command map
-- AUTO_SCREENSHOT_TOOLS: commands that auto-capture
-- parseArgs(), sendRequest()
+**native/do-parser.cjs / native/do-executor.cjs** - Headless AI workflow parsing/execution.
 
-**native/host.cjs** (~2100L) - Socket server, AI integration
-- handleToolRequest(): main dispatcher
-- mapToolToMessage(): tool→extension msg converter
-- queueAiRequest(): AI request serialization
-- AI clients: chatgptClient, geminiClient, perplexityClient
+**native/mcp-server.cjs** - Stdio MCP server exposing supported headless AI tools.
 
-**src/native/port-manager.ts** - Extension↔native messaging, auto-reconnect, request/response tracking
+**native/session-store.cjs / native/session-reconciler.cjs** - AI session logs and reconciliation.
 
-## Message Flow
+## Add a CLI option
 
-1. CLI: `surf click e5`
-2. cli.cjs parses → socket → host.cjs
-3. host.cjs routes to EXECUTE_CLICK msg
-4. Native msg → service-worker/index.ts
-5. Service worker: CDP (cdp/controller.ts) or content script (chrome.tabs.sendMessage)
-6. Response flows back to CLI
+1. Read the relevant provider bridge/worker first.
+2. Add help text in `native/cli.cjs`.
+3. Thread parsed args into the bridge request.
+4. Add focused unit tests for parser/bridge behavior.
+5. Run `npm test`, `npm run check`, and `bash native/tests/cli-tests.sh`.
+
+## Add a workflow/MCP-supported option
+
+1. Update `native/headless-command-runner.cjs` arg building if the option name needs normalization.
+2. Update `native/mcp-server.cjs` schema if MCP should expose it.
+3. Add/adjust unit tests.
 
 ## Debug
 
-- Extension logs: chrome://extensions → Service Worker → Console
-- Host logs: /tmp/surf-host.log
-- CLI raw output: `--json` flag
+- CLI JSON: pass `--json` where supported.
+- Session logs: `surf session <id>`.
+- Recent sessions: `surf session --all`.
+- Reconcile: `surf session --reconcile --network`.
 
 ## Test
 
 ```bash
-npm run build            # Build ext
-npm test                 # Run tests
-npm run test:coverage    # Coverage
+npm test
+npm run check
+bash native/tests/cli-tests.sh
 ```
-
-## Element Refs
-
-A11y tree assigns e1, e2... during READ_PAGE. Stored window.__piRefs. Reset each `read` command.
-
-## Network Capture
-
-- CDP captures via Network.* events cdp/controller.ts:73
-- Storage: /tmp/surf/requests.jsonl
-- Formatters: native/formatters/network.cjs:259
-
-## Build/Install
-
-```bash
-npm run dev              # Watch mode
-npm run build            # Prod → dist/
-# Load dist/ as unpacked ext
-surf install <ext-id>    # Register native host
-```
-
-## Gotchas
-
-- CDP attach: 100-500ms first time/tab
-- chrome:// pages restricted
-- Content script needs page refresh on existing tabs
-- Screenshots auto-resize 1200px unless --full

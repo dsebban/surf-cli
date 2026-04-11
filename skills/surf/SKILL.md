@@ -1,263 +1,144 @@
 ---
 name: surf
-description: Control Chrome browser via CLI for testing, automation, debugging, and browser-session AI. Use for real browser interaction, screenshots, DOM inspection, file upload, and especially headless ChatGPT/Gemini workflows.
+description: Run the headless-only surf CLI for ChatGPT and Gemini terminal workflows.
 ---
 
 # Surf
 
-Real Chrome-family browser control via CLI / native host / extension.
-Prefer real browser state over guessed APIs.
+Headless terminal AI via local signed-in browser profiles.
+Prefer real CLI execution over guessed provider APIs.
 
 Repo + local CLI verified against **surf-cli v2.11.1**.
 
 ## Use when
 
-- real browser interaction needed
-- screenshots / DOM / console / network capture
-- form fill / upload / waits / iframe work
-- browser-session AI via ChatGPT / Gemini / AI Studio / Perplexity / Grok
+- ChatGPT prompts, file review, prompt-file runs, image generation
+- Gemini prompts, file/video analysis, image generation/editing
+- ChatGPT conversation list/search/view/export/reply/manage flows
+- Long-running browser-session AI from shell, tmux, or agent workflows
+
+## Defaults
+
+- Headless-only CLI.
+- ChatGPT uses CloakBrowser headless by default.
+- Gemini uses Bun WebView headless by default.
+- Default profile on macOS: `dsebban883@gmail.com` unless the user asks for another account.
+- Use `--profile dsebban883@gmail.com` for reliable auth and file/image/chats features.
 
 ## Sanity check
 
-Always use Surf to discover live paths.
-
 ```bash
-surf extension-path
-surf install <extension-id>
-surf tab.list
+surf --version
+surf --help
+surf chatgpt.chats --limit 1 --profile dsebban883@gmail.com
 ```
 
-If commands break after upgrade:
-1. reload unpacked extension from `surf extension-path`
-2. rerun `surf install <extension-id>`
-3. restart Chrome fully
-
-## Core browser loop
+## ChatGPT
 
 ```bash
-surf go "https://example.com"
-surf read
-surf click e5
-surf type "hello"
-surf snap
+surf chatgpt "explain this code" --profile dsebban883@gmail.com
+surf chatgpt "review this PR" --file diff.patch --profile dsebban883@gmail.com
+surf chatgpt --prompt-file prompt.md --model gpt-5.4-pro --profile dsebban883@gmail.com
+surf chatgpt "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
+surf chatgpt "deep analysis" --model gpt-5.4-pro --profile dsebban883@gmail.com
 ```
 
-Aliases:
-
-```bash
-surf read   # page.read
-surf snap   # screenshot
-surf go     # navigate
-surf find   # search
-```
-
-## High-signal primitives
-
-```bash
-surf read --depth 3 --compact
-surf page.state
-surf console
-surf network
-surf locate.role button --name "Submit" --action click
-surf locate.label "Email" --action fill --value "test@example.com"
-surf wait.element ".loaded"
-surf snap --output /tmp/shot.png
-surf upload --ref e5 --files "/path/to/file.txt"
-surf js "return document.title"
-```
-
-## ChatGPT — headless first
-
-**Default to CloakBrowser headless.**
-Always set `SURF_USE_CLOAK_CHATGPT=1`.
-**Default profile on macOS: `dsebban883@gmail.com`.** Use that `--profile` by default unless the user asks for another account.
-Use `--profile dsebban883@gmail.com` for reliable auth and for file / image / chats features.
-
-```bash
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "explain this code" --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "review this PR" --file diff.patch --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt --prompt-file prompt.md --model gpt-5.4-pro --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "deep analysis" --model gpt-5.4-pro --profile dsebban883@gmail.com
-```
-
-**`--prompt-file`** reads a file as the prompt text (for large exported contexts). Unlike `--file` which uploads as an attachment.
-For large exports, prefer `--prompt-file` so the worker verifies the actual latest user turn instead of accepting a pasted-file placeholder.
+`--prompt-file` reads the file as prompt text. Use it for large exported contexts. `--file` uploads as an attachment.
 
 ### ChatGPT model aliases
 
-- `instant`, `gpt-5.3`, `gpt-4o` → GPT-5.3 Instant
+- `instant`, `gpt-5.3`, `gpt-4o`, `gpt-4.1`, `gpt-4.1-mini` → GPT-5.3 Instant
 - `thinking`, `gpt-5.4-thinking`, `o3`, `o4-mini` → GPT-5.4 Thinking
-- `pro`, `gpt-5.4-pro`, `o1-pro` → GPT-5.4 Pro
+- `pro`, `gpt-5.4-pro`, `chatgpt-pro`, `o1-pro` → GPT-5.4 Pro
 
-### ChatGPT conversations
-
-These are **Cloak-only** commands.
+## ChatGPT conversations
 
 ```bash
-# list / search
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats --limit 20 --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats --search "auth system" --profile dsebban883@gmail.com
-
-# view / export
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats <conversation-id> --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats <conversation-id> --export /tmp/chat.md --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats <conversation-id> --export /tmp/chat.json --format json --json --profile dsebban883@gmail.com
-
-# reply / manage
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.reply <conversation-id> "follow-up" --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats <conversation-id> --rename "New Title" --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats <conversation-id> --delete --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats <conversation-id> --download-file <file-id> --output /tmp/file.txt --profile dsebban883@gmail.com
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats --limit 1 --json --continue --profile dsebban883@gmail.com
+surf chatgpt.chats --limit 20 --profile dsebban883@gmail.com
+surf chatgpt.chats --search "auth system" --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --export /tmp/chat.md --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --export /tmp/chat.json --format json --json --profile dsebban883@gmail.com
+surf chatgpt.reply <conversation-id> "follow-up" --profile dsebban883@gmail.com
+surf chatgpt.reply <conversation-id> --prompt-file followup.md --model gpt-5.4-thinking --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --rename "New Title" --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --delete --profile dsebban883@gmail.com
+surf chatgpt.chats <conversation-id> --download-file <file-id> --output /tmp/file.txt --profile dsebban883@gmail.com
 ```
 
 Notes:
-- `--continue` runs headed CloakBrowser for that command
-- `--delete` is destructive; no CLI undo
-- search may use a recent-history fallback; if JSON shows `partial: true`, misses are **not authoritative** for older chats
-- `--download-file` needs `--output`
+- `--delete` is destructive; no CLI undo.
+- Search may use a recent-history fallback; if JSON shows `partial: true`, misses are not authoritative for older chats.
+- `--download-file` needs `--output`.
 
-### ChatGPT thinking trace
+## ChatGPT thinking trace
 
-Pro/Thinking models stream live thinking content via `🧠` lines:
+Pro/Thinking models stream live thinking content via `🧠` lines.
 
 ```bash
-# Thinking trace shows during generation
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "complex problem" --model gpt-5.4-pro --profile dsebban883@gmail.com
-# Output:
-# [cloak-chatgpt] ⏳ Thinking
-# [cloak-chatgpt] 🧠 The user wants me to analyze the trade setup...
-# [cloak-chatgpt] 🧠 Looking at the volume profile and price action...
-# [cloak-chatgpt] ⏳ Responding
+surf chatgpt "complex problem" --model gpt-5.4-pro --profile dsebban883@gmail.com
 ```
 
-### ChatGPT constraints
-
-- `--profile` macOS only
-- `--profile` incompatible with `--with-page`
-- `--file` / `--generate-image` / `--profile` require headless
-- default timeout: **2700s**
-
-### Long-running ChatGPT runs
-
-Use tmux for long-think models.
-If a run dies after send or status looks uncertain, check `surf session <id>` then `surf session --reconcile --network` to confirm whether ChatGPT persisted the turn.
+## Gemini
 
 ```bash
-tmux new -d -s surf-chat "bash -lc 'SURF_USE_CLOAK_CHATGPT=1 surf chatgpt \"complex analysis\" --model gpt-5.4-pro --profile dsebban883@gmail.com --timeout 3000 2>&1 | tee /tmp/surf-chatgpt.log'"
-tail -f /tmp/surf-chatgpt.log
-```
-
-### Legacy fallback
-
-Only if headless is unavailable:
-
-```bash
-surf chatgpt "explain this code"
-surf chatgpt "summarize" --with-page
-```
-
-## Gemini — headless first
-
-**Default to Bun headless Gemini.**
-**Default profile on macOS: `dsebban883@gmail.com`.** Use that `--profile` by default unless the user asks for another account.
-Always use `SURF_USE_BUN_GEMINI=1` with `--profile dsebban883@gmail.com`.
-This path is faster, cleaner, and avoids tab pollution.
-
-```bash
-SURF_USE_BUN_GEMINI=1 surf gemini "explain quantum computing" --profile dsebban883@gmail.com
-SURF_USE_BUN_GEMINI=1 surf gemini "analyze this chart" --file chart.jpg --profile dsebban883@gmail.com
-SURF_USE_BUN_GEMINI=1 surf gemini "summarize this video" --youtube "https://youtube.com/..." --profile dsebban883@gmail.com
-```
-
-### Gemini image workflows
-
-```bash
-SURF_USE_BUN_GEMINI=1 surf gemini "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
-SURF_USE_BUN_GEMINI=1 surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9 --profile dsebban883@gmail.com
-SURF_USE_BUN_GEMINI=1 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile dsebban883@gmail.com
+surf gemini "explain quantum computing" --profile dsebban883@gmail.com
+surf gemini "analyze this chart" --file chart.jpg --model gemini-3-pro --profile dsebban883@gmail.com
+surf gemini "reason about this architecture" --model gemini-3.1-pro-preview --profile dsebban883@gmail.com
+surf gemini "summarize this video" --youtube "https://youtube.com/..." --profile dsebban883@gmail.com
+surf gemini "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
+surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9 --profile dsebban883@gmail.com
+surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile dsebban883@gmail.com
 ```
 
 ### Gemini model notes
 
-Local help lists:
+Default/listed models:
+
 - `gemini-3-pro` default
 - `gemini-2.5-pro`
 - `gemini-2.5-flash`
 
-Also works:
+Gemini UI selection also accepts best-effort mode IDs when available:
+
 - `gemini-3.1-pro-preview`
-
-Use `gemini-3.1-pro-preview` for strongest reasoning / image analysis.
-
-### Gemini fallback
-
-Only if headless is unavailable:
-
-```bash
-surf gemini "explain quantum computing"
-surf gemini "summarize" --with-page
-```
-
-## AI Studio
-
-Use when you need latest Gemini model ids and AI Studio-specific behavior.
-
-```bash
-surf aistudio "review this architecture" --model gemini-3.1-pro-preview
-surf aistudio "summarize this page" --with-page --model gemini-3.1-flash-lite-preview
-```
-
-Preferred ids:
-- `gemini-3.1-pro-preview`
+- `gemini-3.1-pro`
+- `gemini-3.1-thinking`
+- `gemini-3.1-flash`
 - `gemini-3.1-flash-lite-preview`
-- `gemini-3.1-flash-image-preview`
 
-## Sessions & Reconciliation
+Use `gemini-3.1-pro-preview` for strongest reasoning/image analysis when the account UI exposes it. Unknown Gemini model names are passed through to the UI picker best-effort.
 
-Every surf command creates a session in `~/.surf/sessions/`.
+## Workflows
 
 ```bash
-# List sessions
-surf session                    # last 72h
-surf session --hours 1          # last 1h
-surf session --all              # everything
-
-# View session detail
-surf session <session-id>
-
-# Reconcile orphaned sessions (auto-runs on list, or explicit)
-surf session --reconcile              # local PID check only
-surf session --reconcile --network    # + poll ChatGPT API for conversation status
-surf session --reconcile --all        # include old sessions
-
-# Clean up old sessions
-surf session --clear --hours 48       # delete sessions older than 48h
-surf session --clear --all            # delete all
+surf do 'chatgpt "Draft release notes" --profile dsebban883@gmail.com | gemini "Make it concise" --profile dsebban883@gmail.com'
+surf do 'chatgpt "Review this" --file diff.patch --profile dsebban883@gmail.com' --dry-run
 ```
 
-### Session status labels
+## Sessions & reconciliation
 
-| Label | Meaning |
-|-------|--------|
-| `✓ completed` | Finished successfully |
-| `✗ error` | Failed (timeout, crash, etc.) |
-| `✗ orphaned` | Worker died without completing — auto-detected by reconciler |
-| `! stale` | PID alive but session > 4h — annotated, not killed |
-| `◌ running` | Active session |
-| `? running` | Network poll says conversation still in progress |
-| `✓ recovered` | Reconciler confirmed conversation completed on ChatGPT side |
+Every surf AI command creates a session in `~/.surf/sessions/`.
 
-Reconciler stores `pid` in session metadata. On list, auto-checks if PID is alive. Dead PID → orphaned. Alive PID → never mutated (even if old).
+```bash
+surf session
+surf session <id>
+surf session --reconcile
+surf session --reconcile --network
+```
 
-## Practical rules
+For long runs, use tmux:
 
-- prefer headless for ChatGPT and Gemini
-- default macOS profile: `dsebban883@gmail.com` unless user asks otherwise
-- always use profile-based auth when available
-- use tmux for long jobs
-- treat browser-session AI as UI automation: poll logs, expect latency, verify outputs
-- for ChatGPT search, JSON `partial: true` means recent-window fallback only
-- use `surf session` to check status of long-running jobs
-- `surf session --reconcile` fixes orphaned sessions automatically
+```bash
+tmux new -d -s surf-chat "bash -lc 'surf chatgpt \"complex analysis\" --model gpt-5.4-pro --profile dsebban883@gmail.com --timeout 3000 2>&1 | tee /tmp/surf-chatgpt.log'"
+tail -f /tmp/surf-chatgpt.log
+```
+
+## Troubleshooting
+
+- `--profile` is macOS-only.
+- `--with-page` is not supported.
+- Page-context/browser-extension commands were removed.
+- Default ChatGPT timeout: **2700s**.
+- If auth fails, sign in with the same local profile and retry.
+- Use `surf session <id>` to inspect stderr/result details.
