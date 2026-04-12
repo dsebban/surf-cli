@@ -34,6 +34,7 @@ const CHATGPT_COOKIE_DOMAINS = [
 ];
 
 const REQUIRED_SESSION_COOKIE = '__Secure-next-auth.session-token';
+const SESSION_COOKIE_CHUNKED_RE = /^__Secure-next-auth\.session-token(\.\d+)?$/;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -186,7 +187,7 @@ export async function loadAndInjectChatgptCookies(context, opts = {}) {
   }
 
   // 4. Verify required session cookie present
-  const hasSession = cookies.some(c => c.name === REQUIRED_SESSION_COOKIE);
+  const hasSession = cookies.some(c => SESSION_COOKIE_CHUNKED_RE.test(c.name));
   if (!hasSession) {
     throw Object.assign(
       new Error(
@@ -209,9 +210,10 @@ export async function loadAndInjectChatgptCookies(context, opts = {}) {
     'https://auth0.openai.com/',
   ]);
   const injectedNames = new Set(injected.map(c => c.name));
-  if (!injectedNames.has(REQUIRED_SESSION_COOKIE)) {
+  const hasInjectedSession = injected.some(c => SESSION_COOKIE_CHUNKED_RE.test(c.name));
+  if (!hasInjectedSession) {
     throw Object.assign(
-      new Error(`Cookie injection verification failed. Missing: ${REQUIRED_SESSION_COOKIE}`),
+      new Error(`Cookie injection verification failed. Missing: ${REQUIRED_SESSION_COOKIE} (or chunked variant)`),
       { code: 'cookie_injection_failed' }
     );
   }
