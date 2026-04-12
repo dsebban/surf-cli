@@ -33,7 +33,9 @@ describe("mcp-server headless tool surface", () => {
   });
 
   it("preserves provider metadata alongside response text", () => {
-    const formatted = formatResultPayload({ result: { response: "ok", model: "gpt", conversationId: "abc" } });
+    const formatted = formatResultPayload({
+      result: { response: "ok", model: "gpt", conversationId: "abc" },
+    });
     expect(formatted.content[0].text).toBe("ok");
     expect(formatted.content[1].text).toContain('"conversationId"');
   });
@@ -69,11 +71,15 @@ describe("mcp-server headless tool surface", () => {
   });
 
   it("accepts prompt-file-only ChatGPT reply MCP args", () => {
-    expect(() => validateMcpArgs("chatgpt.reply", { conversationId: "abc", promptFile: "reply.md" })).not.toThrow();
+    expect(() =>
+      validateMcpArgs("chatgpt.reply", { conversationId: "abc", promptFile: "reply.md" }),
+    ).not.toThrow();
   });
 
   it("rejects ChatGPT MCP args without prompt input", () => {
-    expect(() => validateMcpArgs("chatgpt", { model: "pro" })).toThrow("requires prompt or promptFile");
+    expect(() => validateMcpArgs("chatgpt", { model: "pro" })).toThrow(
+      "requires prompt or promptFile",
+    );
   });
 
   it("does not mutate MCP args during normalization", () => {
@@ -117,10 +123,14 @@ describe("mcp-server headless tool surface", () => {
 
   it("passes reply args through the injected headless runner", async () => {
     const calls: any[] = [];
-    await runMcpHeadlessTool("chatgpt.reply", { conversationId: "abc", prompt: "hello" }, async (...args: any[]) => {
-      calls.push(args);
-      return { result: { response: "ok" } };
-    });
+    await runMcpHeadlessTool(
+      "chatgpt.reply",
+      { conversationId: "abc", prompt: "hello" },
+      async (...args: any[]) => {
+        calls.push(args);
+        return { result: { response: "ok" } };
+      },
+    );
 
     expect(calls[0][1]).toEqual({ conversationId: "abc", prompt: "hello" });
   });

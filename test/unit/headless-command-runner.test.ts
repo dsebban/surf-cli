@@ -4,15 +4,9 @@ const runner = require("../../native/headless-command-runner.cjs");
 
 describe("headless-command-runner buildCliArgs", () => {
   it("builds ChatGPT prompt args with JSON output", () => {
-    expect(runner.buildCliArgs("chatgpt", { query: "hello", model: "pro", profile: "user@example.com" })).toEqual([
-      "chatgpt",
-      "hello",
-      "--model",
-      "pro",
-      "--profile",
-      "user@example.com",
-      "--json",
-    ]);
+    expect(
+      runner.buildCliArgs("chatgpt", { query: "hello", model: "pro", profile: "user@example.com" }),
+    ).toEqual(["chatgpt", "hello", "--model", "pro", "--profile", "user@example.com", "--json"]);
   });
 
   it("builds Gemini prompt args", () => {
@@ -26,32 +20,21 @@ describe("headless-command-runner buildCliArgs", () => {
   });
 
   it("builds ChatGPT conversation args", () => {
-    expect(runner.buildCliArgs("chatgpt.chats", { conversationId: "abc", noCache: true, limit: 3 })).toEqual([
-      "chatgpt.chats",
-      "abc",
-      "--no-cache",
-      "--limit",
-      "3",
-      "--json",
-    ]);
+    expect(
+      runner.buildCliArgs("chatgpt.chats", { conversationId: "abc", noCache: true, limit: 3 }),
+    ).toEqual(["chatgpt.chats", "abc", "--no-cache", "--limit", "3", "--json"]);
   });
 
   it("builds ChatGPT reply args", () => {
-    expect(runner.buildCliArgs("chatgpt.reply", { conversationId: "abc", prompt: "thanks" })).toEqual([
-      "chatgpt.reply",
-      "abc",
-      "thanks",
-      "--json",
-    ]);
+    expect(
+      runner.buildCliArgs("chatgpt.reply", { conversationId: "abc", prompt: "thanks" }),
+    ).toEqual(["chatgpt.reply", "abc", "thanks", "--json"]);
   });
 
   it("accepts kebab conversation-id for reply args", () => {
-    expect(runner.buildCliArgs("chatgpt.reply", { "conversation-id": "abc", query: "thanks" })).toEqual([
-      "chatgpt.reply",
-      "abc",
-      "thanks",
-      "--json",
-    ]);
+    expect(
+      runner.buildCliArgs("chatgpt.reply", { "conversation-id": "abc", query: "thanks" }),
+    ).toEqual(["chatgpt.reply", "abc", "thanks", "--json"]);
   });
 
   it("accepts kebab conversation-id for chats args", () => {
@@ -78,20 +61,24 @@ describe("headless-command-runner buildCliArgs", () => {
   });
 
   it("skips false null and undefined options", () => {
-    expect(runner.buildCliArgs("chatgpt", {
-      query: "hello",
-      all: false,
-      model: null,
-      profile: undefined,
-    })).toEqual(["chatgpt", "hello", "--json"]);
+    expect(
+      runner.buildCliArgs("chatgpt", {
+        query: "hello",
+        all: false,
+        model: null,
+        profile: undefined,
+      }),
+    ).toEqual(["chatgpt", "hello", "--json"]);
   });
 
   it("converts camelCase options to kebab flags", () => {
-    expect(runner.buildCliArgs("chatgpt", {
-      query: "hello",
-      promptFile: "prompt.md",
-      generateImage: "/tmp/out.png",
-    })).toEqual([
+    expect(
+      runner.buildCliArgs("chatgpt", {
+        query: "hello",
+        promptFile: "prompt.md",
+        generateImage: "/tmp/out.png",
+      }),
+    ).toEqual([
       "chatgpt",
       "hello",
       "--prompt-file",
@@ -111,17 +98,21 @@ describe("headless-command-runner buildCliArgs", () => {
   });
 
   it("consumes both conversation-id aliases without leaking duplicate flags", () => {
-    expect(runner.buildCliArgs("chatgpt.chats", {
-      conversationId: "camel",
-      "conversation-id": "kebab",
-    })).toEqual(["chatgpt.chats", "camel", "--json"]);
+    expect(
+      runner.buildCliArgs("chatgpt.chats", {
+        conversationId: "camel",
+        "conversation-id": "kebab",
+      }),
+    ).toEqual(["chatgpt.chats", "camel", "--json"]);
   });
 
   it("converts underscore options to kebab flags", () => {
-    expect(runner.buildCliArgs("gemini", {
-      query: "hello",
-      aspect_ratio: "16:9",
-    })).toEqual(["gemini", "hello", "--aspect-ratio", "16:9", "--json"]);
+    expect(
+      runner.buildCliArgs("gemini", {
+        query: "hello",
+        aspect_ratio: "16:9",
+      }),
+    ).toEqual(["gemini", "hello", "--aspect-ratio", "16:9", "--json"]);
   });
 
   it("serializes array options as comma-separated values", () => {

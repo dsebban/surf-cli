@@ -73,13 +73,13 @@ describe("parseDoCommands", () => {
   });
 
   it("parses boolean option values", () => {
-    const input = 'chatgpt.chats --all true';
+    const input = "chatgpt.chats --all true";
     const steps = parser.parseDoCommands(input);
     expect(steps[0].args.all).toBe(true);
   });
 
   it("parses boolean false option values", () => {
-    const input = 'chatgpt.chats --all false';
+    const input = "chatgpt.chats --all false";
     const steps = parser.parseDoCommands(input);
     expect(steps[0].args.all).toBe(false);
   });
@@ -230,6 +230,9 @@ describe("parseCommandLine", () => {
 
   it("parses chatgpt.reply positional args", () => {
     const result = parser.parseCommandLine('chatgpt.reply abc123 "hello"');
-    expect(result).toEqual({ cmd: "chatgpt.reply", args: { conversationId: "abc123", prompt: "hello" } });
+    expect(result).toEqual({
+      cmd: "chatgpt.reply",
+      args: { conversationId: "abc123", prompt: "hello" },
+    });
   });
 });
