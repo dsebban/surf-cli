@@ -138,5 +138,30 @@ describe("slack-formatter", () => {
       expect(md).toContain("Original message");
       expect(md).toContain("Reply one");
     });
+
+    it("formats replies as normalized JSON", () => {
+      const repliesResult = {
+        messages: [
+          { ts: "1700000000.000000", user: "U1", text: "Original <@U2>", files: [{ name: "a.txt", mimetype: "text/plain", url_private: "https://x" }] },
+          { ts: "1700000120.000000", user: "U2", text: "Reply one" },
+        ],
+        users: {
+          U1: { id: "U1", name: "Alice", displayName: "Alice", avatar: null },
+          U2: { id: "U2", name: "Bob", displayName: "Bob", avatar: null },
+        },
+        channel: "C123",
+        threadTs: "1700000000.000000",
+        messageCount: 2,
+      };
+      const json = formatSlackResult(repliesResult, "replies", "json");
+      const parsed = JSON.parse(json);
+      expect(parsed).toHaveLength(2);
+      expect(parsed[0].userName).toBe("Alice");
+      expect(parsed[0].text).toBe("Original @Bob");
+      expect(parsed[0].rawText).toBe("Original <@U2>");
+      expect(parsed[0].isParent).toBe(true);
+      expect(parsed[0].files).toEqual([{ name: "a.txt", type: "text/plain", url: "https://x" }]);
+      expect(parsed[1].isParent).toBe(false);
+    });
   });
 });

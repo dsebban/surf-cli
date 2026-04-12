@@ -175,11 +175,30 @@ function formatHistoryJson(result) {
 // Public API
 // ============================================================================
 
+function formatRepliesJson(result) {
+  const { messages, users, threadTs } = result;
+  return messages.map(msg => {
+    const entry = {
+      ts: msg.ts,
+      user: msg.user,
+      userName: users[msg.user]?.displayName || users[msg.user]?.name || msg.user,
+      text: cleanSlackText(msg.text, users),
+      rawText: msg.text,
+      time: formatTimestamp(msg.ts),
+      isParent: msg.ts === threadTs,
+    };
+    if (msg.files?.length) {
+      entry.files = msg.files.map(f => ({ name: f.name, type: f.mimetype, url: f.url_private }));
+    }
+    return entry;
+  });
+}
+
 function formatSlackResult(result, action, format) {
   if (format === "json") {
     switch (action) {
       case "history": return JSON.stringify(formatHistoryJson(result), null, 2);
-      case "replies": return JSON.stringify(result, null, 2);
+      case "replies": return JSON.stringify(formatRepliesJson(result), null, 2);
       case "channels": return JSON.stringify(result, null, 2);
       default: return JSON.stringify(result, null, 2);
     }

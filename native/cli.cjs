@@ -582,16 +582,18 @@ const TOOLS = {
         opts: {
           thread: "Thread timestamp to fetch replies for",
           channels: "List available channels instead of reading messages",
+          "include-dms": "Include DMs and group DMs when listing channels",
           limit: "Number of messages to fetch (default: 50)",
           days: "How many days back to fetch (default: 7)",
           format: "Output format: markdown|json (default: markdown)",
           timeout: "Timeout in seconds (default: 120)",
-          profile: "Chrome profile email for headless auth (macOS)",
+          profile: "Optional Chrome profile email for cookie auth fallback (macOS)",
         },
         examples: [
           { cmd: 'slack.read C0ABW197BHP --profile user@company.com', desc: "Read channel messages" },
           { cmd: 'slack.read C0ABW197BHP --thread 1234567890.123456 --profile user@company.com', desc: "Read thread replies" },
           { cmd: 'slack.read --channels --profile user@company.com', desc: "List channels" },
+          { cmd: 'slack.read --channels --include-dms --profile user@company.com', desc: "List channels + DMs" },
           { cmd: 'slack.read C0ABW197BHP --days 30 --limit 200 --format json --profile user@company.com', desc: "JSON export, 30 days" },
         ],
       },
@@ -3629,31 +3631,30 @@ if (tool === "chatgpt") {
 
 if (tool === "slack.read") {
   const channelId = typeof toolArgs.channelId === "string" ? toolArgs.channelId.trim() : "";
-  const threadTs = typeof toolArgs.thread === "string" ? toolArgs.thread.trim() : "";
+  const threadTs = toolArgs.thread === undefined ? "" : String(toolArgs.thread).trim();
   const wantChannels = toolArgs.channels === true;
+  const includeDms = toolArgs["include-dms"] === true;
   const limit = toolArgs.limit === undefined ? undefined : parseInt(String(toolArgs.limit), 10);
   const days = toolArgs.days === undefined ? undefined : parseInt(String(toolArgs.days), 10);
   const explicitFormat = toolArgs.format;
   const timeout = toolArgs.timeout;
 
-  if (!requestedProfile) {
-    console.error("Error: --profile is required for slack.read");
-    process.exit(1);
-  }
-  if (!wantChannels && !channelId) {
-    console.error("Error: channel ID required. Use: surf slack.read <channel-id> --profile user@company.com");
-    console.error("       Or list channels: surf slack.read --channels --profile user@company.com");
-    process.exit(1);
-  }
   if (threadTs && !channelId) {
     console.error("Error: --thread requires a channel ID");
     process.exit(1);
   }
+  if (!wantChannels && !channelId) {
+    console.error("Error: channel ID required. Use: surf slack.read <channel-id>");
+    console.error("       Or list channels: surf slack.read --channels");
+    process.exit(1);
+  }
 
   const action = wantChannels ? "channels" : threadTs ? "replies" : "history";
-  const format = (explicitFormat && ["json", "markdown", "md"].includes(String(explicitFormat).toLowerCase()))
-    ? (explicitFormat === "md" ? "markdown" : explicitFormat)
-    : "markdown";
+  const format = wantJson
+    ? "json"
+    : ((explicitFormat && ["json", "markdown", "md"].includes(String(explicitFormat).toLowerCase()))
+      ? (explicitFormat === "md" ? "markdown" : explicitFormat)
+      : "markdown");
 
   (async () => {
     try {
@@ -3675,10 +3676,11 @@ if (tool === "slack.read") {
         limit: limit || undefined,
         days: days || undefined,
         profile: requestedProfile,
+        includeDms,
         timeout,
       }, progressCb);
 
-      if (wantJson || format === "json") {
+      if (format === "json") {
         console.log(slackFormatter.formatSlackResult(result, action, "json"));
       } else {
         console.log(slackFormatter.formatSlackResult(result, action, "markdown"));

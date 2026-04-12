@@ -106,6 +106,8 @@ test_output "chatgpt help" "node cli.cjs chatgpt --help" "Send prompt to ChatGPT
 test_output "gemini help" "node cli.cjs gemini --help" "Send prompt to Gemini"
 test_output "chatgpt.chats help" "node cli.cjs chatgpt.chats --help" "Search conversations"
 test_output "chatgpt.reply help" "node cli.cjs chatgpt.reply --help" "Reply in-thread"
+test_output "slack.read help include-dms" "node cli.cjs slack.read --help" "--include-dms"
+test_output "slack.read help optional profile text" "node cli.cjs slack.read --help" "Optional Chrome profile email for cookie auth fallback"
 test_output "session help" "node cli.cjs session --help" "inspect and reconcile"
 test_output "do help" "node cli.cjs do --help" "Execute multiple commands"
 
@@ -124,6 +126,8 @@ test_output "chatgpt.chats all+limit invalid" "node cli.cjs chatgpt.chats --all 
 test_output "chatgpt.chats advanced conflict" "node cli.cjs chatgpt.chats abc --rename 'New Title' --delete" "use only one of --rename, --delete, --delete-ids, or --download-file"
 test_output "chatgpt.chats download requires output" "node cli.cjs chatgpt.chats abc --download-file file-123" "requires --output"
 test_output "chatgpt.reply usage" "node cli.cjs chatgpt.reply" "Usage: surf chatgpt.reply"
+test_output "slack.read thread requires channel" "node cli.cjs slack.read --thread 123" "--thread requires a channel ID"
+test_no_output "slack.read no hard profile requirement" "node cli.cjs slack.read --thread 123" "--profile is required for slack.read"
 
 echo ""
 echo "-- Session Reconcile --"

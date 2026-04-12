@@ -5,13 +5,13 @@
  * Reads Slack conversations via internal APIs from an authenticated browser context.
  *
  * Protocol: stdin JSON lines → stdout JSON lines
- *   Input:  { type:"slack", action:"history"|"replies"|"channels", channel?, threadTs?, limit?, days?, profile?, timeout? }
+ *   Input:  { type:"slack", action:"history"|"replies"|"channels", channel?, threadTs?, limit?, days?, profile?, includeDms?, timeout? }
  *   Output: { type:"progress"|"success"|"error"|"keepalive"|"log", … }
  */
 
 import { launchPersistentContext } from 'cloakbrowser'
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs'
-import { homedir, tmpdir } from 'os'
+import { existsSync, mkdirSync, readlinkSync, unlinkSync } from 'fs'
+import { homedir } from 'os'
 import { join } from 'path'
 import { loadAndInjectSlackCookies } from './slack-cloak-profile-auth.mjs'
 
@@ -30,8 +30,33 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 // ============================================================================
 // Profile directory management
 
-function tempProfileDir() {
-  return mkdtempSync(join(tmpdir(), 'surf-slack-session-'))
+function sharedProfileDir() {
+  const dir = join(homedir(), '.surf', 'slack-cloak-profile')
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+
+  // Clean stale SingletonLock from crashed sessions
+  const lockPath = join(dir, 'SingletonLock')
+  if (existsSync(lockPath)) {
+    try {
+      const target = readlinkSync(lockPath)
+      const match = /-(\d+)$/.exec(target)
+      if (match?.[1]) {
+        const pid = Number.parseInt(match[1], 10)
+        try {
+          process.kill(pid, 0)
+        } catch {
+          unlinkSync(lockPath)
+          log('info', 'Cleaned stale SingletonLock', { target })
+        }
+      }
+    } catch {
+      try {
+        unlinkSync(lockPath)
+      } catch {}
+    }
+  }
+
+  return dir
 }
 
 // ============================================================================
@@ -90,7 +115,14 @@ async function extractSlackToken(page) {
       // Return first team's token — for enterprise, the first team is usually correct
       const teamId = teamIds[0]
       const team = config.teams[teamId]
-      return { token: team?.token || null, teamId, teamName: team?.name || null }
+      const availableTeams = teamIds.map((id) => ({ id, name: config.teams[id]?.name || null }))
+      return {
+        token: team?.token || null,
+        teamId,
+        teamName: team?.name || null,
+        teamCount: teamIds.length,
+        availableTeams,
+      }
     } catch {
       return null
     }
@@ -192,6 +224,7 @@ async function handleHistory(page, request, token) {
   progress(3, 4, 'Fetching thread replies...')
   const threads = new Map()
   let threadCount = 0
+  const truncatedThreadIds = []
   for (const msg of allMessages) {
     if (msg.thread_ts && msg.reply_count > 0 && msg.thread_ts === msg.ts) {
       if (threadCount > 0) await sleep(800)
@@ -206,6 +239,13 @@ async function handleHistory(page, request, token) {
         })
         const replies = (repliesData.messages || []).filter(r => r.ts !== msg.ts)
         threads.set(msg.ts, replies)
+        if (repliesData.has_more) {
+          truncatedThreadIds.push(msg.thread_ts)
+          log('warn', `Thread replies truncated for ${msg.thread_ts} (has_more=true)`, {
+            threadTs: msg.thread_ts,
+            fetchedReplies: replies.length,
+          })
+        }
         for (const r of replies) {
           if (r.user) userIds.add(r.user)
         }
@@ -214,6 +254,12 @@ async function handleHistory(page, request, token) {
         log('warn', `Failed to fetch thread ${msg.thread_ts}: ${err.message}`)
       }
     }
+  }
+
+  if (truncatedThreadIds.length > 0) {
+    log('warn', `Detected truncated replies in ${truncatedThreadIds.length} thread(s) during history fetch`, {
+      threadIds: truncatedThreadIds,
+    })
   }
 
   // Resolve user names
@@ -263,7 +309,7 @@ async function handleReplies(page, request, token) {
 }
 
 async function handleChannels(page, request, token) {
-  const { limit = 100 } = request
+  const { limit = 100, includeDms = false } = request
 
   progress(1, 2, 'Fetching channel list...')
 
@@ -274,7 +320,7 @@ async function handleChannels(page, request, token) {
   while (hasMore && allChannels.length < limit) {
     const params = {
       token,
-      types: 'public_channel,private_channel,mpim,im',
+      types: includeDms ? 'public_channel,private_channel,mpim,im' : 'public_channel,private_channel',
       limit: String(Math.min(200, limit - allChannels.length)),
       exclude_archived: 'true',
     }
@@ -283,7 +329,7 @@ async function handleChannels(page, request, token) {
     const data = await callSlackApi(page, 'conversations.list', params)
     const channels = data.channels || []
     allChannels = allChannels.concat(channels)
-    hasMore = data.response_metadata?.next_cursor ? true : false
+    hasMore = Boolean(data.response_metadata?.next_cursor)
     cursor = data.response_metadata?.next_cursor || ''
     keepalive()
 
@@ -299,9 +345,9 @@ async function handleChannels(page, request, token) {
       topic: ch.topic?.value || '',
       purpose: ch.purpose?.value || '',
       memberCount: ch.num_members || 0,
-      isPrivate: ch.is_private || false,
-      isIm: ch.is_im || false,
-      isMpim: ch.is_mpim || false,
+      isPrivate: Boolean(ch.is_private),
+      isIm: Boolean(ch.is_im),
+      isMpim: Boolean(ch.is_mpim),
     })),
     channelCount: allChannels.length,
   }
@@ -368,46 +414,52 @@ async function main() {
   const { action, profile, timeout = 120 } = request
   let context = null
   let profileDir = null
-  let cleanupProfile = false
 
   try {
     // Launch CloakBrowser
     progress(0, 5, 'Launching browser...')
 
-    if (profile) {
-      profileDir = tempProfileDir()
-      cleanupProfile = true
-    } else {
-      profileDir = join(homedir(), '.surf', 'slack-cloak-profile')
-      if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true })
-    }
+    profileDir = sharedProfileDir()
 
     context = await launchPersistentContext(buildLaunchOpts(profileDir))
     log('info', 'Browser launched')
 
-    // Inject cookies from Chrome profile
-    if (profile) {
-      progress(1, 5, 'Injecting Slack cookies...')
-      await loadAndInjectSlackCookies(context, {
-        profileEmail: profile,
-        log: (msg) => log('info', msg),
-      })
-    }
-
     // Navigate to Slack
-    progress(2, 5, 'Navigating to Slack...')
+    progress(1, 5, 'Navigating to Slack...')
     const page = context.pages()[0] || await context.newPage()
     await page.goto('https://app.slack.com/', { waitUntil: 'domcontentloaded', timeout: 30000 })
 
-    const readiness = await waitForSlackReady(page, 45000)
+    let readiness = await waitForSlackReady(page, 45000)
     if (!readiness.ready) {
       fail('page_load_timeout', 'Slack did not load within 45 seconds')
       return
     }
-    if (!readiness.loggedIn) {
-      fail('login_required', 'Not logged into Slack. Please sign in with this profile in Chrome first.')
+
+    if (readiness.loggedIn) {
+      progress(2, 5, 'Using existing Slack session...')
+    } else if (!profile) {
+      fail('login_required', 'Slack login required. Use --profile <email> or sign in to Slack in the shared ~/.surf/slack-cloak-profile session first.')
       return
+    } else {
+      progress(2, 5, 'Injecting Slack cookies...')
+      log('info', 'Slack not authenticated, injecting cookies from Chrome profile', { profile })
+      await loadAndInjectSlackCookies(context, {
+        profileEmail: profile,
+        log: (msg) => log('info', msg),
+      })
+
+      await page.goto('https://app.slack.com/', { waitUntil: 'domcontentloaded', timeout: 30000 })
+      readiness = await waitForSlackReady(page, 45000)
+      if (!readiness.ready) {
+        fail('page_load_timeout', 'Slack did not load within 45 seconds')
+        return
+      }
+      if (!readiness.loggedIn) {
+        fail('login_required', `Login failed for profile "${profile}". Please sign in to Slack in Chrome first.`)
+        return
+      }
     }
+
     log('info', 'Slack loaded and authenticated')
 
     // Extract token
@@ -418,6 +470,12 @@ async function main() {
       return
     }
     log('info', `Token found for team: ${tokenInfo.teamName} (${tokenInfo.teamId})`)
+    if (tokenInfo.teamCount > 1 && Array.isArray(tokenInfo.availableTeams)) {
+      const teamList = tokenInfo.availableTeams
+        .map((team) => `${team.name || 'unknown'} (${team.id})`)
+        .join(', ')
+      log('warn', `Multiple Slack workspaces found; using ${tokenInfo.teamName || 'unknown'} (${tokenInfo.teamId}). Available: ${teamList}`)
+    }
     const token = tokenInfo.token
 
     // Dispatch action
@@ -446,9 +504,6 @@ async function main() {
   } finally {
     if (context) {
       try { await context.close() } catch {}
-    }
-    if (cleanupProfile && profileDir) {
-      try { rmSync(profileDir, { recursive: true, force: true }) } catch {}
     }
   }
 }

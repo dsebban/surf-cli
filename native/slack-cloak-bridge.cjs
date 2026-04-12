@@ -125,7 +125,11 @@ function runSlackWorker({ request, timeout = DEFAULT_SLACK_TIMEOUT_SEC, onProgre
 
     worker.stderr.setEncoding("utf8");
     worker.stderr.on("data", (chunk) => {
-      if (chunk.includes("[cloakbrowser]")) process.stderr.write(chunk);
+      if (process.env.SURF_DEBUG) {
+        process.stderr.write(chunk);
+      } else if (chunk.includes("[cloakbrowser]")) {
+        process.stderr.write(chunk);
+      }
     });
 
     worker.on("close", (code, signal) => {
@@ -164,6 +168,7 @@ async function querySlackMessages(opts, onProgress = () => {}) {
       limit: opts.limit,
       days: opts.days,
       profile: opts.profile,
+      includeDms: opts.includeDms,
       timeout,
     },
     timeout,
