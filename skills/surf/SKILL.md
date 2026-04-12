@@ -83,9 +83,9 @@ surf chatgpt "complex problem" --model gpt-5.4-pro --profile dsebban883@gmail.co
 
 ```bash
 surf gemini "explain quantum computing" --profile dsebban883@gmail.com
-surf gemini "analyze this chart" --file chart.jpg --model gemini-3-pro --profile dsebban883@gmail.com
-surf gemini "reason about this architecture" --model gemini-3.1-pro-preview --profile dsebban883@gmail.com
-surf gemini "summarize this video" --youtube "https://youtube.com/..." --profile dsebban883@gmail.com
+surf gemini "analyze this chart" --file chart.jpg --profile dsebban883@gmail.com
+surf gemini "reason about this architecture" --model thinking --profile dsebban883@gmail.com
+surf gemini "advanced math problem" --model pro --profile dsebban883@gmail.com
 surf gemini "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
 surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9 --profile dsebban883@gmail.com
 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile dsebban883@gmail.com
@@ -93,21 +93,13 @@ surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile d
 
 ### Gemini model notes
 
-Default/listed models:
+Gemini 3 tiers (use `--model <alias>`):
 
-- `gemini-3-pro` default
-- `gemini-2.5-pro`
-- `gemini-2.5-flash`
+- **Fast** (default): `gemini-3-pro`, `fast`, `gemini-2.5-flash`
+- **Thinking**: `thinking`, `gemini-2.5-pro`, `gemini-3.1-thinking`
+- **Pro** (3.1 Pro): `pro`, `gemini-3.1-pro-preview`, `gemini-3.1-pro`
 
-Gemini UI selection also accepts best-effort mode IDs when available:
-
-- `gemini-3.1-pro-preview`
-- `gemini-3.1-pro`
-- `gemini-3.1-thinking`
-- `gemini-3.1-flash`
-- `gemini-3.1-flash-lite-preview`
-
-Use `gemini-3.1-pro-preview` for strongest reasoning/image analysis when the account UI exposes it. Unknown Gemini model names are passed through to the UI picker best-effort.
+Unknown model names are passed through to the UI picker best-effort.
 
 ## Workflows
 

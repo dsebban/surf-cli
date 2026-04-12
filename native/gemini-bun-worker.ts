@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-/// <reference path="./bun-webview.d.ts" />
+declare const Bun: any;
 /**
  * Bun WebView worker for Gemini queries.
  *
@@ -57,7 +57,6 @@ interface WorkerError {
   ok: false;
   code: string;
   error: string;
-  fallbackRecommended: boolean;
 }
 
 // ============================================================================
@@ -574,7 +573,7 @@ async function uploadFileViaCDP(
         lastError = err;
         log(`Upload attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
         if (attempt === maxAttempts) {
-          throw new Error(`File upload failed after ${maxAttempts} attempts: ${lastError.message}`);
+          throw new Error(`File upload failed after ${maxAttempts} attempts: ${lastError?.message || err.message || String(err)}`);
         }
         await delay(1000);
       }
@@ -918,14 +917,20 @@ async function activateCreateImageTool(wv: WebView, timeoutMs = 5000): Promise<v
  */
 const MODEL_TO_MODE_KEYWORDS: Record<string, string[]> = {
   // Fast / Flash tier
+  "fast":                           ["fast"],
+  "gemini-3-fast":                  ["fast"],
   "gemini-3-pro":                   ["fast"],
   "gemini-2.5-flash":               ["fast"],
   "gemini-3.1-flash-lite-preview":  ["fast"],
   "gemini-3.1-flash":               ["fast"],
   // Thinking tier
+  "thinking":                       ["thinking"],
+  "gemini-3-thinking":              ["thinking"],
   "gemini-3.1-thinking":            ["thinking"],
   "gemini-2.5-pro":                 ["thinking"],
   // Pro tier
+  "pro":                            ["pro"],
+  "gemini-3-pro-full":              ["pro"],
   "gemini-3.1-pro-preview":         ["pro"],
   "gemini-3.1-pro":                 ["pro"],
 };
@@ -1243,23 +1248,10 @@ async function main() {
     process.stdout.write(JSON.stringify(result) + "\n");
   } catch (err: any) {
     const code = err.code || "unknown";
-    // Hard failures: explicit user choices that shouldn't silently fall back
-    const hardFailCodes = new Set([
-      "upload_failed",           // file doesn't exist — not a transient issue
-      "profile_not_found",       // --profile specified but not found
-      "profile_ambiguous",       // --profile matched multiple profiles
-      "profile_unsupported_platform",
-    ]);
-    // Everything else (including "unknown" DOM/CDP failures) recommends fallback
-    // so the legacy extension path gets a chance. The CLI will override this
-    // and hard-fail if --profile was explicitly passed by the user.
-    const fallbackRecommended = !hardFailCodes.has(code);
-
     const errorResp: WorkerError = {
       ok: false,
       code,
       error: err.message || String(err),
-      fallbackRecommended,
     };
     process.stdout.write(JSON.stringify(errorResp) + "\n");
     process.exit(1);
@@ -1273,3 +1265,5 @@ async function main() {
 }
 
 main();
+
+export {};

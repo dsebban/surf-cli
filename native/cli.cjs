@@ -109,9 +109,9 @@ ${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
 
 ${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}bash
 surf gemini "explain quantum computing" --profile dsebban883@gmail.com
-surf gemini "analyze this chart" --file chart.jpg --model gemini-3-pro --profile dsebban883@gmail.com
-surf gemini "reason about this architecture" --model gemini-3.1-pro-preview --profile dsebban883@gmail.com
-surf gemini "summarize this video" --youtube "https://youtube.com/..." --profile dsebban883@gmail.com
+surf gemini "analyze this chart" --file chart.jpg --profile dsebban883@gmail.com
+surf gemini "reason about this architecture" --model thinking --profile dsebban883@gmail.com
+surf gemini "advanced math problem" --model pro --profile dsebban883@gmail.com
 surf gemini "a robot surfing" --generate-image /tmp/robot.png --profile dsebban883@gmail.com
 surf gemini "wide banner" --generate-image /tmp/banner.png --aspect-ratio 16:9 --profile dsebban883@gmail.com
 surf gemini "add sunglasses" --edit-image photo.jpg --output out.jpg --profile dsebban883@gmail.com
@@ -119,21 +119,13 @@ ${SURF_SKILL_BT}${SURF_SKILL_BT}${SURF_SKILL_BT}
 
 ### Gemini model notes
 
-Default/listed models:
+Gemini 3 tiers (use ${SURF_SKILL_BT}--model <alias>${SURF_SKILL_BT}):
 
-- ${SURF_SKILL_BT}gemini-3-pro${SURF_SKILL_BT} default
-- ${SURF_SKILL_BT}gemini-2.5-pro${SURF_SKILL_BT}
-- ${SURF_SKILL_BT}gemini-2.5-flash${SURF_SKILL_BT}
+- **Fast** (default): ${SURF_SKILL_BT}gemini-3-pro${SURF_SKILL_BT}, ${SURF_SKILL_BT}fast${SURF_SKILL_BT}, ${SURF_SKILL_BT}gemini-2.5-flash${SURF_SKILL_BT}
+- **Thinking**: ${SURF_SKILL_BT}thinking${SURF_SKILL_BT}, ${SURF_SKILL_BT}gemini-2.5-pro${SURF_SKILL_BT}, ${SURF_SKILL_BT}gemini-3.1-thinking${SURF_SKILL_BT}
+- **Pro** (3.1 Pro): ${SURF_SKILL_BT}pro${SURF_SKILL_BT}, ${SURF_SKILL_BT}gemini-3.1-pro-preview${SURF_SKILL_BT}, ${SURF_SKILL_BT}gemini-3.1-pro${SURF_SKILL_BT}
 
-Gemini UI selection also accepts best-effort mode IDs when available:
-
-- ${SURF_SKILL_BT}gemini-3.1-pro-preview${SURF_SKILL_BT}
-- ${SURF_SKILL_BT}gemini-3.1-pro${SURF_SKILL_BT}
-- ${SURF_SKILL_BT}gemini-3.1-thinking${SURF_SKILL_BT}
-- ${SURF_SKILL_BT}gemini-3.1-flash${SURF_SKILL_BT}
-- ${SURF_SKILL_BT}gemini-3.1-flash-lite-preview${SURF_SKILL_BT}
-
-Use ${SURF_SKILL_BT}gemini-3.1-pro-preview${SURF_SKILL_BT} for strongest reasoning/image analysis when the account UI exposes it. Unknown Gemini model names are passed through to the UI picker best-effort.
+Unknown model names are passed through to the UI picker best-effort.
 
 ## Workflows
 
@@ -592,7 +584,7 @@ const TOOLS = {
         args: ["query"], 
         opts: { 
           "with-page": "Include current page context",
-          model: "Model: gemini-3-pro (default), gemini-2.5-pro, gemini-2.5-flash",
+          model: "Model tiers: Fast (gemini-3-pro/default, fast, gemini-2.5-flash), Thinking (gemini-2.5-pro, thinking, gemini-3.1-thinking), Pro (gemini-3.1-pro-preview, pro, gemini-3.1-pro)",
           file: "Attach file to analyze",
           "generate-image": "Generate image and save to path",
           "edit-image": "Edit existing image (use with --output)",
