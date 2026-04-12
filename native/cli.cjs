@@ -11,8 +11,10 @@ const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
 const { isCloakBrowserAvailable, queryWithCloakBrowser, manageChatsWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
+const { isSlackCloakAvailable, querySlackMessages } = require("./slack-cloak-bridge.cjs");
 const chatgptChatsFormatter = require("./chatgpt-chats-formatter.cjs");
 const chatgptChatsCache = require("./chatgpt-chats-cache.cjs");
+const slackFormatter = require("./slack-formatter.cjs");
 const sessionStore     = require("./session-store.cjs");
 const sessionReconciler = require("./session-reconciler.cjs");
 const { version: VERSION } = require("../package.json");
@@ -572,6 +574,25 @@ const TOOLS = {
         examples: [
           { cmd: 'chatgpt.reply <conversation-id> "follow-up question"', desc: "Reply in-thread" },
           { cmd: 'chatgpt.reply <conversation-id> "follow-up" --model gpt-5.4-thinking', desc: "Reply with model override" },
+        ],
+      },
+      "slack.read": {
+        desc: "Read Slack conversations from the web UI (Cloak only)",
+        args: ["channel_id"],
+        opts: {
+          thread: "Thread timestamp to fetch replies for",
+          channels: "List available channels instead of reading messages",
+          limit: "Number of messages to fetch (default: 50)",
+          days: "How many days back to fetch (default: 7)",
+          format: "Output format: markdown|json (default: markdown)",
+          timeout: "Timeout in seconds (default: 120)",
+          profile: "Chrome profile email for headless auth (macOS)",
+        },
+        examples: [
+          { cmd: 'slack.read C0ABW197BHP --profile user@company.com', desc: "Read channel messages" },
+          { cmd: 'slack.read C0ABW197BHP --thread 1234567890.123456 --profile user@company.com', desc: "Read thread replies" },
+          { cmd: 'slack.read --channels --profile user@company.com', desc: "List channels" },
+          { cmd: 'slack.read C0ABW197BHP --days 30 --limit 200 --format json --profile user@company.com', desc: "JSON export, 30 days" },
         ],
       },
       "gemini": { 
@@ -1726,6 +1747,7 @@ const HEADLESS_COMMAND_HELP = {
   chatgpt: "Send prompt to ChatGPT",
   "chatgpt.chats": "Search conversations",
   "chatgpt.reply": "Reply in-thread",
+  "slack.read": "Read Slack conversations",
   gemini: "Send prompt to Gemini",
   session: "Inspect and reconcile AI sessions",
   do: "Execute multiple commands",
@@ -1737,6 +1759,7 @@ const HEADLESS_COMMAND_LIST = [
   "chatgpt",
   "chatgpt.chats",
   "chatgpt.reply",
+  "slack.read",
   "gemini",
   "session",
   "do",
@@ -1754,6 +1777,7 @@ AI Commands (headless-only):
   chatgpt.chats [conversation_id] List/search/view conversations
   chatgpt.reply <conversation_id> <prompt> Reply inside a conversation
   gemini <query>                 Send prompt to Gemini
+  slack.read [channel_id]        Read Slack conversations
 
 Workflow + Session:
   do <commands>                  Execute multiple commands as a workflow
@@ -1787,6 +1811,7 @@ AI - AI assistants (headless-only)
   chatgpt.chats <conversation_id> Search conversations
   chatgpt.reply <conversation_id> <prompt> Reply in-thread
   gemini <query>                Send prompt to Gemini
+  slack.read [channel_id]       Read Slack conversations
 
 WORKFLOW
   do <commands>                 Execute multiple commands
@@ -2889,6 +2914,7 @@ const PRIMARY_ARG_MAP = {
   chatgpt: "query",
   "chatgpt.chats": "conversationId",
   "chatgpt.reply": "conversationId",
+  "slack.read": "channelId",
   perplexity: "query",
   grok: "query",
   aistudio: "query",
@@ -3304,6 +3330,7 @@ const performAutoCapture = async () => {
 };
 
 const CHATGPT_CLOAK_ONLY_TOOLS = new Set(["chatgpt.chats", "chatgpt.reply"]);
+const SLACK_CLOAK_TOOLS = new Set(["slack.read"]);
 
 const withOptionalHeadedCloak = async (enabled, fn) => {
   const previous = process.env.CLOAK_HEADLESS;
@@ -3576,7 +3603,7 @@ const requestedProfile = (() => {
   return undefined;
 })();
 
-if ((tool === "chatgpt" || CHATGPT_CLOAK_ONLY_TOOLS.has(tool)) && requestedProfile) {
+if ((tool === "chatgpt" || CHATGPT_CLOAK_ONLY_TOOLS.has(tool) || SLACK_CLOAK_TOOLS.has(tool)) && requestedProfile) {
   if (process.platform !== "darwin") {
     console.error("Error: --profile is only supported on macOS");
     process.exit(1);
@@ -3598,6 +3625,71 @@ if (tool === "chatgpt") {
     await runChatGptCloakQueryDirect("chatgpt", toolArgs);
   })();
   return; // Prevent falling through to Bun or legacy
+}
+
+if (tool === "slack.read") {
+  const channelId = typeof toolArgs.channelId === "string" ? toolArgs.channelId.trim() : "";
+  const threadTs = typeof toolArgs.thread === "string" ? toolArgs.thread.trim() : "";
+  const wantChannels = toolArgs.channels === true;
+  const limit = toolArgs.limit === undefined ? undefined : parseInt(String(toolArgs.limit), 10);
+  const days = toolArgs.days === undefined ? undefined : parseInt(String(toolArgs.days), 10);
+  const explicitFormat = toolArgs.format;
+  const timeout = toolArgs.timeout;
+
+  if (!requestedProfile) {
+    console.error("Error: --profile is required for slack.read");
+    process.exit(1);
+  }
+  if (!wantChannels && !channelId) {
+    console.error("Error: channel ID required. Use: surf slack.read <channel-id> --profile user@company.com");
+    console.error("       Or list channels: surf slack.read --channels --profile user@company.com");
+    process.exit(1);
+  }
+  if (threadTs && !channelId) {
+    console.error("Error: --thread requires a channel ID");
+    process.exit(1);
+  }
+
+  const action = wantChannels ? "channels" : threadTs ? "replies" : "history";
+  const format = (explicitFormat && ["json", "markdown", "md"].includes(String(explicitFormat).toLowerCase()))
+    ? (explicitFormat === "md" ? "markdown" : explicitFormat)
+    : "markdown";
+
+  (async () => {
+    try {
+      if (!isSlackCloakAvailable()) {
+        console.error("Error: CloakBrowser not installed. Run: npm install cloakbrowser playwright-core");
+        process.exit(1);
+      }
+
+      const progressCb = (msg) => {
+        if (msg.type === "progress" && msg.message) {
+          process.stderr.write(`  ${msg.message}\n`);
+        }
+      };
+
+      const result = await querySlackMessages({
+        action,
+        channel: channelId || undefined,
+        threadTs: threadTs || undefined,
+        limit: limit || undefined,
+        days: days || undefined,
+        profile: requestedProfile,
+        timeout,
+      }, progressCb);
+
+      if (wantJson || format === "json") {
+        console.log(slackFormatter.formatSlackResult(result, action, "json"));
+      } else {
+        console.log(slackFormatter.formatSlackResult(result, action, "markdown"));
+      }
+    } catch (err) {
+      console.error(`Error: ${err.message}`);
+      if (err.code) console.error(`Code: ${err.code}`);
+      process.exit(1);
+    }
+  })();
+  return;
 }
 
 if (tool === "chatgpt.chats") {

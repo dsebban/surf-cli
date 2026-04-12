@@ -1,0 +1,142 @@
+import { describe, it, expect } from "vitest";
+import { formatSlackResult, cleanSlackText, formatTimestamp } from "../../native/slack-formatter.cjs";
+
+describe("slack-formatter", () => {
+  describe("cleanSlackText", () => {
+    it("replaces user mentions with display names", () => {
+      const userMap = { U123: { displayName: "Alice", name: "alice" } };
+      expect(cleanSlackText("<@U123> said hello", userMap)).toBe("@Alice said hello");
+    });
+
+    it("replaces channel mentions", () => {
+      expect(cleanSlackText("See <#C456|general> for details")).toBe("See #general for details");
+    });
+
+    it("replaces bare channel mentions", () => {
+      expect(cleanSlackText("See <#C456> for details")).toBe("See #C456 for details");
+    });
+
+    it("replaces URL mentions with markdown links", () => {
+      expect(cleanSlackText("Visit <https://example.com|Example>")).toBe("Visit [Example](https://example.com)");
+    });
+
+    it("replaces bare URLs", () => {
+      expect(cleanSlackText("Visit <https://example.com>")).toBe("Visit https://example.com");
+    });
+
+    it("replaces special mentions", () => {
+      expect(cleanSlackText("<!here> <!channel> <!everyone>")).toBe("@here @channel @everyone");
+    });
+
+    it("decodes HTML entities", () => {
+      expect(cleanSlackText("a &amp; b &lt; c &gt; d")).toBe("a & b < c > d");
+    });
+
+    it("handles empty/null input", () => {
+      expect(cleanSlackText("")).toBe("");
+      expect(cleanSlackText(null)).toBe("");
+      expect(cleanSlackText(undefined)).toBe("");
+    });
+  });
+
+  describe("formatTimestamp", () => {
+    it("formats Unix timestamp to human readable", () => {
+      const ts = "1700000000.123400";
+      const result = formatTimestamp(ts);
+      expect(result).toContain("2023");
+      expect(result).toMatch(/\d+:\d+ [AP]M/);
+    });
+
+    it("handles empty input", () => {
+      expect(formatTimestamp("")).toBe("");
+      expect(formatTimestamp(null)).toBe("");
+    });
+  });
+
+  describe("formatSlackResult", () => {
+    const historyResult = {
+      messages: [
+        { ts: "1700000000.000000", user: "U1", text: "Hello world" },
+        { ts: "1700000060.000000", user: "U2", text: "Hi <@U1>!" },
+      ],
+      threads: {},
+      users: {
+        U1: { id: "U1", name: "Alice", displayName: "Alice", avatar: null },
+        U2: { id: "U2", name: "Bob", displayName: "Bob", avatar: null },
+      },
+      channel: "C123",
+      messageCount: 2,
+      threadCount: 0,
+    };
+
+    it("formats history as markdown", () => {
+      const md = formatSlackResult(historyResult, "history", "markdown");
+      expect(md).toContain("# Slack Channel: C123");
+      expect(md).toContain("**Alice**");
+      expect(md).toContain("**Bob**");
+      expect(md).toContain("Hello world");
+      expect(md).toContain("Hi @Alice!");
+    });
+
+    it("formats history as JSON", () => {
+      const json = formatSlackResult(historyResult, "history", "json");
+      const parsed = JSON.parse(json);
+      expect(parsed).toHaveLength(2);
+      expect(parsed[0].userName).toBe("Alice");
+      expect(parsed[0].text).toBe("Hello world");
+      expect(parsed[1].text).toBe("Hi @Alice!");
+    });
+
+    it("formats channels as markdown table", () => {
+      const channelResult = {
+        channels: [
+          { id: "C1", name: "general", topic: "General chat", purpose: "", memberCount: 50, isPrivate: false, isIm: false, isMpim: false },
+          { id: "C2", name: "random", topic: "", purpose: "", memberCount: 30, isPrivate: true, isIm: false, isMpim: false },
+        ],
+        channelCount: 2,
+      };
+      const md = formatSlackResult(channelResult, "channels", "markdown");
+      expect(md).toContain("# Slack Channels");
+      expect(md).toContain("| C1 | #general |");
+      expect(md).toContain("| C2 | #random |");
+      expect(md).toContain("Public");
+      expect(md).toContain("Private");
+    });
+
+    it("formats history with thread replies", () => {
+      const withThreads = {
+        ...historyResult,
+        threads: {
+          "1700000000.000000": [
+            { ts: "1700000120.000000", user: "U2", text: "Thread reply" },
+          ],
+        },
+        threadCount: 1,
+      };
+      const md = formatSlackResult(withThreads, "history", "markdown");
+      expect(md).toContain("**Thread**");
+      expect(md).toContain("Thread reply");
+    });
+
+    it("formats replies as markdown", () => {
+      const repliesResult = {
+        messages: [
+          { ts: "1700000000.000000", user: "U1", text: "Original message" },
+          { ts: "1700000120.000000", user: "U2", text: "Reply one" },
+        ],
+        users: {
+          U1: { id: "U1", name: "Alice", displayName: "Alice", avatar: null },
+          U2: { id: "U2", name: "Bob", displayName: "Bob", avatar: null },
+        },
+        channel: "C123",
+        threadTs: "1700000000.000000",
+        messageCount: 2,
+      };
+      const md = formatSlackResult(repliesResult, "replies", "markdown");
+      expect(md).toContain("# Thread in C123");
+      expect(md).toContain("[OP]");
+      expect(md).toContain("Original message");
+      expect(md).toContain("Reply one");
+    });
+  });
+});
