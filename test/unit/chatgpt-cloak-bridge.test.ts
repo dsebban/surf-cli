@@ -141,50 +141,9 @@ describe("chatgpt-cloak-bridge", () => {
     bridge.__resetBridgeRuntimeForTests();
   });
 
-  it("retries chat get in headed mode after clean worker_exit", async () => {
-    const worker1 = createWorker();
-    const worker2 = createWorker();
-    const spawn = vi.fn().mockReturnValueOnce(worker1).mockReturnValueOnce(worker2);
-    const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
-    bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
-    const progress = vi.fn();
-
-    const promise = bridge.manageChatsWithCloakBrowser(
-      { action: "get", conversationId: "conv-123", timeout: 5 },
-      progress,
-    );
-
-    worker1.emit("close", 0, null);
-    await Promise.resolve();
-    await Promise.resolve();
-    worker2.stdout.emit(
-      "data",
-      `${JSON.stringify({
-        type: "success",
-        action: "get",
-        conversationId: "conv-123",
-        conversation: { current_node: "n1", mapping: { n1: {} } },
-      })}\n`,
-    );
-
-    await expect(promise).resolves.toMatchObject({
-      action: "get",
-      conversationId: "conv-123",
-    });
-    expect(spawn).toHaveBeenCalledTimes(2);
-    expect(progress).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "progress",
-        message: expect.stringContaining("retrying"),
-      }),
-    );
-    bridge.__resetBridgeRuntimeForTests();
-  });
-
-  it("keeps original worker_exit context when headed retry also fails", async () => {
-    const worker1 = createWorker();
-    const worker2 = createWorker();
-    const spawn = vi.fn().mockReturnValueOnce(worker1).mockReturnValueOnce(worker2);
+  it("does not retry chat get after clean worker_exit in headless-only mode", async () => {
+    const worker = createWorker();
+    const spawn = vi.fn().mockReturnValue(worker);
     const bridge = require("../../native/chatgpt-cloak-bridge.cjs");
     bridge.__setBridgeRuntimeForTests({ spawn, existsSync: () => true });
 
@@ -194,21 +153,13 @@ describe("chatgpt-cloak-bridge", () => {
       timeout: 5,
     });
 
-    worker1.emit("close", 0, null);
-    await Promise.resolve();
-    await Promise.resolve();
-    worker2.emit("close", 0, null);
+    worker.emit("close", 0, null);
 
     await expect(promise).rejects.toMatchObject({
       code: "worker_exit",
       exitCode: 0,
-      retryContext: {
-        initialError: {
-          code: "worker_exit",
-          exitCode: 0,
-        },
-      },
     });
+    expect(spawn).toHaveBeenCalledTimes(1);
 
     bridge.__resetBridgeRuntimeForTests();
   });

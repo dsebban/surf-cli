@@ -84,7 +84,7 @@ Relevant code:
 ### Phase 4 — Runtime probe: headed Cloak
 **Hypothesis:** UI behavior differs in headed mode; the trace chip may become interactive.
 
-**Experiment:** same probe script, but `CLOAK_HEADLESS=0`
+**Experiment:** same probe script in headed mode
 
 **Findings:**
 - The trace chip/button was present and hoverable: `Thought for 17s`

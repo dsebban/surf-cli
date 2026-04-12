@@ -2,25 +2,14 @@
  * Bridge module: spawns the Bun WebView worker for ChatGPT queries.
  *
  * Handles:
- *  - SURF_USE_BUN_CHATGPT env flag
  *  - Bun executable detection
- *  - Eligibility checks (--with-page → ineligible)
+ *  - Eligibility checks (--with-page is not supported by the headless worker)
  *  - Worker spawn + stdin/stdout JSON protocol
- *  - Structured error / fallback policy
+ *  - Structured errors
  */
 
 const { execFileSync, spawn } = require("child_process");
 const path = require("path");
-
-// ============================================================================
-// Feature flag
-// ============================================================================
-
-function shouldUseBunChatGPT(env) {
-  const flag = (env || process.env).SURF_USE_BUN_CHATGPT;
-  if (!flag) return false;
-  return flag === "1" || flag.toLowerCase() === "true";
-}
 
 // ============================================================================
 // Bun detection
@@ -114,7 +103,7 @@ function buildWorkerRequest(args) {
  * @param {object} args - CLI-parsed tool args
  * @param {object} [opts]
  * @param {number} [opts.timeoutMs] - Kill worker after this many ms
- * @returns {Promise<{ ok: true, result: object } | { ok: false, error: string, code: string, fallbackRecommended: boolean }>}
+ * @returns {Promise<{ ok: true, result: object } | { ok: false, error: string, code: string }>}
  */
 async function runChatGPTViaBun(args, opts = {}) {
   const bunPath = detectBunPath();
@@ -122,8 +111,7 @@ async function runChatGPTViaBun(args, opts = {}) {
     return {
       ok: false,
       code: "bun_not_found",
-      error: "Bun executable not found. Install Bun canary for headless ChatGPT.",
-      fallbackRecommended: true,
+      error: "Bun executable not found. Install Bun for headless ChatGPT.",
     };
   }
 
@@ -163,7 +151,6 @@ async function runChatGPTViaBun(args, opts = {}) {
           ok: false,
           code: "timeout",
           error: `Bun worker killed after ${timeoutMs}ms`,
-          fallbackRecommended: false,
         });
       }
     }, timeoutMs + 5000);
@@ -176,7 +163,6 @@ async function runChatGPTViaBun(args, opts = {}) {
         ok: false,
         code: "spawn_failed",
         error: `Failed to spawn Bun worker: ${err.message}`,
-        fallbackRecommended: true,
       });
     });
 
@@ -193,7 +179,6 @@ async function runChatGPTViaBun(args, opts = {}) {
           ok: false,
           code: "protocol_error",
           error: `Bun worker produced no output (exit ${code}). stderr: ${stderr.slice(0, 300)}`,
-          fallbackRecommended: true,
         });
         return;
       }
@@ -207,14 +192,12 @@ async function runChatGPTViaBun(args, opts = {}) {
             ok: false,
             code: response.code || "unknown",
             error: response.error || "Bun worker error",
-            fallbackRecommended: response.fallbackRecommended ?? false,
           });
         } else {
           resolve({
             ok: false,
             code: "protocol_error",
             error: `Unexpected worker response shape: ${lastLine.slice(0, 200)}`,
-            fallbackRecommended: true,
           });
         }
       } catch (parseErr) {
@@ -222,7 +205,6 @@ async function runChatGPTViaBun(args, opts = {}) {
           ok: false,
           code: "protocol_error",
           error: `Failed to parse worker JSON: ${parseErr.message}. Output: ${lastLine.slice(0, 200)}`,
-          fallbackRecommended: true,
         });
       }
     });
@@ -234,7 +216,6 @@ async function runChatGPTViaBun(args, opts = {}) {
 // ============================================================================
 
 module.exports = {
-  shouldUseBunChatGPT,
   isBunChatGPTEligible,
   runChatGPTViaBun,
   detectBunPath,

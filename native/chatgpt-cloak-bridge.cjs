@@ -77,11 +77,7 @@ function runCloakWorker({ workerPath, request, timeout = DEFAULT_CHATGPT_CHATS_T
 
     const worker = runtime.spawn(process.execPath, [workerPath], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        CLOAK_HEADLESS: process.env.CLOAK_HEADLESS ?? "1",
-        CLOAK_HUMANIZE: process.env.CLOAK_HUMANIZE ?? "1",
-      },
+      env: { ...process.env },
     });
 
     const timeoutMs = timeout * 1000;
@@ -267,43 +263,7 @@ async function manageChatsWithCloakBrowser(opts, onProgress = () => {}) {
     },
   });
 
-  try {
-    return await runChatsRequest();
-  } catch (err) {
-    const shouldRetryHeaded = (
-      opts?.action === "get" &&
-      opts?.continueInBrowser !== true &&
-      err?.code === "worker_exit" &&
-      err?.exitCode === 0
-    );
-    if (!shouldRetryHeaded) throw err;
-    onProgress({
-      type: "progress",
-      step: 0,
-      total: 0,
-      message: "Worker exited without result; retrying in headed CloakBrowser",
-    });
-    const previousHeadless = process.env.CLOAK_HEADLESS;
-    try {
-      process.env.CLOAK_HEADLESS = "0";
-      return await runChatsRequest();
-    } catch (retryErr) {
-      const retryContext = {
-        initialError: {
-          code: err?.code || null,
-          exitCode: err?.exitCode ?? null,
-          message: err?.message || String(err),
-        },
-      };
-      if (retryErr && typeof retryErr === "object") {
-        retryErr.retryContext = retryContext;
-      }
-      throw retryErr;
-    } finally {
-      if (previousHeadless === undefined) delete process.env.CLOAK_HEADLESS;
-      else process.env.CLOAK_HEADLESS = previousHeadless;
-    }
-  }
+  return await runChatsRequest();
 }
 
 function __setBridgeRuntimeForTests(overrides = {}) {

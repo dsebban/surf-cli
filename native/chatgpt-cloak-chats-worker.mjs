@@ -54,12 +54,10 @@ function tempProfileDir() {
 }
 
 function buildLaunchOpts(userDataDir) {
-  const headless = process.env.CLOAK_HEADLESS !== '0';
-  const humanize = process.env.CLOAK_HUMANIZE !== '0';
   return {
     userDataDir,
-    headless,
-    humanize,
+    headless: true,
+    humanize: true,
     humanPreset: 'careful',
     viewport: { width: 1280, height: 800 },
     locale: 'en-US',

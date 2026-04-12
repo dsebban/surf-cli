@@ -2,25 +2,14 @@
  * Bridge module: spawns the Bun WebView worker for Gemini queries.
  *
  * Handles:
- *  - SURF_USE_BUN_GEMINI env flag
  *  - Bun executable detection
- *  - Eligibility checks (--with-page → ineligible)
+ *  - Eligibility checks (--with-page is not supported by the headless worker)
  *  - Worker spawn + stdin/stdout JSON protocol
- *  - Structured error / fallback policy
+ *  - Structured errors
  */
 
 const { execFileSync, spawn } = require("child_process");
 const path = require("path");
-
-// ============================================================================
-// Feature flag
-// ============================================================================
-
-function shouldUseBunGemini(env) {
-  const flag = (env || process.env).SURF_USE_BUN_GEMINI;
-  if (!flag) return false;
-  return flag === "1" || flag.toLowerCase() === "true";
-}
 
 // ============================================================================
 // Bun detection
@@ -121,7 +110,7 @@ function buildWorkerRequest(args) {
  * @param {object} args - CLI-parsed tool args
  * @param {object} [opts]
  * @param {number} [opts.timeoutMs] - Kill worker after this many ms
- * @returns {Promise<{ ok: true, result: object } | { ok: false, error: string, code: string, fallbackRecommended: boolean }>}
+ * @returns {Promise<{ ok: true, result: object } | { ok: false, error: string, code: string }>}
  */
 async function runGeminiViaBun(args, opts = {}) {
   const bunPath = detectBunPath();
@@ -129,8 +118,7 @@ async function runGeminiViaBun(args, opts = {}) {
     return {
       ok: false,
       code: "bun_not_found",
-      error: "Bun executable not found. Install Bun canary for headless Gemini.",
-      fallbackRecommended: true,
+      error: "Bun executable not found. Install Bun for headless Gemini.",
     };
   }
 
@@ -171,7 +159,6 @@ async function runGeminiViaBun(args, opts = {}) {
           ok: false,
           code: "timeout",
           error: `Bun worker killed after ${timeoutMs}ms`,
-          fallbackRecommended: false,
         });
       }
     }, timeoutMs + 5000);
@@ -184,7 +171,6 @@ async function runGeminiViaBun(args, opts = {}) {
         ok: false,
         code: "spawn_failed",
         error: `Failed to spawn Bun worker: ${err.message}`,
-        fallbackRecommended: true,
       });
     });
 
@@ -202,7 +188,6 @@ async function runGeminiViaBun(args, opts = {}) {
           ok: false,
           code: "protocol_error",
           error: `Bun worker produced no output (exit ${code}). stderr: ${stderr.slice(0, 300)}`,
-          fallbackRecommended: true,
         });
         return;
       }
@@ -216,14 +201,12 @@ async function runGeminiViaBun(args, opts = {}) {
             ok: false,
             code: response.code || "unknown",
             error: response.error || "Bun worker error",
-            fallbackRecommended: response.fallbackRecommended ?? false,
           });
         } else {
           resolve({
             ok: false,
             code: "protocol_error",
             error: `Unexpected worker response shape: ${lastLine.slice(0, 200)}`,
-            fallbackRecommended: true,
           });
         }
       } catch (parseErr) {
@@ -231,7 +214,6 @@ async function runGeminiViaBun(args, opts = {}) {
           ok: false,
           code: "protocol_error",
           error: `Failed to parse worker JSON: ${parseErr.message}. Output: ${lastLine.slice(0, 200)}`,
-          fallbackRecommended: true,
         });
       }
     });
@@ -243,7 +225,6 @@ async function runGeminiViaBun(args, opts = {}) {
 // ============================================================================
 
 module.exports = {
-  shouldUseBunGemini,
   isBunGeminiEligible,
   runGeminiViaBun,
   detectBunPath,

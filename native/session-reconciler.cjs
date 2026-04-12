@@ -43,12 +43,9 @@ function defaultPidIsAlive(pid) {
   }
 }
 
-/** True when the session was run via CloakBrowser (as opposed to Bun headless). */
+/** True when the session was run via CloakBrowser. ChatGPT is always Cloak in headless-only mode. */
 function isChatGptCloakSession(meta) {
-  return (
-    meta.tool === "chatgpt" &&
-    !!(meta.env && (meta.env.SURF_USE_CLOAK_CHATGPT === "1" || meta.env.SURF_USE_CLOAK_CHATGPT === true))
-  );
+  return meta.tool === "chatgpt" || meta.tool === "chatgpt.reply";
 }
 
 /** Pull the ChatGPT conversation ID out of wherever it may be stored. */

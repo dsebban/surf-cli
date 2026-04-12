@@ -14,9 +14,9 @@ ln -s "$(pwd)/skills/surf" ~/.agents/skills/surf
 cp -r skills/surf ~/.agents/skills/
 ```
 
-The skill will be available when pi detects browser automation tasks.
+The skill will be available when pi detects headless ChatGPT/Gemini terminal tasks.
 
-The bundled surf skill covers the current headless ChatGPT/Gemini operator flow too: `SURF_USE_CLOAK_CHATGPT=1`, profile-based auth, `--prompt-file` for inline large prompts, and `surf session --reconcile --network` for recovery checks.
+The bundled surf skill covers the current operator flow: profile-based auth, `--prompt-file` for inline large prompts, and `surf session --reconcile --network` for recovery checks.
 
 ## Other Agents
 

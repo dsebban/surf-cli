@@ -207,18 +207,11 @@ function createSession(tool, args = {}, env = {}) {
   const dir = path.join(sessionsDir, id);
   try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch {}
 
-  // Capture relevant env flags
-  const envFlags = {};
-  for (const key of ["SURF_USE_BUN_GEMINI","SURF_USE_BUN_CHATGPT","SURF_USE_CLOAK_CHATGPT"]) {
-    if (env[key]) envFlags[key] = env[key];
-  }
-
   const meta = {
     id,
     version:   VERSION,
     tool,
     args:      sanitizeArgs(args),
-    env:       envFlags,
     status:    "running",
     createdAt: new Date().toISOString(),
     _startMs:  Date.now(),
@@ -235,7 +228,6 @@ function createSession(tool, args = {}, env = {}) {
 
   // Write header to output.log
   const cmdPreview = [
-    Object.entries(envFlags).map(([k]) => `${k}=1`).join(" "),
     `surf ${tool}`,
     args.query ? `"${String(args.query).slice(0, 80)}"` : "",
     args.file  ? `--file ${args.file}` : "",

@@ -7,10 +7,6 @@
  * Protocol: stdin JSON lines → stdout JSON lines
  *   Input:  { type:"query", prompt, model?, file?, profile?, timeout?, generateImage? }
  *   Output: { type:"progress"|"success"|"error", … }
- *
- * Environment:
- *   CLOAK_HEADLESS  — "0" for headed (default "1")
- *   CLOAK_HUMANIZE  — "0" to disable (default "1")
  */
 
 import { launchPersistentContext } from 'cloakbrowser';
@@ -112,12 +108,10 @@ function tempProfileDir() {
 // Launch options builder
 
 function buildLaunchOpts(userDataDir) {
-  const headless = process.env.CLOAK_HEADLESS !== '0';
-  const humanize = process.env.CLOAK_HUMANIZE !== '0';
   return {
     userDataDir,
-    headless,
-    humanize,
+    headless: true,
+    humanize: true,
     humanPreset: 'careful',
     viewport: { width: 1280, height: 800 },
     locale: 'en-US',
@@ -804,8 +798,8 @@ async function runQuery({ prompt, model, file, profile, timeout = DEFAULT_CHATGP
 
   const context = await launchPersistentContext(buildLaunchOpts(userDataDir));
   log('info', 'CloakBrowser launched', {
-    headless: process.env.CLOAK_HEADLESS !== '0',
-    humanize: process.env.CLOAK_HUMANIZE !== '0',
+    headless: true,
+    humanize: true,
   });
 
   // Cleanup on forced kill
@@ -854,7 +848,7 @@ async function runQuery({ prompt, model, file, profile, timeout = DEFAULT_CHATGP
         fail('login_required',
           useInjectedProfile
             ? `Login failed for profile "${profile}". Session cookie may be expired.`
-            : 'ChatGPT login required. Use --profile <email> or log in via CLOAK_HEADLESS=0.'
+            : 'ChatGPT login required. Use --profile <email> or authenticate the shared ~/.surf/cloak-profile session.'
         );
         return;
       }
@@ -877,7 +871,7 @@ async function runQuery({ prompt, model, file, profile, timeout = DEFAULT_CHATGP
         fail('login_required',
           useInjectedProfile
             ? `Login failed for profile "${profile}". Session cookie may be expired.`
-            : 'ChatGPT login required. Use --profile <email> or log in via CLOAK_HEADLESS=0.'
+            : 'ChatGPT login required. Use --profile <email> or authenticate the shared ~/.surf/cloak-profile session.'
         );
         return;
       }

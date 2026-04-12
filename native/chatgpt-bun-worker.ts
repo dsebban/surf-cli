@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-/// <reference path="./bun-webview.d.ts" />
+declare const Bun: any;
 /**
  * Bun WebView worker for ChatGPT queries.
  *
@@ -72,7 +72,6 @@ interface WorkerError {
   ok: false;
   code: string;
   error: string;
-  fallbackRecommended: boolean;
 }
 
 // ============================================================================
@@ -1284,23 +1283,12 @@ async function main() {
     const message = err.message || String(err);
     log(`Error [${code}]: ${message}`);
 
-    // Fallback policy: hard-fail for Bun-only features; recommend fallback for others
-    const HARD_FAIL_CODES = new Set([
-      "upload_failed",
-      "image_save_failed",
-      "profile_not_found",
-      "profile_ambiguous",
-      "profile_unsupported_platform",
-      "protocol_error",
-    ]);
-
     console.log(
       JSON.stringify({
         ok: false,
         code,
         error: message,
-        fallbackRecommended: !HARD_FAIL_CODES.has(code),
-      }),
+      } satisfies WorkerError),
     );
   } finally {
     if (wv) {
@@ -1310,3 +1298,5 @@ async function main() {
 }
 
 main();
+
+export {};

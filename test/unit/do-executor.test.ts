@@ -4,65 +4,18 @@ import { describe, expect, it } from "vitest";
 import * as executor from "../../native/do-executor.cjs";
 
 describe("shouldAutoWait", () => {
-  it("returns true for navigation commands", () => {
-    expect(executor.shouldAutoWait("go")).toBe(true);
-    expect(executor.shouldAutoWait("navigate")).toBe(true);
-    expect(executor.shouldAutoWait("back")).toBe(true);
-    expect(executor.shouldAutoWait("forward")).toBe(true);
-  });
-
-  it("returns true for interaction commands", () => {
-    expect(executor.shouldAutoWait("click")).toBe(true);
-    expect(executor.shouldAutoWait("key")).toBe(true);
-    expect(executor.shouldAutoWait("form.fill")).toBe(true);
-    expect(executor.shouldAutoWait("submit")).toBe(true);
-  });
-
-  it("returns false for type (no DOM changes expected)", () => {
-    expect(executor.shouldAutoWait("type")).toBe(false);
-  });
-
-  it("returns true for tab commands", () => {
-    expect(executor.shouldAutoWait("tab.switch")).toBe(true);
-    expect(executor.shouldAutoWait("tab.new")).toBe(true);
-  });
-
-  it("returns false for read-only commands", () => {
-    expect(executor.shouldAutoWait("screenshot")).toBe(false);
-    expect(executor.shouldAutoWait("page.read")).toBe(false);
-    expect(executor.shouldAutoWait("tab.list")).toBe(false);
-    expect(executor.shouldAutoWait("ai")).toBe(false);
+  it("returns false after browser auto-waits were removed", () => {
+    expect(executor.shouldAutoWait("chatgpt")).toBe(false);
+    expect(executor.shouldAutoWait("gemini")).toBe(false);
+    expect(executor.shouldAutoWait("click")).toBe(false);
   });
 });
 
 describe("getAutoWaitCommand", () => {
-  it("returns wait.load for navigation", () => {
-    expect(executor.getAutoWaitCommand("navigate")).toBe("wait.load");
-    expect(executor.getAutoWaitCommand("go")).toBe("wait.load");
-    expect(executor.getAutoWaitCommand("back")).toBe("wait.load");
-    expect(executor.getAutoWaitCommand("forward")).toBe("wait.load");
-  });
-
-  it("returns wait.dom for click", () => {
-    expect(executor.getAutoWaitCommand("click")).toBe("wait.dom");
-  });
-
-  it("returns wait.load for submit", () => {
-    expect(executor.getAutoWaitCommand("submit")).toBe("wait.load");
-  });
-
-  it("returns null for type", () => {
-    expect(executor.getAutoWaitCommand("type")).toBe(null);
-  });
-
-  it("returns wait.load for tab commands", () => {
-    expect(executor.getAutoWaitCommand("tab.switch")).toBe("wait.load");
-    expect(executor.getAutoWaitCommand("tab.new")).toBe("wait.load");
-  });
-
-  it("returns null for unknown commands", () => {
-    expect(executor.getAutoWaitCommand("screenshot")).toBe(null);
-    expect(executor.getAutoWaitCommand("page.read")).toBe(null);
+  it("returns null because headless AI commands do not need browser auto-waits", () => {
+    expect(executor.getAutoWaitCommand("chatgpt")).toBe(null);
+    expect(executor.getAutoWaitCommand("gemini")).toBe(null);
+    expect(executor.getAutoWaitCommand("click")).toBe(null);
   });
 });
 
@@ -103,30 +56,27 @@ describe("substituteVars", () => {
   });
 });
 
-describe("AUTO_WAIT_COMMANDS", () => {
-  it("includes expected commands", () => {
-    expect(executor.AUTO_WAIT_COMMANDS).toContain("go");
-    expect(executor.AUTO_WAIT_COMMANDS).toContain("navigate");
-    expect(executor.AUTO_WAIT_COMMANDS).toContain("click");
-    expect(executor.AUTO_WAIT_COMMANDS).toContain("key");
+describe("executeSingleStep", () => {
+  it("rejects commands outside the headless workflow runtime", async () => {
+    const result = await executor.executeSingleStep(
+      { cmd: "screenshot", args: {} },
+      {},
+      {},
+      { quiet: true },
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("not supported by the headless-only workflow runtime");
   });
+});
 
-  it("excludes type (typing doesn't trigger waits)", () => {
-    expect(executor.AUTO_WAIT_COMMANDS).not.toContain("type");
+describe("AUTO_WAIT_COMMANDS", () => {
+  it("is empty in headless-only mode", () => {
+    expect(executor.AUTO_WAIT_COMMANDS).toEqual([]);
   });
 });
 
 describe("AUTO_WAIT_MAP", () => {
-  it("maps navigation to wait.load", () => {
-    expect(executor.AUTO_WAIT_MAP.navigate).toBe("wait.load");
-    expect(executor.AUTO_WAIT_MAP.go).toBe("wait.load");
-  });
-
-  it("maps click to wait.dom", () => {
-    expect(executor.AUTO_WAIT_MAP.click).toBe("wait.dom");
-  });
-
-  it("does not include type (not an auto-wait command)", () => {
-    expect(executor.AUTO_WAIT_MAP.type).toBeUndefined();
+  it("is empty in headless-only mode", () => {
+    expect(executor.AUTO_WAIT_MAP).toEqual({});
   });
 });

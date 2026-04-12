@@ -3,32 +3,6 @@ import { describe, expect, it } from "vitest";
 const bridge = require("../../native/gemini-bun-bridge.cjs");
 
 describe("gemini-bun-bridge", () => {
-  describe("shouldUseBunGemini", () => {
-    it("returns false when env not set", () => {
-      expect(bridge.shouldUseBunGemini({})).toBe(false);
-    });
-
-    it("returns false for empty string", () => {
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "" })).toBe(false);
-    });
-
-    it("returns true for '1'", () => {
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "1" })).toBe(true);
-    });
-
-    it("returns true for 'true' (case-insensitive)", () => {
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "true" })).toBe(true);
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "True" })).toBe(true);
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "TRUE" })).toBe(true);
-    });
-
-    it("returns false for other values", () => {
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "0" })).toBe(false);
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "false" })).toBe(false);
-      expect(bridge.shouldUseBunGemini({ SURF_USE_BUN_GEMINI: "yes" })).toBe(false);
-    });
-  });
-
   describe("isBunGeminiEligible", () => {
     it("returns ineligible for --with-page", () => {
       const result = bridge.isBunGeminiEligible({ "with-page": true });
@@ -126,7 +100,7 @@ describe("gemini-bun-bridge", () => {
 
   // --- P2 fix: protocol edge cases ---
   describe("runGeminiViaBun - protocol edge cases", () => {
-    it("returns error with fallback for empty stdout", async () => {
+    it("returns protocol error for empty stdout", async () => {
       // We can't easily mock spawn, but we can test with a deliberately bad worker
       // by pointing to a non-existent script — spawn_failed
       const { execFileSync } = require("node:child_process");

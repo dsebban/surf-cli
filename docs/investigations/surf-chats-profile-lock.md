@@ -16,8 +16,8 @@
 - `.pi/extensions/pi-surf-chats/surf-client.ts:121-152` invoked `chatgpt.chats` commands without any `--profile` flag.
 - `native/cli.cjs:3458-3465` forwards `requestedProfile` into `chatArgs.profile` for `chatgpt.chats`.
 - `native/chatgpt-cloak-chats-worker.mjs:502-510` chooses `tempProfileDir()` when `profile` is set, otherwise `sharedProfileDir()`.
-- Repro without profile: `SURF_USE_CLOAK_CHATGPT=1 node native/cli.cjs chatgpt.chats --json --limit 1` failed with `Failed to create a ProcessSingleton for your profile directory` against `/Users/danielsivan/.surf/cloak-profile`.
-- Repro with profile: `SURF_USE_CLOAK_CHATGPT=1 node native/cli.cjs chatgpt.chats --json --limit 1 --profile dsebban883@gmail.com` succeeded and returned conversation JSON.
+- Repro without profile: `node native/cli.cjs chatgpt.chats --json --limit 1` failed with `Failed to create a ProcessSingleton for your profile directory` against `/Users/danielsivan/.surf/cloak-profile`.
+- Repro with profile: `node native/cli.cjs chatgpt.chats --json --limit 1 --profile dsebban883@gmail.com` succeeded and returned conversation JSON.
 **Conclusion:** Root cause confirmed: extension omitted `--profile`, so isolated temp-profile mode never activated.
 
 ### Phase 2 - Fix

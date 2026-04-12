@@ -8,30 +8,9 @@ let cachedConfig = null;
 let cachedConfigPath = null;
 
 const STARTER_CONFIG = {
-  // Set to false to disable auto-saving screenshots to /tmp
-  // When disabled, screenshots return base64 + ID instead of file path
-  autoSaveScreenshots: true,
-  routes: {
-    main: ["http://localhost:3000"]
-  },
-  selectors: {
-    chatgpt: {
-      input: "#prompt-textarea"
-    }
-  }
+  chatgpt: {},
+  gemini: {}
 };
-
-// Grok models can be customized in surf.json if X.com UI changes:
-// {
-//   "grok": {
-//     "models": {
-//       "thinking": { "id": "thinking", "name": "Grok 4.1 Thinking" },
-//       "auto": { "id": "auto", "name": "Auto" },
-//       "fast": { "id": "fast", "name": "Fast" },
-//       "expert": { "id": "expert", "name": "Expert" }
-//     }
-//   }
-// }
 
 function findConfigPath() {
   const cwdPath = path.join(process.cwd(), CONFIG_NAME);

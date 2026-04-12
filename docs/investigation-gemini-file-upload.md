@@ -2,7 +2,7 @@
 
 ## Summary
 
-`SURF_USE_BUN_GEMINI=1 surf gemini "..." --file /tmp/file.md` sends only the prompt; the file is
+`surf gemini "..." --file /tmp/file.md` sends only the prompt; the file is
 never included in the Gemini message. This is a **silent false-positive upload** bug: the UI chip
 appears (pollUntil exits cleanly), but the file bytes were never transmitted to Google's upload API.
 

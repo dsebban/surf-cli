@@ -33,7 +33,7 @@ The ChatGPT Pro run did produce a valid assistant response remotely, and that re
 
 **Evidence:**
 - Export command used:
-  - `SURF_USE_CLOAK_CHATGPT=1 surf chatgpt.chats 69d730dc-7f68-8389-9001-9993d8d8020d --export /tmp/chatgpt-69d730dc.md --format markdown --profile dsebban883@gmail.com`
+  - `surf chatgpt.chats 69d730dc-7f68-8389-9001-9993d8d8020d --export /tmp/chatgpt-69d730dc.md --format markdown --profile dsebban883@gmail.com`
 - Exported file: `/tmp/chatgpt-69d730dc.md`
 - Header/body markers in export:
   - first user turn: `### You · 07:53`

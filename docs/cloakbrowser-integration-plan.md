@@ -11,7 +11,7 @@ Integrate CloakBrowser as a new ChatGPT backend to defeat detection systems.
 3. `native/chatgpt-cloak-profile.mjs` - Cookie injection for CloakBrowser contexts
 
 ### Modified Files
-1. `native/cli.cjs` - Add `SURF_USE_CLOAK_CHATGPT` routing gate
+1. `native/cli.cjs` - Add a ChatGPT Cloak routing gate
 2. `native/chatgpt-bun-bridge.cjs` - Add CloakBrowser as fallback chain
 3. `package.json` - Add optional `cloakbrowser` dependency
 
@@ -19,8 +19,8 @@ Integrate CloakBrowser as a new ChatGPT backend to defeat detection systems.
 
 | Flag | Behavior |
 |------|----------|
-| `SURF_USE_BUN_CHATGPT=1` | Current Bun.WebView implementation |
-| `SURF_USE_CLOAK_CHATGPT=1` | New CloakBrowser Playwright implementation |
+| the ChatGPT Bun routing flag | Current Bun.WebView implementation |
+| the ChatGPT Cloak routing flag | New CloakBrowser Playwright implementation |
 | Neither set | Defaults to extension-based path (legacy) |
 
 ## CloakBrowser Worker Features
@@ -129,7 +129,7 @@ From research and our testing:
 - Progress feedback
 
 ### Phase 3: Integration (1-2 hours)
-- CLI wiring with `SURF_USE_CLOAK_CHATGPT` flag
+- CLI wiring with the ChatGPT Cloak routing flag
 - Error handling / fallback
 - Tests
 
@@ -146,21 +146,21 @@ npm install -g surf-cli
 npm install -g cloakbrowser  # Auto-downloads ~200MB Chromium
 
 # Use CloakBrowser mode
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "What is 2+2?" --profile user@gmail.com
+surf chatgpt "What is 2+2?" --profile user@gmail.com
 
 # With humanization (default)
-SURF_USE_CLOAK_CHATGPT=1 surf chatgpt "Explain quantum entanglement" --model thinking
+surf chatgpt "Explain quantum entanglement" --model thinking
 ```
 
 ## Fallback Chain
 
 ```
-SURF_USE_CLOAK_CHATGPT=1
+ChatGPT Cloak routing enabled
   └─> CloakBrowser (if installed)
       └─> Bun.WebView (if CloakBrowser not installed)
           └─> Extension-based path (if Bun fails)
 
-SURF_USE_BUN_CHATGPT=1
+ChatGPT Bun routing enabled
   └─> Bun.WebView
       └─> Extension-based path (if Bun fails)
 

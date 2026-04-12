@@ -3,32 +3,6 @@ import { describe, expect, it } from "vitest";
 const bridge = require("../../native/chatgpt-bun-bridge.cjs");
 
 describe("chatgpt-bun-bridge", () => {
-  describe("shouldUseBunChatGPT", () => {
-    it("returns false when env not set", () => {
-      expect(bridge.shouldUseBunChatGPT({})).toBe(false);
-    });
-
-    it("returns false for empty string", () => {
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "" })).toBe(false);
-    });
-
-    it("returns true for '1'", () => {
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "1" })).toBe(true);
-    });
-
-    it("returns true for 'true' (case-insensitive)", () => {
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "true" })).toBe(true);
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "True" })).toBe(true);
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "TRUE" })).toBe(true);
-    });
-
-    it("returns false for other values", () => {
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "0" })).toBe(false);
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "false" })).toBe(false);
-      expect(bridge.shouldUseBunChatGPT({ SURF_USE_BUN_CHATGPT: "yes" })).toBe(false);
-    });
-  });
-
   describe("isBunChatGPTEligible", () => {
     it("returns ineligible for --with-page", () => {
       const result = bridge.isBunChatGPTEligible({ "with-page": true });
@@ -110,7 +84,7 @@ describe("chatgpt-bun-bridge", () => {
 
   // Protocol edge cases
   describe("runChatGPTViaBun - protocol edge cases", () => {
-    it("returns error with fallback for empty stdout", async () => {
+    it("returns protocol error for empty stdout", async () => {
       const { execFileSync } = require("node:child_process");
       try {
         execFileSync("which", ["bun"], { encoding: "utf-8", timeout: 3000 });

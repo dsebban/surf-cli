@@ -381,7 +381,7 @@ Minimal modification — the existing worker already handles everything after na
 
 1. `--rename`, `--delete` (PATCH/POST endpoints)
 2. File download from conversations (`/backend-api/files/download/{id}`)
-3. `--continue` (open in headed browser via `CLOAK_HEADLESS=0`)
+3. headed-browser continuation mode
 4. Caching layer for conversation list (avoid rate limits)
 5. Persistent browser context (avoid cold start on repeated commands)
 

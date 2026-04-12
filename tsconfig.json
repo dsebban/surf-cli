@@ -8,13 +8,14 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "declaration": false,
     "declarationMap": false,
     "sourceMap": true,
     "outDir": "./dist",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["chrome", "vitest/globals", "node"]
+    "types": ["vitest/globals", "node"]
   },
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["native/**/*.ts", "test/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

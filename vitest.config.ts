@@ -17,7 +17,7 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "html", "lcov"],
       reportsDirectory: "./coverage",
-      include: ["src/**/*.ts", "native/**/*.cjs"],
+      include: ["native/**/*.cjs", "native/**/*.ts"],
       exclude: [
         "node_modules",
         "test",
