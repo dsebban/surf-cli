@@ -515,6 +515,13 @@ const REMOVED_COMMANDS = {
   left_click_drag: "drag",
 };
 
+const UNSUPPORTED_HEADLESS_COMMANDS = new Set([
+  "perplexity",
+  "grok",
+  "aistudio",
+  "aistudio.build",
+]);
+
 const TOOLS = {
   ai: {
     desc: "AI assistants (ChatGPT, Gemini)",
@@ -583,6 +590,7 @@ const TOOLS = {
           thread: "Thread timestamp to fetch replies for",
           channels: "List available channels instead of reading messages",
           "include-dms": "Include DMs and group DMs when listing channels",
+          workspace: "Slack workspace/team ID when profile has multiple workspaces",
           limit: "Number of messages to fetch (default: 50)",
           days: "How many days back to fetch (default: 7)",
           format: "Output format: markdown|json (default: markdown)",
@@ -618,72 +626,6 @@ const TOOLS = {
           { cmd: 'gemini "add sunglasses" --edit-image photo.jpg --output out.jpg', desc: "Edit image" },
           { cmd: 'gemini "summarize this video" --youtube "https://youtube.com/..."', desc: "YouTube analysis" },
           { cmd: 'gemini "summarize" --profile dsebban883@gmail.com', desc: "Use specific Chrome profile (Bun)" },
-        ]
-      },
-      "perplexity": {
-        desc: "Search with Perplexity AI (uses browser session)",
-        args: ["query"],
-        opts: {
-          "with-page": "Include current page context",
-          mode: "Mode: search (default), research",
-          model: "Model (Pro users): sonar, gpt-4o, claude, etc.",
-          timeout: "Timeout in seconds (default: 120)"
-        },
-        examples: [
-          { cmd: 'perplexity "what is quantum computing"', desc: "Basic search" },
-          { cmd: 'perplexity "explain this page" --with-page', desc: "With page context" },
-          { cmd: 'perplexity "deep dive into transformers" --mode research', desc: "Research mode" },
-          { cmd: 'perplexity "latest AI news" --model sonar', desc: "Specify model (Pro)" },
-        ]
-      },
-      "grok": {
-        desc: "Query Grok AI with real-time X/Twitter data access (uses browser session)",
-        args: ["query"],
-        opts: {
-          "with-page": "Include current page context",
-          model: "Model: auto, fast, expert, thinking (default)",
-          "deep-search": "Enable DeepSearch for X post searching",
-          timeout: "Timeout in seconds (default: 300 for thinking models)",
-          validate: "Check Grok UI and scrape available models (no query sent)",
-          "save-models": "Save discovered models to surf.json config"
-        },
-        examples: [
-          { cmd: 'grok "what are the latest AI agent trends on X"', desc: "Search X posts" },
-          { cmd: 'grok "analyze @username recent activity"', desc: "Profile analysis" },
-          { cmd: 'grok "summarize this page" --with-page', desc: "With page context" },
-          { cmd: 'grok "find viral AI posts" --deep-search', desc: "DeepSearch mode" },
-          { cmd: 'grok "quick question" --model fast', desc: "Faster model" },
-          { cmd: 'grok --validate', desc: "Check UI and list available models" },
-          { cmd: 'grok --validate --save-models', desc: "Save discovered models to settings" },
-        ]
-      },
-      "aistudio": {
-        desc: "Query via Google AI Studio (uses browser session)",
-        args: ["query"],
-        opts: {
-          "with-page": "Include current page context",
-          model: "Model (best-effort): pass an AI Studio model id like gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-flash-lite-latest. If invalid, AI Studio uses the last-selected UI model",
-          timeout: "Timeout in seconds (default: 300)"
-        },
-        examples: [
-          { cmd: 'aistudio "explain quantum computing"', desc: "Basic query" },
-          { cmd: 'aistudio "redteam this" --with-page', desc: "With page context" },
-          { cmd: 'aistudio "quick answer" --model gemini-3-flash-preview', desc: "Model selection" },
-        ]
-      },
-      "aistudio.build": {
-        desc: "Build an app via Google AI Studio App Builder (uses browser session)",
-        args: ["query"],
-        opts: {
-          model: "Model override for Advanced Settings (e.g. gemini-3.1-pro-preview)",
-          output: "Directory to extract the downloaded zip",
-          timeout: "Build timeout in seconds (default: 600)",
-          "keep-open": "Keep the AI Studio tab open after completion",
-        },
-        examples: [
-          { cmd: 'aistudio.build "build a portfolio site"', desc: "Build with defaults" },
-          { cmd: 'aistudio.build "todo app with auth" --model gemini-3.1-pro-preview', desc: "Build with model override" },
-          { cmd: 'aistudio.build "crm dashboard" --output ./out', desc: "Build and extract to directory" },
         ]
       },
       "ai": { 
@@ -2874,6 +2816,12 @@ if (REMOVED_COMMANDS[tool]) {
 
 tool = ALIASES[tool] || tool;
 
+if (UNSUPPORTED_HEADLESS_COMMANDS.has(tool)) {
+  console.error(`Error: Command '${tool}' is no longer supported in headless-only mode.`);
+  console.error("Supported AI commands: chatgpt, gemini");
+  process.exit(1);
+}
+
 // Auto-save screenshots to temp file when no --output specified
 // This ensures agents always get a usable file path, not just an in-memory ID
 // Can be disabled with --no-save flag or autoSaveScreenshots: false in surf.json
@@ -2917,10 +2865,6 @@ const PRIMARY_ARG_MAP = {
   "chatgpt.chats": "conversationId",
   "chatgpt.reply": "conversationId",
   "slack.read": "channelId",
-  perplexity: "query",
-  grok: "query",
-  aistudio: "query",
-  "aistudio.build": "query",
   navigate: "url",
   go: "url",
   js: "code",
@@ -3069,9 +3013,6 @@ if (!noScreenshot && AUTO_SCREENSHOT_TOOLS.includes(tool)) {
 
 const outputPath = toolArgs.output;
 delete toolArgs.output;
-if (tool === "aistudio.build" && outputPath) {
-  toolArgs.output = path.resolve(outputPath);
-}
 if (tool === "gemini") {
   if (outputPath) toolArgs.output = path.resolve(outputPath);
   if (toolArgs["generate-image"] && typeof toolArgs["generate-image"] === "string") {
@@ -3630,15 +3571,38 @@ if (tool === "chatgpt") {
 }
 
 if (tool === "slack.read") {
+  const parsePositiveIntegerOption = (raw) => {
+    const value = String(raw).trim();
+    if (!/^\d+$/.test(value)) return NaN;
+    return Number.parseInt(value, 10);
+  };
+
   const channelId = typeof toolArgs.channelId === "string" ? toolArgs.channelId.trim() : "";
   const threadTs = toolArgs.thread === undefined ? "" : String(toolArgs.thread).trim();
   const wantChannels = toolArgs.channels === true;
   const includeDms = toolArgs["include-dms"] === true;
-  const limit = toolArgs.limit === undefined ? undefined : parseInt(String(toolArgs.limit), 10);
-  const days = toolArgs.days === undefined ? undefined : parseInt(String(toolArgs.days), 10);
+  const workspace = toolArgs.workspace === undefined ? undefined : String(toolArgs.workspace).trim();
+  const limit = toolArgs.limit === undefined ? undefined : parsePositiveIntegerOption(toolArgs.limit);
+  const days = toolArgs.days === undefined ? undefined : parsePositiveIntegerOption(toolArgs.days);
   const explicitFormat = toolArgs.format;
-  const timeout = toolArgs.timeout;
+  const timeout = toolArgs.timeout === undefined ? undefined : parsePositiveIntegerOption(toolArgs.timeout);
 
+  if (toolArgs.limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+    console.error("Error: --limit must be a positive integer");
+    process.exit(1);
+  }
+  if (toolArgs.days !== undefined && (!Number.isFinite(days) || days <= 0)) {
+    console.error("Error: --days must be a positive integer");
+    process.exit(1);
+  }
+  if (toolArgs.timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
+    console.error("Error: --timeout must be a positive integer");
+    process.exit(1);
+  }
+  if (toolArgs.workspace !== undefined && !workspace) {
+    console.error("Error: --workspace requires a non-empty workspace/team ID");
+    process.exit(1);
+  }
   if (threadTs && !channelId) {
     console.error("Error: --thread requires a channel ID");
     process.exit(1);
@@ -3676,6 +3640,7 @@ if (tool === "slack.read") {
         limit: limit || undefined,
         days: days || undefined,
         profile: requestedProfile,
+        workspace,
         includeDms,
         timeout,
       }, progressCb);
@@ -3872,18 +3837,11 @@ if (tool === "gemini") {
           }
           process.exit(0);
         } else if (bunResult.fallbackRecommended) {
-          // When --profile was explicit, never fall back (wrong account risk)
-          if (requestedProfile) {
-            sess.fail(new Error(bunResult.error || "bun gemini failed"));
-            process.stderr.write = _origWrite;
-            console.error(`Error: Bun Gemini failed with --profile: ${bunResult.error}`);
-            process.exit(1);
-          }
+          const errMsg = bunResult.error || "Bun Gemini fallback requested";
+          sess.fail(new Error(errMsg));
           process.stderr.write = _origWrite;
-          // Mark bun attempt as cancelled — legacy path will run independently
-          sess.fail(Object.assign(new Error(bunResult.error || "bun gemini fallback"), { code: "fallback" }));
-          process.stderr.write(`[bun-gemini] Falling back to legacy path: ${bunResult.error}\n`);
-          startLegacySocketPath();
+          console.error(`Error: Gemini requires Bun in headless-only mode. ${errMsg}`);
+          process.exit(1);
         } else {
           // Runtime error — honor --soft-fail / --auto-capture like legacy path
           const errMsg = bunResult.error || "Bun Gemini worker error";
@@ -3915,15 +3873,13 @@ if (tool === "gemini") {
       }
     })();
   } else {
-    // Not eligible for Bun (e.g. --with-page) → legacy path
-    if (requestedProfile) {
-      console.error(`Error: --profile cannot be used with --with-page`);
+    if (requestedProfile && (toolArgs["with-page"] || toolArgs.withPage)) {
+      console.error("Error: --profile cannot be used with --with-page");
       process.exit(1);
     }
-    if (eligibility.reason !== "with_page") {
-      process.stderr.write(`[bun-gemini] Not eligible: ${eligibility.reason}, using legacy path\n`);
-    }
-    startLegacySocketPath();
+    const reason = eligibility.reason || "not_eligible";
+    console.error(`Error: Gemini requires Bun in headless-only mode. Not eligible for Bun (${reason}).`);
+    process.exit(1);
   }
 } else if (tool !== "chatgpt") {
   // Non-Gemini, non-ChatGPT tools → legacy socket path
@@ -3936,12 +3892,8 @@ const socket = net.createConnection(SOCKET_PATH, () => {
   socket.write(JSON.stringify(request) + "\n");
 });
 
-const AI_TOOLS = ["smoke", "chatgpt", "gemini", "perplexity", "grok", "aistudio", "aistudio.build", "ai"];
+const AI_TOOLS = ["smoke", "chatgpt", "gemini", "ai"];
 let requestTimeout = AI_TOOLS.includes(tool) ? 300000 : 30000;
-if (tool === "aistudio.build") {
-  const userTimeoutSec = parseInt(options.timeout || "600", 10);
-  requestTimeout = (userTimeoutSec * 1000) + 60000;
-}
 const timeout = setTimeout(() => {
   console.error(`Error: Request timed out (${requestTimeout / 1000}s)`);
   socket.destroy();
@@ -4021,10 +3973,6 @@ async function handleResponse(response) {
     data = result ? JSON.parse(result) : response.result;
   } catch {
     data = result || response.result;
-  }
-
-  if (tool === 'aistudio' && typeof data === 'string') {
-    data = { response: data };
   }
 
   if (wantJson) {
@@ -4198,39 +4146,6 @@ async function handleResponse(response) {
       console.log(`\nImage saved: ${data.imagePath}`);
     }
     console.error(`\n[${data.model || 'unknown'} | ${((data.tookMs || 0) / 1000).toFixed(1)}s]`);
-  } else if (tool === "aistudio" && data?.response) {
-    console.log(data.response);
-
-    const meta = [];
-    if (data.model) meta.push(data.model);
-    if (data.thinkingTime) meta.push(`thought ${data.thinkingTime}s`);
-    if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s`);
-    if (meta.length > 0) {
-      console.error(`\n[${meta.join(' | ')}]`);
-    }
-  } else if (tool === "aistudio.build" && data?.zipPath) {
-    console.error(`Downloaded: ${data.zipPath}`);
-    if (data.extractedPath) {
-      console.error(`Extracted: ${data.extractedPath}`);
-      console.error("");
-    }
-
-    const meta = [];
-    if (data.model) meta.push(data.model);
-    if (Number.isFinite(data.buildDuration)) meta.push(`built ${data.buildDuration}s`);
-    if (Number.isFinite(data.tookMs)) meta.push(`${(data.tookMs / 1000).toFixed(1)}s total`);
-    if (meta.length > 0) {
-      console.error(`[${meta.join(" | ")}]`);
-    }
-  } else if (tool === "perplexity" && data?.response) {
-    console.log(data.response);
-    const meta = [];
-    if (data.sources) meta.push(`${data.sources} sources`);
-    if (data.mode) meta.push(data.mode);
-    if (data.model && data.model !== 'default') meta.push(data.model);
-    meta.push(`${((data.tookMs || 0) / 1000).toFixed(1)}s`);
-    console.error(`\n[${meta.join(' | ')}]`);
-    if (data.url) console.error(`URL: ${data.url}`);
   } else if (tool === "window.list" && data?.windows) {
     if (data.windows.length === 0) {
       console.log("No windows. Use 'surf window.new' to create one.");

@@ -5,7 +5,7 @@
  * Reads Slack conversations via internal APIs from an authenticated browser context.
  *
  * Protocol: stdin JSON lines → stdout JSON lines
- *   Input:  { type:"slack", action:"history"|"replies"|"channels", channel?, threadTs?, limit?, days?, profile?, includeDms?, timeout? }
+ *   Input:  { type:"slack", action:"history"|"replies"|"channels", channel?, threadTs?, limit?, days?, profile?, workspace?, includeDms?, timeout? }
  *   Output: { type:"progress"|"success"|"error"|"keepalive"|"log", … }
  */
 
@@ -103,8 +103,8 @@ async function waitForSlackReady(page, timeoutMs = 45_000) {
 // ============================================================================
 // Slack token extraction
 
-async function extractSlackToken(page) {
-  return await page.evaluate(() => {
+async function extractSlackToken(page, requestedWorkspaceId) {
+  return await page.evaluate((workspaceId) => {
     try {
       const raw = localStorage.getItem('localConfig_v2')
       if (!raw) return null
@@ -112,10 +112,43 @@ async function extractSlackToken(page) {
       if (!config.teams) return null
       const teamIds = Object.keys(config.teams)
       if (teamIds.length === 0) return null
-      // Return first team's token — for enterprise, the first team is usually correct
+
+      const availableTeams = teamIds.map((id) => ({ id, name: config.teams[id]?.name || null }))
+
+      if (workspaceId) {
+        const team = config.teams[workspaceId]
+        if (!team) {
+          return {
+            token: null,
+            teamId: workspaceId,
+            teamName: null,
+            teamCount: teamIds.length,
+            availableTeams,
+            missingWorkspace: true,
+          }
+        }
+        return {
+          token: team?.token || null,
+          teamId: workspaceId,
+          teamName: team?.name || null,
+          teamCount: teamIds.length,
+          availableTeams,
+        }
+      }
+
+      if (teamIds.length > 1) {
+        return {
+          token: null,
+          teamId: null,
+          teamName: null,
+          teamCount: teamIds.length,
+          availableTeams,
+          requiresWorkspaceSelection: true,
+        }
+      }
+
       const teamId = teamIds[0]
       const team = config.teams[teamId]
-      const availableTeams = teamIds.map((id) => ({ id, name: config.teams[id]?.name || null }))
       return {
         token: team?.token || null,
         teamId,
@@ -126,7 +159,7 @@ async function extractSlackToken(page) {
     } catch {
       return null
     }
-  })
+  }, requestedWorkspaceId)
 }
 
 // ============================================================================
@@ -411,7 +444,7 @@ async function main() {
     process.exit(1)
   }
 
-  const { action, profile, timeout = 120 } = request
+  const { action, profile, workspace, timeout = 120 } = request
   let context = null
   let profileDir = null
 
@@ -464,18 +497,26 @@ async function main() {
 
     // Extract token
     progress(3, 5, 'Extracting auth token...')
-    const tokenInfo = await extractSlackToken(page)
+    const tokenInfo = await extractSlackToken(page, workspace)
+    if (tokenInfo?.requiresWorkspaceSelection && Array.isArray(tokenInfo.availableTeams)) {
+      const teamList = tokenInfo.availableTeams
+        .map((team) => `${team.name || 'unknown'} (${team.id})`)
+        .join(', ')
+      fail('workspace_required', `Multiple Slack workspaces found. Available: ${teamList}. Specify one with --workspace <team-id>.`)
+      return
+    }
+    if (tokenInfo?.missingWorkspace && Array.isArray(tokenInfo.availableTeams)) {
+      const teamList = tokenInfo.availableTeams
+        .map((team) => `${team.name || 'unknown'} (${team.id})`)
+        .join(', ')
+      fail('workspace_not_found', `Workspace '${workspace}' not found. Available: ${teamList}.`)
+      return
+    }
     if (!tokenInfo?.token) {
       fail('token_not_found', 'Could not extract Slack auth token from localStorage. Is this profile logged into Slack?')
       return
     }
     log('info', `Token found for team: ${tokenInfo.teamName} (${tokenInfo.teamId})`)
-    if (tokenInfo.teamCount > 1 && Array.isArray(tokenInfo.availableTeams)) {
-      const teamList = tokenInfo.availableTeams
-        .map((team) => `${team.name || 'unknown'} (${team.id})`)
-        .join(', ')
-      log('warn', `Multiple Slack workspaces found; using ${tokenInfo.teamName || 'unknown'} (${tokenInfo.teamId}). Available: ${teamList}`)
-    }
     const token = tokenInfo.token
 
     // Dispatch action

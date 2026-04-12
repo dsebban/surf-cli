@@ -168,6 +168,7 @@ async function querySlackMessages(opts, onProgress = () => {}) {
       limit: opts.limit,
       days: opts.days,
       profile: opts.profile,
+      workspace: opts.workspace,
       includeDms: opts.includeDms,
       timeout,
     },
