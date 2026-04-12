@@ -40,6 +40,28 @@ test_no_output() {
   fi
 }
 
+test_exit_output() {
+  local name="$1"
+  local cmd="$2"
+  local expected_status="$3"
+  local expect="$4"
+
+  output=$(eval "$cmd" 2>&1)
+  status=$?
+  if [ "$status" -eq "$expected_status" ] && echo "$output" | grep -q -- "$expect"; then
+    echo "PASS: $name"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL: $name"
+    echo "  Command: $cmd"
+    echo "  Expected status: $expected_status"
+    echo "  Expected output: $expect"
+    echo "  Got status: $status"
+    echo "  Got: $output"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 echo "=== CLI Unit Tests (headless-only) ==="
 echo ""
 
@@ -86,6 +108,14 @@ test_output "chatgpt.chats help" "node cli.cjs chatgpt.chats --help" "Search con
 test_output "chatgpt.reply help" "node cli.cjs chatgpt.reply --help" "Reply in-thread"
 test_output "session help" "node cli.cjs session --help" "inspect and reconcile"
 test_output "do help" "node cli.cjs do --help" "Execute multiple commands"
+
+echo ""
+echo "-- Headless-only Guards --"
+test_exit_output "chatgpt rejects with-page" "node cli.cjs chatgpt \"x\" --with-page" 1 "headless-only"
+test_exit_output "gemini rejects with-page" "node cli.cjs gemini \"x\" --with-page" 1 "headless-only"
+test_exit_output "chatgpt.chats rejects continue" "node cli.cjs chatgpt.chats abc --continue" 1 "headless-only"
+test_exit_output "install removed" "node cli.cjs install abc" 1 "removed"
+test_exit_output "extension-path removed" "node cli.cjs extension-path" 1 "removed"
 
 echo ""
 echo "-- ChatGPT Chats Validation --"

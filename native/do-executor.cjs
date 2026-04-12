@@ -7,36 +7,19 @@
  *   - Loops: `repeat` for fixed iterations, `each` for array iteration
  *   - Variable substitution: %{varname} syntax
  * 
- * Follows the same socket communication pattern as --script mode in cli.cjs.
+ * Runs the supported headless commands through the CLI entrypoint.
  */
 
-const net = require("net");
-
-const SOCKET_PATH = process.platform === "win32" ? "//./pipe/surf" : "/tmp/surf.sock";
+const {
+  SUPPORTED_HEADLESS_COMMANDS,
+  runSurfHeadlessCommand,
+} = require("./headless-command-runner.cjs");
 
 // Maximum iterations for loops (safety cap)
 const MAX_LOOP_ITERATIONS = 100;
 
-// Commands that trigger auto-wait after execution
-// Note: 'type' is intentionally excluded - typing doesn't trigger navigation or DOM changes
-const AUTO_WAIT_COMMANDS = [
-  'go', 'navigate', 'click', 'key', 'form.fill', 'submit',
-  'tab.switch', 'tab.new', 'back', 'forward'
-];
-
-// Auto-wait strategies per command type
-const AUTO_WAIT_MAP = {
-  'navigate': 'wait.load',
-  'go': 'wait.load',
-  'click': 'wait.dom',
-  'key': 'wait.dom',
-  'form.fill': 'wait.dom',
-  'submit': 'wait.load',  // Form submission typically triggers navigation
-  'tab.switch': 'wait.load',
-  'tab.new': 'wait.load',
-  'back': 'wait.load',
-  'forward': 'wait.load',
-};
+const AUTO_WAIT_COMMANDS = [];
+const AUTO_WAIT_MAP = {};
 
 /**
  * Check if a command should trigger an auto-wait
@@ -62,64 +45,6 @@ function getAutoWaitCommand(cmd) {
   }
   
   return null;
-}
-
-/**
- * Send a single tool request over socket
- * @param {string} toolName - Tool/command name
- * @param {object} toolArgs - Tool arguments
- * @param {object} context - Execution context (tabId, windowId)
- * @returns {Promise<object>} - Response from host
- */
-function sendDoRequest(toolName, toolArgs, context = {}) {
-  return new Promise((resolve, reject) => {
-    const sock = net.createConnection(SOCKET_PATH, () => {
-      const req = {
-        type: "tool_request",
-        method: "execute_tool",
-        params: { tool: toolName, args: toolArgs },
-        id: "do-" + Date.now() + "-" + Math.random(),
-      };
-      if (context.tabId) req.tabId = context.tabId;
-      if (context.windowId) req.windowId = context.windowId;
-      sock.write(JSON.stringify(req) + "\n");
-    });
-    
-    let buf = "";
-    sock.on("data", (d) => {
-      buf += d.toString();
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const resp = JSON.parse(line);
-          sock.end();
-          resolve(resp);
-        } catch {
-          sock.end();
-          reject(new Error("Invalid JSON response"));
-        }
-      }
-    });
-    
-    sock.on("error", (e) => {
-      if (e.code === "ENOENT") {
-        reject(new Error("Socket not found. Is Chrome running with the extension?"));
-      } else if (e.code === "ECONNREFUSED") {
-        reject(new Error("Connection refused. Native host not running."));
-      } else {
-        reject(e);
-      }
-    });
-    
-    const timeoutId = setTimeout(() => { 
-      sock.destroy(); 
-      reject(new Error("Request timeout")); 
-    }, 30000);
-    
-    sock.on("close", () => clearTimeout(timeoutId));
-  });
 }
 
 /**
@@ -222,40 +147,31 @@ function extractStepOutput(resp) {
  * @returns {Promise<object>} - Result { success, error?, output? }
  */
 async function executeSingleStep(step, vars, context, options) {
-  const { autoWait = true, stepDelay = 100 } = options;
+  const { stepDelay = 100, quiet = false } = options;
   
   // Substitute variables in args
   const resolvedArgs = substituteVars(step.args || {}, vars);
   
   try {
-    const resp = await sendDoRequest(step.cmd, resolvedArgs, context);
-    
-    if (resp.error) {
-      const errText = resp.error.content?.[0]?.text || JSON.stringify(resp.error);
-      return { success: false, error: errText };
+    if (!SUPPORTED_HEADLESS_COMMANDS.has(step.cmd)) {
+      return {
+        success: false,
+        error: `Command "${step.cmd}" is not supported by the headless-only workflow runtime.`,
+      };
     }
-    
+
+    const resp = await runSurfHeadlessCommand(step.cmd, resolvedArgs, {
+      json: true,
+      cwd: options.cwd || process.cwd(),
+      onStderr: quiet ? undefined : (text) => process.stderr.write(text),
+    });
+
     // Capture output if step has `as` field
     if (step.as) {
       const output = extractStepOutput(resp);
       vars[step.as] = output;
     }
-    
-    // Command-specific auto-wait
-    if (autoWait) {
-      const waitCmd = getAutoWaitCommand(step.cmd);
-      if (waitCmd) {
-        const waitArgs = waitCmd === 'wait.load' 
-          ? { timeout: 10000 } 
-          : { stable: 100, timeout: 5000 };
-        try {
-          await sendDoRequest(waitCmd, waitArgs, context);
-        } catch {
-          // Ignore auto-wait failures silently
-        }
-      }
-    }
-    
+
     // Delay between steps
     if (stepDelay > 0) {
       await new Promise(r => setTimeout(r, stepDelay));
@@ -409,6 +325,7 @@ async function executeDoSteps(steps, options = {}) {
     stepDelay = 100,
     context = {},
     quiet = false,  // For --json mode, suppress streaming output
+    cwd = process.cwd(),
     vars: initialVars = {},
   } = options;
   
@@ -433,7 +350,7 @@ async function executeDoSteps(steps, options = {}) {
         console.log(`[${i + 1}/${total}] Loop: ${loopType} (${step.steps?.length || 0} nested steps)`);
       }
       
-      const result = await executeStep(step, vars, context, { onError, autoWait, stepDelay }, null);
+      const result = await executeStep(step, vars, context, { onError, autoWait, stepDelay, quiet, cwd }, null);
       const ms = Date.now() - startTime;
       
       stepsExecuted += result.stepsExecuted || 0;
@@ -473,7 +390,7 @@ async function executeDoSteps(steps, options = {}) {
         process.stdout.write(`${stepNum} ${desc} ... `);
       }
       
-      const result = await executeSingleStep(step, vars, context, { onError, autoWait, stepDelay });
+      const result = await executeSingleStep(step, vars, context, { onError, autoWait, stepDelay, quiet, cwd });
       const ms = Date.now() - startTime;
       stepsExecuted++;
       
@@ -519,7 +436,6 @@ async function executeDoSteps(steps, options = {}) {
 
 module.exports = { 
   executeDoSteps, 
-  sendDoRequest, 
   shouldAutoWait,
   getAutoWaitCommand,
   substituteVars,

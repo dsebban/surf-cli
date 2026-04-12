@@ -10,7 +10,6 @@ const networkStore = require("./network-store.cjs");
 const { parseDoCommands } = require("./do-parser.cjs");
 const { executeDoSteps } = require("./do-executor.cjs");
 const { isBunGeminiEligible, runGeminiViaBun } = require("./gemini-bun-bridge.cjs");
-const { shouldUseBunChatGPT, isBunChatGPTEligible, runChatGPTViaBun } = require("./chatgpt-bun-bridge.cjs");
 const { isCloakBrowserAvailable, queryWithCloakBrowser, manageChatsWithCloakBrowser } = require("./chatgpt-cloak-bridge.cjs");
 const chatgptChatsFormatter = require("./chatgpt-chats-formatter.cjs");
 const chatgptChatsCache = require("./chatgpt-chats-cache.cjs");
@@ -522,7 +521,6 @@ const TOOLS = {
         desc: "Send prompt to ChatGPT (uses browser cookies)", 
         args: ["query"], 
         opts: { 
-          "with-page": "Include current page context",
           model: "Model: gpt-4o, o3, o4-mini, etc.",
           file: "Attach file",
           "generate-image": "Generate image and save to path",
@@ -531,7 +529,6 @@ const TOOLS = {
         },
         examples: [
           { cmd: 'chatgpt "explain this code"', desc: "Basic query" },
-          { cmd: 'chatgpt "summarize" --with-page', desc: "With page context" },
           { cmd: 'chatgpt "review" --file code.ts', desc: "With file (headless)" },
           { cmd: 'chatgpt --prompt-file prompt.md --model gpt-5.4-pro', desc: "Prompt from file (large context)" },
           { cmd: 'chatgpt "analyze" --model gpt-4o', desc: "Specify model" },
@@ -552,7 +549,6 @@ const TOOLS = {
           delete: "Delete a conversation by ID",
           "delete-ids": "Bulk-delete conversations by comma-separated IDs",
           "download-file": "Download attached file by file ID (use with --output)",
-          continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
           "no-cache": "Bypass local chats cache",
           timeout: "Timeout in seconds (default: 120)",
           profile: "Chrome profile email for headless auth (macOS)",
@@ -570,7 +566,6 @@ const TOOLS = {
         args: ["conversation_id", "prompt"],
         opts: {
           model: "Model override (optional)",
-          continue: "Run in headed CloakBrowser (sets CLOAK_HEADLESS=0 for this command)",
           timeout: "Inactivity timeout in seconds (default: 2700 = 45min)",
           profile: "Chrome profile email for headless auth (macOS)",
         },
@@ -583,7 +578,6 @@ const TOOLS = {
         desc: "Send prompt to Gemini (uses browser cookies)", 
         args: ["query"], 
         opts: { 
-          "with-page": "Include current page context",
           model: "Model tiers: Fast (gemini-3-pro/default, fast, gemini-2.5-flash), Thinking (gemini-2.5-pro, thinking, gemini-3.1-thinking), Pro (gemini-3.1-pro-preview, pro, gemini-3.1-pro)",
           file: "Attach file to analyze",
           "generate-image": "Generate image and save to path",
@@ -596,7 +590,6 @@ const TOOLS = {
         },
         examples: [
           { cmd: 'gemini "explain quantum computing"', desc: "Basic query" },
-          { cmd: 'gemini "summarize" --with-page', desc: "With page context" },
           { cmd: 'gemini "analyze" --file data.csv', desc: "With file attachment" },
           { cmd: 'gemini "a robot surfing" --generate-image /tmp/robot.png', desc: "Generate image" },
           { cmd: 'gemini "add sunglasses" --edit-image photo.jpg --output out.jpg', desc: "Edit image" },
@@ -2228,74 +2221,9 @@ if (args[0] === "session" || args[0] === "sessions") {
   })();
 }
 
-if (args[0] === "extension-path" || args[0] === "path") {
-  const distPath = process.env.SURF_EXTENSION_PATH || path.resolve(__dirname, "../dist");
-  console.log(distPath);
-  process.exit(0);
-}
-
-if (args[0] === "install") {
-  const { spawnSync } = require("child_process");
-  const scriptPath = require("path").resolve(__dirname, "../scripts/install-native-host.cjs");
-  const installArgs = args.slice(1);
-  
-  if (installArgs.length === 0 || installArgs[0] === "--help" || installArgs[0] === "-h") {
-    console.log(`
-Usage: surf install <extension-id> [options]
-
-Install native messaging host for browser communication.
-
-Arguments:
-  extension-id    Chrome extension ID (32 lowercase letters a-p)
-                  Find at chrome://extensions with Developer Mode enabled
-
-Options:
-  -b, --browser   Browser(s) to install for (default: chrome)
-                  Values: chrome, chromium, brave, edge, arc, helium, all
-                  Multiple: --browser chrome,brave
-
-Examples:
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --browser brave
-  surf install hnfbepgmaoklhekckbpjnleifhahkcpl --browser all
-`);
-    process.exit(0);
-  }
-
-  const result = spawnSync(process.execPath, [scriptPath, ...installArgs], {
-    stdio: "inherit",
-  });
-  process.exit(result.status || 0);
-}
-
-if (args[0] === "uninstall") {
-  const { spawnSync } = require("child_process");
-  const scriptPath = require("path").resolve(__dirname, "../scripts/uninstall-native-host.cjs");
-  const uninstallArgs = args.slice(1);
-  
-  if (uninstallArgs.includes("--help") || uninstallArgs.includes("-h")) {
-    console.log(`
-Usage: surf uninstall [options]
-
-Remove native messaging host configuration.
-
-Options:
-  -b, --browser   Browser(s) to uninstall from (default: chrome)
-                  Values: chrome, chromium, brave, edge, arc, helium, all
-  -a, --all       Uninstall from all browsers and remove wrapper
-
-Examples:
-  surf uninstall
-  surf uninstall --browser brave
-  surf uninstall --all
-`);
-    process.exit(0);
-  }
-
-  const result = spawnSync(process.execPath, [scriptPath, ...uninstallArgs], {
-    stdio: "inherit",
-  });
-  process.exit(result.status || 0);
+if (["extension-path", "path", "install", "uninstall"].includes(args[0])) {
+  console.error("Error: extension commands were removed in headless-only mode");
+  process.exit(1);
 }
 
 if (args.includes("--help") || args.includes("-h")) {
@@ -2858,7 +2786,7 @@ if (args[0] === "workflow.validate") {
   }
 }
 
-const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait"];
+const BOOLEAN_FLAGS = ["auto-capture", "json", "stream", "dry-run", "stop-on-error", "fail-fast", "clear", "submit", "all", "case-sensitive", "hard", "annotate", "fullpage", "reset", "no-screenshot", "full", "soft-fail", "has-body", "exclude-static", "v", "vv", "request", "by-tab", "har", "jsonl", "no-save", "no-auto-wait", "with-page", "continue"];
 
 const AUTO_SCREENSHOT_TOOLS = ["click", "type", "key", "smart_type", "form.fill", "form_input", "drag", "hover", "scroll", "scroll.top", "scroll.bottom", "scroll.to", "dialog.accept", "dialog.dismiss", "js", "eval"];
 
@@ -3034,6 +2962,16 @@ if (firstArg !== undefined) {
 if (tool === "chatgpt.reply") {
   toolArgs.prompt = positional.slice(2).join(" ").trim();
   toolArgs.query = toolArgs.prompt;
+}
+
+if ((tool === "chatgpt" || tool === "gemini") && (toolArgs["with-page"] || toolArgs.withPage)) {
+  console.error("Error: --with-page is not supported in headless-only mode");
+  process.exit(1);
+}
+
+if ((tool === "chatgpt" || tool === "chatgpt.chats" || tool === "chatgpt.reply") && toolArgs.continue) {
+  console.error("Error: --continue (headed mode) is not supported in headless-only mode");
+  process.exit(1);
 }
 
 if (tool === "js" && toolArgs.file) {
@@ -3638,11 +3576,6 @@ const requestedProfile = (() => {
   return undefined;
 })();
 
-// Retained for legacy Bun fallback block below (currently unreachable in headless-only mode).
-const hasBunOnlyChatGPTFeature = !!(
-  toolArgs.file || toolArgs["generate-image"] || requestedProfile
-);
-
 if ((tool === "chatgpt" || CHATGPT_CLOAK_ONLY_TOOLS.has(tool)) && requestedProfile) {
   if (process.platform !== "darwin") {
     console.error("Error: --profile is only supported on macOS");
@@ -3799,99 +3732,6 @@ if (tool === "chatgpt.reply") {
     await runChatGptCloakQueryDirect("chatgpt.reply", replyArgs);
   })();
   return;
-}
-
-// ---------------------------------------------------------------------------
-// Bun-native ChatGPT path (opt-in via SURF_USE_BUN_CHATGPT=1)
-// ---------------------------------------------------------------------------
-
-if (tool === "chatgpt" && shouldUseBunChatGPT(process.env)) {
-  const eligibility = isBunChatGPTEligible(toolArgs);
-  if (eligibility.eligible) {
-    if (requestedProfile) toolArgs.profile = requestedProfile;
-    (async () => {
-      const sess = sessionStore.createSession("chatgpt", toolArgs, process.env);
-      const _origWrite = process.stderr.write.bind(process.stderr);
-      process.stderr.write = (data, ...rest) => { sess.step(String(typeof data==="string"?data:data.toString()).trimEnd()); return _origWrite(data, ...rest); };
-      try {
-        const bunResult = await runChatGPTViaBun(toolArgs);
-        process.stderr.write = _origWrite;
-        if (bunResult.ok) {
-            const data = bunResult.result;
-            sess.finish({ model: data.model, tookMs: data.tookMs, imagePath: data.imagePath,
-              response: data.response,
-              responsePreview: data.response ? data.response.slice(0, 160) : "" });
-          if (wantJson) {
-            console.log(JSON.stringify(data, null, 2));
-          } else {
-            console.log(data.response);
-            if (data.imagePath) {
-              console.log(`\nImage saved: ${data.imagePath}`);
-            }
-            console.error(`\n[${data.model || 'unknown'} | ${((data.tookMs || 0) / 1000).toFixed(1)}s | bun]`);
-          }
-          process.exit(0);
-        } else if (bunResult.fallbackRecommended) {
-          process.stderr.write = _origWrite;
-          if (requestedProfile) {
-            sess.fail(new Error(bunResult.error || "bun chatgpt failed"));
-            console.error(`Error: Bun ChatGPT failed with --profile: ${bunResult.error}`);
-            process.exit(1);
-          }
-          if (hasBunOnlyChatGPTFeature) {
-            sess.fail(new Error(bunResult.error || "bun chatgpt failed"));
-            console.error(`Error: ${bunResult.error}`);
-            process.exit(1);
-          }
-          // Mark bun attempt as cancelled — legacy path will run independently (no new session)
-          sess.fail(Object.assign(new Error(bunResult.error || "bun chatgpt fallback"), { code: "fallback" }));
-          process.stderr.write(`[bun-chatgpt] Falling back to legacy path: ${bunResult.error}\n`);
-          startLegacySocketPath();
-        } else {
-          const errMsg = bunResult.error || "Bun ChatGPT worker error";
-          sess.fail(new Error(errMsg));
-          process.stderr.write = _origWrite;
-          if (softFail) {
-            console.warn(`Warning: ${errMsg}`);
-            process.exit(0);
-          }
-          console.error(`Error: ${errMsg}`);
-          if (autoCapture) {
-            await performAutoCapture();
-          }
-          process.exit(1);
-        }
-      } catch (err) {
-        sess.fail(err);
-        process.stderr.write = _origWrite;
-        const errMsg = `Bun ChatGPT bridge failed: ${err.message}`;
-        if (softFail) {
-          console.warn(`Warning: ${errMsg}`);
-          process.exit(0);
-        }
-        console.error(`Error: ${errMsg}`);
-        if (autoCapture) {
-          await performAutoCapture();
-        }
-        process.exit(1);
-      }
-    })();
-  } else {
-    if (requestedProfile) {
-      console.error(`Error: --profile cannot be used with --with-page`);
-      process.exit(1);
-    }
-    if (hasBunOnlyChatGPTFeature) {
-      console.error(`Error: Bun ChatGPT not eligible (${eligibility.reason}) but Bun-only features requested`);
-      process.exit(1);
-    }
-    if (eligibility.reason !== "with_page") {
-      process.stderr.write(`[bun-chatgpt] Not eligible: ${eligibility.reason}, using legacy path\n`);
-    }
-    startLegacySocketPath();
-  }
-} else if (tool === "chatgpt") {
-  startLegacySocketPath();
 }
 
 // ---------------------------------------------------------------------------

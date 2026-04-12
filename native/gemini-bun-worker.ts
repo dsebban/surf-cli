@@ -125,7 +125,7 @@ async function pollUntil<T>(
 // WebView page helpers
 // ============================================================================
 
-type WebView = InstanceType<typeof Bun.WebView>;
+type WebView = any;
 
 /**
  * eval() wrapper that catches and rethrows with context.
